@@ -140,7 +140,9 @@ function captureWhere(q: CaptureQuery): Where {
   // predicate from `adapterId` (which requires a value), so a delete and the
   // count shown beside it can share this exact WHERE — see deleteCaptures.
   if (q.unattributed) parts.push('adapter_id IS NULL');
-  if (q.ids && q.ids.length > 0) {
+    if (q.ids && q.ids.length === 0) {
+    parts.push('1=0'); // match-none: empty id list is not "no filter"
+  } else if (q.ids && q.ids.length > 0) {
     // Bound the IN list so a huge hydrate request cannot blow the query planner
     // or the bind limit. Callers batch if they need more.
     const capped = q.ids.slice(0, 500);
@@ -192,6 +194,11 @@ function itemWhere(q: ItemFilter): Where {
  * The single SQLite sink for captures + normalized entities. There is no method
  * to persist a secret: the store simply has nowhere to put one.
  */
+/** Escape `%`, `_`, and `\\` for SQLite LIKE with ESCAPE '\\'. */
+function escapeLike(s: string): string {
+  return s.replace(/[\\%_]/g, (ch) => '\\' + ch);
+}
+
 export class SqliteStore {
   readonly db: DB;
 
@@ -906,7 +913,7 @@ export class SqliteStore {
       for (const r of rows) mark.run({ id: r.id, ts });
       return rows.map((r) => rowToWorkItem({ ...r, state: 'running', attempts: r.attempts + 1 }));
     });
-    return tx();
+    return tx.immediate();
   }
 
   /** Settle a claimed item. Passing an error marks it failed and records why. */
@@ -1064,17 +1071,17 @@ export class SqliteStore {
     }
     if (q.q && q.q.trim().length > 0) {
       parts.push(`(
-        IFNULL(label, '') LIKE @qq
+        IFNULL(label, '') LIKE @qq ESCAPE '\\'
         OR primary_capture_id IN (
           SELECT capture_id FROM interaction_flow_steps
-           WHERE role = 'primary' AND IFNULL(operation, '') LIKE @qq
+           WHERE role = 'primary' AND IFNULL(operation, '') LIKE @qq ESCAPE '\\'
         )
         OR id IN (
           SELECT flow_id FROM interaction_flow_steps
-           WHERE IFNULL(operation, '') LIKE @qq
+           WHERE IFNULL(operation, '') LIKE @qq ESCAPE '\\'
         )
       )`);
-      params.qq = `%${q.q.trim()}%`;
+      params.qq = `%${escapeLike(q.q.trim())}%`;
     }
     const where = parts.length ? `WHERE ${parts.join(' AND ')}` : '';
     const rows = this.db
@@ -1122,9 +1129,12 @@ export class SqliteStore {
     }
     const primary = this.getCapture(input.primaryCaptureId);
     if (!primary) throw new Error(`unknown primary capture "${input.primaryCaptureId}"`);
-    const ids = input.captureIds.includes(input.primaryCaptureId)
+    const raw = input.captureIds.includes(input.primaryCaptureId)
       ? input.captureIds.slice()
       : [input.primaryCaptureId, ...input.captureIds];
+    // Dedupe while preserving order — duplicate ids violate UNIQUE(flow_id, capture_id).
+    const seen = new Set<string>();
+    const ids = raw.filter((id) => (seen.has(id) ? false : (seen.add(id), true)));
     const caps = ids.map((cid) => {
       const c = this.getCapture(cid);
       if (!c) throw new Error(`unknown capture "${cid}"`);
@@ -1318,8 +1328,8 @@ export class SqliteStore {
       params.primaryKey = q.primaryKey;
     }
     if (q.q && q.q.trim().length > 0) {
-      parts.push(`(IFNULL(label, '') LIKE @qq OR primary_key LIKE @qq)`);
-      params.qq = `%${q.q.trim()}%`;
+      parts.push(`(IFNULL(label, '') LIKE @qq ESCAPE '\\' OR primary_key LIKE @qq ESCAPE '\\')`);
+      params.qq = `%${escapeLike(q.q.trim())}%`;
     }
     const where = parts.length ? `WHERE ${parts.join(' AND ')}` : '';
     const rows = this.db

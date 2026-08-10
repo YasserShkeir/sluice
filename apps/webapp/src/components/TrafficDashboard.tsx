@@ -695,11 +695,12 @@ export function TrafficDashboard({
                       <div
                         key="ungrouped"
                         role="row"
+                        tabIndex={-1}
                         aria-rowindex={v.index + 2}
                         className="absolute inset-x-0 flex items-center border-b border-border/80 bg-bg-2/80 px-3 font-mono text-[11px] text-fg-mute"
                         style={{ height: ROW_H, transform: `translateY(${v.start}px)` }}
                       >
-                        <div role="gridcell" aria-colindex={1} className="truncate">
+                        <div role="gridcell" aria-colindex={1} className="truncate" tabIndex={-1}>
                           Ungrouped · {r.count} request{r.count === 1 ? '' : 's'} not in a learned/pinned flow
                         </div>
                       </div>
@@ -838,16 +839,16 @@ function FlowGroupRow({
         }
       }}
     >
-      <div role="gridcell" aria-colindex={1} className="truncate px-1 text-fg-mute">
+      <div role="gridcell" aria-colindex={1} className="truncate px-1 text-fg-mute" tabIndex={-1}>
         {expanded ? '▼' : '▶'}
       </div>
-      <div role="gridcell" aria-colindex={2} className="truncate px-1 text-fg-dim" title={flow.id}>
+      <div role="gridcell" aria-colindex={2} className="truncate px-1 text-fg-dim" title={flow.id} tabIndex={-1}>
         flow
       </div>
-      <div role="gridcell" aria-colindex={3} className="truncate px-1">
+      <div role="gridcell" aria-colindex={3} className="truncate px-1" tabIndex={-1}>
         {flow.adapterId}
       </div>
-      <div role="gridcell" aria-colindex={4} className="truncate px-1 text-fg-dim">
+      <div role="gridcell" aria-colindex={4} className="truncate px-1 text-fg-dim" tabIndex={-1}>
         {flow.source}
       </div>
       <div
@@ -856,9 +857,17 @@ function FlowGroupRow({
         className="truncate px-1 font-medium"
         style={{ gridColumn: '5 / 10' }}
         title={`${label} · ${members.length}/${flow.stepCount} in window`}
+        tabIndex={-1}
         onClick={(e) => {
           e.stopPropagation();
           onSelectPrimary();
+        }}
+        onKeyDown={(e) => {
+          if (e.key === 'Enter' || e.key === ' ') {
+            e.preventDefault();
+            e.stopPropagation();
+            onSelectPrimary();
+          }
         }}
       >
         {label}
@@ -866,10 +875,10 @@ function FlowGroupRow({
           {members.length}/{flow.stepCount} steps · {flow.endedAt - flow.startedAt}ms span
         </span>
       </div>
-      <div role="gridcell" aria-colindex={10} className="truncate px-1 text-fg-mute">
+      <div role="gridcell" aria-colindex={10} className="truncate px-1 text-fg-mute" tabIndex={-1}>
         —
       </div>
-      <div role="gridcell" aria-colindex={11} className="truncate px-1 text-fg-mute">
+      <div role="gridcell" aria-colindex={11} className="truncate px-1 text-fg-mute" tabIndex={-1}>
         —
       </div>
     </div>

@@ -160,9 +160,14 @@ function scrubString(value: string, salt: string): string {
   // A mask is already the absence of data. Re-scrubbing it would hide the fact
   // that the redactor ran, and the fixture is partly there to prove it did.
   if (value === MASK) return value;
-  if (value.startsWith('^')) return value;
+  // Gmail label vocabulary is short (`^i`, `^smartlabel_promo`). An unbounded
+  // caret passthrough would keep arbitrary user text that happens to start with
+  // `^` — bound to label-shaped tokens only.
+  if (/^\^\S{1,32}$/.test(value)) return value;
 
   const seed = seedOf(salt, value);
+
+  if (ISO_DATE.test(value)) return scrubIsoDate(value, salt);
 
   const prefixed = PREFIXED_ID.exec(value);
   if (prefixed) {
@@ -337,9 +342,34 @@ const EPOCH_SHIFT_MS = -30_000_000_000;
  * parser that branches on `kind === 2` has to still see 2. Timestamps are the
  * exception — they say when the user did something.
  */
+/** Epoch seconds (~2001–2033) — same shift as ms, in seconds. */
+const EPOCH_SEC_MIN = 1e9;
+const EPOCH_SEC_MAX = 2e9;
+const EPOCH_SHIFT_SEC = Math.trunc(EPOCH_SHIFT_MS / 1000);
+
+/** ISO-8601 date/time strings a JSON body might carry as text. */
+const ISO_DATE =
+  /^\d{4}-\d{2}-\d{2}(?:[T ]\d{2}:\d{2}(?::\d{2}(?:\.\d{1,9})?)?(?:Z|[+-]\d{2}:?\d{2})?)?$/;
+
 function scrubNumber(value: number): number {
   if (!Number.isFinite(value)) return value;
-  return value >= EPOCH_MIN && value <= EPOCH_MAX ? value + EPOCH_SHIFT_MS : value;
+  if (value >= EPOCH_MIN && value <= EPOCH_MAX) return value + EPOCH_SHIFT_MS;
+  // Seconds window — exclude pure small integers (counts/flags) below 1e9.
+  if (value >= EPOCH_SEC_MIN && value <= EPOCH_SEC_MAX && Number.isInteger(value)) {
+    return value + EPOCH_SHIFT_SEC;
+  }
+  return value;
+}
+
+/** Shift an ISO date string by EPOCH_SHIFT_MS, preserving length when possible. */
+function scrubIsoDate(value: string, salt: string): string {
+  const ms = Date.parse(value);
+  if (!Number.isFinite(ms)) return synthText(seedOf(salt, value), value.length);
+  const shifted = new Date(ms + EPOCH_SHIFT_MS).toISOString();
+  // Prefer same length: trim/pad fractional seconds only if needed.
+  if (shifted.length === value.length) return shifted;
+  if (shifted.length > value.length) return shifted.slice(0, value.length);
+  return shifted.padEnd(value.length, '0');
 }
 
 // ── Structure ────────────────────────────────────────────────────────────────
@@ -486,6 +516,9 @@ function scrubCapture(raw: unknown, salt: string): Capture {
   if ('tabId' in c) scrubbed.tabId = str(c.tabId) ?? null;
   if ('tabUrl' in c) scrubbed.tabUrl = tabUrl === undefined ? null : scrubUrl(tabUrl, salt, true);
   if ('direction' in c) scrubbed.direction = (str(c.direction) ?? null) as Capture['direction'];
+  if ('loaderId' in c) scrubbed.loaderId = str(c.loaderId) ?? null;
+  if ('pageLoadId' in c) scrubbed.pageLoadId = str(c.pageLoadId) ?? null;
+  if ('navigationId' in c) scrubbed.navigationId = str(c.navigationId) ?? null;
   if ('wsId' in c) scrubbed.wsId = str(c.wsId) ?? null;
   if ('classification' in c) scrubbed.classification = str(c.classification) ?? null;
   if ('parsedAt' in c) {

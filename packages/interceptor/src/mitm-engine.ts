@@ -209,6 +209,7 @@ export class MitmEngine {
       });
       // Drop half-open exchanges so `pending` can't grow without bound.
       await server.on('abort', (req: { id: string }) => {
+        this.wsUrls.delete(req.id);
         this.pending.delete(req.id);
       });
 
