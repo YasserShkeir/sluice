@@ -929,8 +929,125 @@ test('wipe clears flows and flow templates', () => {
     ],
     flowParams: [],
   });
+  store.upsertSession({
+    id: 'sess1',
+    adapterId: 'slack',
+    label: 'ws',
+    discoveredAt: 1,
+    source: 'manual',
+    credentialKinds: ['token'],
+  });
+  assert.ok(store.listSessions().length >= 1);
   store.wipe();
   assert.equal(store.listFlows().length, 0);
   assert.equal(store.listFlowTemplates().length, 0);
+  assert.equal(store.listSessions().length, 0);
+  store.close();
+});
+
+test('deleteCaptures with bodyMatch does not leave FTS ghosts or zombie flows', () => {
+  const store = new SqliteStore(':memory:');
+  store.insertCapture(
+    capture({
+      id: 'keep',
+      ts: 1,
+      method: 'GET',
+      url: 'https://example.com/a',
+      host: 'example.com',
+      path: '/a',
+      resBody: 'hello world uniquekeep',
+    }),
+  );
+  store.insertCapture(
+    capture({
+      id: 'drop',
+      ts: 2,
+      method: 'GET',
+      url: 'https://example.com/b',
+      host: 'example.com',
+      path: '/b',
+      resBody: 'secret payload uniquedrop',
+    }),
+  );
+  store.upsertFlow({
+    adapterId: 'slack',
+    primaryCaptureId: 'drop',
+    startedAt: 2,
+    endedAt: 2,
+    source: 'observed',
+    steps: [{ captureId: 'drop', seq: 0, role: 'primary', required: true }],
+  });
+  const n = store.deleteCaptures({ bodyMatch: 'uniquedrop' });
+  assert.equal(n, 1);
+  assert.equal(store.getCapture('drop'), undefined);
+  assert.ok(store.getCapture('keep'));
+  assert.equal(store.listFlows().length, 0, 'flow whose primary was deleted must go');
+  // FTS must not still match the deleted body.
+  assert.equal(store.searchCaptures('uniquedrop').length, 0);
+  store.close();
+});
+
+test('deleteFlows and deleteFlowTemplates scope by adapter', () => {
+  const store = new SqliteStore(':memory:');
+  store.upsertFlow({
+    adapterId: 'slack',
+    primaryCaptureId: 'p1',
+    startedAt: 1,
+    endedAt: 1,
+    source: 'observed',
+    steps: [{ captureId: 'p1', seq: 0, role: 'primary', required: true }],
+  });
+  store.upsertFlow({
+    adapterId: 'trello',
+    primaryCaptureId: 'p2',
+    startedAt: 1,
+    endedAt: 1,
+    source: 'observed',
+    steps: [{ captureId: 'p2', seq: 0, role: 'primary', required: true }],
+  });
+  store.upsertFlowTemplate({
+    adapterId: 'slack',
+    primaryKey: 'a',
+    sampleCount: 1,
+    version: 1,
+    learnedAt: 1,
+    steps: [
+      {
+        seq: 0,
+        role: 'primary',
+        method: 'GET',
+        path: '/',
+        required: true,
+        support: 1,
+        delayMsP50: 0,
+      },
+    ],
+    flowParams: [],
+  });
+  store.upsertFlowTemplate({
+    adapterId: 'trello',
+    primaryKey: 'b',
+    sampleCount: 1,
+    version: 1,
+    learnedAt: 1,
+    steps: [
+      {
+        seq: 0,
+        role: 'primary',
+        method: 'GET',
+        path: '/',
+        required: true,
+        support: 1,
+        delayMsP50: 0,
+      },
+    ],
+    flowParams: [],
+  });
+  assert.equal(store.deleteFlows({ adapterId: 'slack' }), 1);
+  assert.equal(store.listFlows({ adapterId: 'slack' }).length, 0);
+  assert.equal(store.listFlows({ adapterId: 'trello' }).length, 1);
+  assert.equal(store.deleteFlowTemplates({ adapterId: 'slack' }), 1);
+  assert.equal(store.listFlowTemplates({ adapterId: 'slack' }).length, 0);
+  assert.equal(store.listFlowTemplates({ adapterId: 'trello' }).length, 1);
   store.close();
 });

@@ -60,6 +60,29 @@ test('always-secret headers are masked by name', () => {
   assert.equal(out['content-type'], 'application/json', 'benign headers must survive');
 });
 
+test('credential-shaped header names are masked without per-app registration', () => {
+  const out = redactHeaders({
+    'x-api-key': 'sk-live-abcdefgh',
+    'x-auth-token': 'tok-abcdefgh',
+    'x-amz-security-token': 'FwoGZXIvYXdzE',
+    'x-csrf-token': 'csrf-secret-value',
+    'X-Session-Id': 'sess-abcdef',
+    'content-type': 'application/json',
+    accept: 'application/json',
+    'user-agent': 'RealClient/1.0',
+    'x-request-id': 'req-123',
+  });
+  assert.equal(out['x-api-key'], MASK);
+  assert.equal(out['x-auth-token'], MASK);
+  assert.equal(out['x-amz-security-token'], MASK);
+  assert.equal(out['x-csrf-token'], MASK);
+  assert.equal(out['X-Session-Id'], MASK);
+  assert.equal(out['content-type'], 'application/json');
+  assert.equal(out.accept, 'application/json');
+  assert.equal(out['user-agent'], 'RealClient/1.0');
+  assert.equal(out['x-request-id'], 'req-123', 'request-id is not credential-shaped');
+});
+
 test('app-registered token shapes are masked under ANY field name', () => {
   // These all reached SQLite and the WebSocket before apps could contribute
   // patterns: the generic rule only knows credential-*named* fields.

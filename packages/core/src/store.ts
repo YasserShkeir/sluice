@@ -471,6 +471,7 @@ export class SqliteStore {
           )
           .run(opts.maxRows).changes;
       }
+      if (removed > 0) this.gcOrphanFlows();
     });
     tx();
     // VACUUM cannot run inside a transaction, and it rewrites the whole file —
@@ -491,6 +492,9 @@ export class SqliteStore {
    * Refuses an EMPTY query: `deleteCaptures({})` would delete everything, which is
    * `wipe()`'s job and must be asked for by name, not reachable by forgetting a
    * filter.
+   *
+   * When `bodyMatch` is set, rowids are materialized first and deletes use that
+   * fixed id set — never re-evaluate an FTS-dependent WHERE after FTS rows drop.
    */
   deleteCaptures(q: CaptureQuery): number {
     const { clause, params } = captureWhere(q);
@@ -499,11 +503,17 @@ export class SqliteStore {
     }
     return this.db.transaction(() => {
       const rows = this.db
-        .prepare(`SELECT rowid AS rid FROM captures ${clause}`)
-        .all(params) as Array<{ rid: number }>;
+        .prepare(`SELECT id, rowid AS rid FROM captures ${clause}`)
+        .all(params) as Array<{ id: string; rid: number }>;
+      if (rows.length === 0) return 0;
       const dropFts = this.db.prepare(`DELETE FROM captures_fts WHERE rowid = ?`);
       for (const { rid } of rows) dropFts.run(rid);
-      return this.db.prepare(`DELETE FROM captures ${clause}`).run(params).changes;
+      // Delete by materialized ids so bodyMatch/FTS filters cannot see a half-deleted index.
+      const del = this.db.prepare(`DELETE FROM captures WHERE id = ?`);
+      let n = 0;
+      for (const { id } of rows) n += del.run(id).changes;
+      if (n > 0) this.gcOrphanFlows();
+      return n;
     })();
   }
 
@@ -588,6 +598,7 @@ export class SqliteStore {
         'interaction_flow_steps',
         'interaction_flows',
         'flow_templates',
+        'sessions',
         'captures',
       ]) {
         try {
@@ -1183,6 +1194,58 @@ export class SqliteStore {
     };
   }
 
+  /**
+   * Delete all flows for an adapter (and their steps). Captures untouched.
+   * Used by clearApp so derived flow rows do not outlive their app.
+   */
+  deleteFlows(opts: { adapterId: string }): number {
+    const ids = (
+      this.db
+        .prepare(`SELECT id FROM interaction_flows WHERE adapter_id = ?`)
+        .all(opts.adapterId) as Array<{ id: string }>
+    ).map((r) => r.id);
+    if (ids.length === 0) return 0;
+    const dropSteps = this.db.prepare(`DELETE FROM interaction_flow_steps WHERE flow_id = ?`);
+    const dropFlow = this.db.prepare(`DELETE FROM interaction_flows WHERE id = ?`);
+    return this.db.transaction(() => {
+      let n = 0;
+      for (const id of ids) {
+        dropSteps.run(id);
+        n += dropFlow.run(id).changes;
+      }
+      return n;
+    })();
+  }
+
+  /**
+   * Drop flows whose primary capture is gone, or that have zero remaining steps
+   * pointing at existing captures. Called after capture prune/delete.
+   */
+  gcOrphanFlows(): number {
+    // Steps whose capture no longer exists.
+    this.db.exec(`
+      DELETE FROM interaction_flow_steps
+       WHERE capture_id NOT IN (SELECT id FROM captures)
+    `);
+    // Flows whose primary is gone, or that lost every step.
+    const doomed = this.db
+      .prepare(
+        `SELECT id FROM interaction_flows
+          WHERE primary_capture_id NOT IN (SELECT id FROM captures)
+             OR id NOT IN (SELECT DISTINCT flow_id FROM interaction_flow_steps)`,
+      )
+      .all() as Array<{ id: string }>;
+    if (doomed.length === 0) return 0;
+    const dropSteps = this.db.prepare(`DELETE FROM interaction_flow_steps WHERE flow_id = ?`);
+    const dropFlow = this.db.prepare(`DELETE FROM interaction_flows WHERE id = ?`);
+    let n = 0;
+    for (const { id } of doomed) {
+      dropSteps.run(id);
+      n += dropFlow.run(id).changes;
+    }
+    return n;
+  }
+
   // ── Flow templates ─────────────────────────────────────────────────────────
 
   /**
@@ -1270,6 +1333,12 @@ export class SqliteStore {
 
   deleteFlowTemplate(id: string): boolean {
     return this.db.prepare(`DELETE FROM flow_templates WHERE id = ?`).run(id).changes > 0;
+  }
+
+  /** Delete all learned templates for an adapter (clearApp). */
+  deleteFlowTemplates(opts: { adapterId: string }): number {
+    return this.db.prepare(`DELETE FROM flow_templates WHERE adapter_id = ?`).run(opts.adapterId)
+      .changes;
   }
 
   listWorkspaces(): Workspace[] {

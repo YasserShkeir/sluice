@@ -14,6 +14,19 @@
  * host_permissions for loopback let this fetch bypass CORS.
  */
 const KEYS = ['endpoint', 'token', 'hosts', 'enabled'];
+
+/** Only loopback runners are allowed — never ship captures off-box. */
+function isLoopbackEndpoint(endpoint) {
+  try {
+    const u = new URL(endpoint);
+    if (u.protocol !== 'http:' && u.protocol !== 'https:') return false;
+    const h = (u.hostname || '').toLowerCase();
+    return h === '127.0.0.1' || h === 'localhost' || h === '[::1]' || h === '::1';
+  } catch {
+    return false;
+  }
+}
+
 const FLUSH_MS = 2000;
 const FLUSH_AT = 50;
 const MAX_BATCH = 500;
@@ -72,6 +85,10 @@ async function flush() {
   const batch = queue.splice(0, MAX_BATCH);
   const cfg = await config();
   if (!cfg.token) return;
+  if (!isLoopbackEndpoint(cfg.endpoint)) {
+    console.warn('[sluice] refusing non-loopback endpoint', cfg.endpoint);
+    return;
+  }
   try {
     await fetch(`${cfg.endpoint}/api/ingest`, {
       method: 'POST',

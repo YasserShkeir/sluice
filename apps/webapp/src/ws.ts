@@ -297,6 +297,16 @@ export function distinctValues(captures: Capture[], pick: (c: Capture) => string
 
 // ── Ingest ──────────────────────────────────────────────────────────────────────
 
+/**
+ * Drop every capture held in the client ring. Used after a successful wipe so
+ * the dashboard cannot keep showing rows the server just deleted.
+ */
+export function clearCaptureRing(): void {
+  captureArr.length = 0;
+  captureIndex.clear();
+  touch();
+}
+
 function upsertCapture(c: Capture): void {
   const existing = captureIndex.get(c.id);
   if (existing !== undefined) {
@@ -364,6 +374,11 @@ function handleMessage(msg: ServerMsg): void {
       break;
     case 'op.progress':
       applyOp(msg.op);
+      // Wipe emptied the server; the client ring must empty too or deleted rows
+      // stay visible until hard refresh.
+      if (msg.op.kind === 'wipe' && msg.op.state === 'ok') {
+        clearCaptureRing();
+      }
       break;
     case 'capture.state':
       capturePaused = msg.paused;
