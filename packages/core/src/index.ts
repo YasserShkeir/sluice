@@ -7,3 +7,4 @@ export * from './redact.js';
 export * from './util.js';
 export * from './body-codec.js';
 export * from './auth-failure.js';
+export * from './replay-deny.js';

@@ -19,6 +19,15 @@ export { launchDebugChrome, defaultChromePath, defaultChromeProfileDir } from '.
 export type { LaunchChromeOptions, LaunchedChrome } from './launch-chrome.js';
 export { ensureSluiceCA, sluiceCaCertPath } from './ca.js';
 export { runReplay } from './replay.js';
+export { runFlowReplay, resolveJsonPath, nextPaceWaitMs, FLOW_DELAY_CAP_MS, DEFAULT_FLOW_TIMEOUT_MS } from './flow-replay.js';
+export type {
+  FlowReplayIO,
+  FlowReplayResult,
+  FlowStepResult,
+  FlowStepStatus,
+  FlowBuildContext,
+  RunFlowReplayOptions,
+} from './flow-replay.js';
 export {
   assertReplayAllowed,
   replayBudget,

@@ -19,6 +19,7 @@
  *      cannot hammer the service and get the account rate-limited or flagged.
  */
 import type { ReplayBudgetState, ReplayRequest } from '@sluice/core';
+import { looksLikeDeniedOperation } from '@sluice/core';
 
 export type ReplayDenialCode =
   | 'method_not_allowed'
@@ -36,24 +37,6 @@ export class ReplayDeniedError extends Error {
 
 /** Verbs that can only mutate. GET/HEAD are reads; POST is ambiguous (see below). */
 const ALLOWED_METHODS = new Set(['GET', 'HEAD', 'POST']);
-
-/**
- * Operation names that write, notify, or administer — matched case-insensitively
- * against the request path. Slack drove this list (it POSTs for reads, so the
- * method check alone would let `chat.postMessage` through), but the patterns are
- * deliberately generic enough to cover the same shapes on other services.
- */
-const DENIED_OPERATIONS: RegExp[] = [
-  /\bchat\.(post|update|delete|meMessage|scheduleMessage)/i,
-  /\badmin\./i,
-  /\bfiles\.(upload|delete|revokePublicURL)/i,
-  /\bconversations\.(create|invite|kick|leave|archive|unarchive|rename|setTopic|setPurpose|close)/i,
-  /\b(users|usergroups)\.(admin|create|update|disable|enable)/i,
-  /\breactions\.(add|remove)/i,
-  /\b(pins|stars|bookmarks)\.(add|remove)/i,
-  /\bviews\.(open|publish|push|update)/i,
-  /\b(oauth|auth)\.(revoke|token|access)/i,
-];
 
 export interface ReplayBudgetOptions {
   /** Requests permitted per window. */
@@ -178,15 +161,11 @@ export function assertReplayAllowed(req: ReplayRequest): void {
   }
   // The operation name can also ride in a form body (Slack sends it in the path,
   // but some services put it in the payload), so check both.
-  const haystack = `${probe}\n${req.body ?? ''}`;
-
-  for (const re of DENIED_OPERATIONS) {
-    if (re.test(haystack)) {
-      throw new ReplayDeniedError(
-        'operation_not_allowed',
-        `replay refused: this looks like a write/admin operation (matched ${re.source}). Sluice replays reads only.`,
-      );
-    }
+  if (looksLikeDeniedOperation(probe, req.body)) {
+    throw new ReplayDeniedError(
+      'operation_not_allowed',
+      `replay refused: this looks like a write/admin operation. Sluice replays reads only.`,
+    );
   }
 }
 

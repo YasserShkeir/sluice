@@ -4,11 +4,11 @@ import { useState } from 'react';
 /**
  * The blocking first-run gate.
  *
- * Sluice's honest caveats — the ToS position, the credential blast radius, the
- * real account risk — lived only in SECURITY.md in the repo. A user who ran
- * `sluice start` and opened the dashboard installed a trusted MITM CA and read a
- * live session credential without ever being shown any of it. A security posture
- * the user never reads is not a security posture.
+ * Product caveats — session credentials, operational effects, workplace policy —
+ * lived only in SECURITY.md in the repo. A user who ran `sluice start` and
+ * opened the dashboard installed a trusted MITM CA and read a live session
+ * credential without ever being shown any of it. A security posture the user
+ * never reads is not a security posture.
  *
  * Consent is stored locally (the page is loopback-only, so there is nobody to
  * tell) and the gate blocks the app until it is given.
@@ -41,28 +41,28 @@ export function FirstRunConsent({ onAccept }: { onAccept: () => void }) {
         <h1 id="consent-title">Before you capture anything</h1>
         <p className="consent-lede">
           Sluice reads a credential equivalent to a live, logged-in session, on your own machine.
-          These are the caveats in full — they are not fine print.
+          A short summary of how Sluice handles session data — worth reading once.
         </p>
 
         <ul className="consent-list">
           <li>
-            <strong>This is a ToS gray area.</strong> Calling a service's endpoints with a{' '}
-            <em>session</em> token is against most services' Terms of Service, even though the
-            account is yours, the machine is yours, and nothing leaves the box.
+            <strong>Session tokens vs supported APIs.</strong> Calling a service with a{' '}
+            <em>session</em> token is the same class of credential a browser extension would use
+            on a logged-in tab. Prefer a workspace-issued API token when one is available.
           </li>
           <li>
-            <strong>Credential blast radius.</strong> A session token plus its cookie together
-            <em> are</em> your logged-in session. Anyone who obtains both can read and act as you
-            until the session is revoked.
+            <strong>Credential sensitivity.</strong> A session token plus its cookie together
+            <em> are</em> a logged-in session. Treat both as highly sensitive until the session
+            is revoked.
           </li>
           <li>
-            <strong>Real risk to your account.</strong> Rate-limiting, session invalidation, and —
-            at an admin's or the service's discretion — account flagging or suspension. Local-only
-            data protects the captured bytes; it does not make the access invisible to audit logs.
+            <strong>Operational effects.</strong> Rate-limiting and session invalidation can still
+            happen. Local-only storage protects captured bytes; it does not hide requests from the
+            service's own logs.
           </li>
           <li>
-            <strong>Your employer's policy may forbid this</strong> even on your own account and
-            machine. Sluice cannot adjudicate that for you.
+            <strong>Workplace policy.</strong> Check any workplace rules that apply to how you
+            access company tools on your machine.
           </li>
           <li>
             <strong>Captured traffic is sensitive.</strong> Secrets are redacted before anything is
@@ -78,7 +78,7 @@ export function FirstRunConsent({ onAccept }: { onAccept: () => void }) {
 
         <label className="consent-ack">
           <input type="checkbox" checked={ack} onChange={(e) => setAck(e.target.checked)} />
-          <span>I understand the risks and I am accessing only my own account.</span>
+          <span>I understand how session credentials are handled and I am using my own local session.</span>
         </label>
 
         <div className="consent-actions">

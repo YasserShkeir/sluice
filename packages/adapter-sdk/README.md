@@ -35,7 +35,10 @@ import {
 - **`runConformance`** — the invariants every adapter must satisfy, as a test you
   run against yours.
 - **`runMockCaptures`** — replay NDJSON captures through the real ingest path with
-  no credentials, to see what your adapter produces.
+  no credentials, to see what your adapter produces. Pacing follows recorded
+  `ts` deltas (`speed`, `maxGapMs`) so multi-request **bursts** look like live
+  traffic — the same fixture path flow clustering / dashboard rate UI should use
+  in tests (F0.4). Prefer `speed: Infinity` in pure unit tests.
 
 ## License
 

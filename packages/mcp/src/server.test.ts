@@ -78,9 +78,125 @@ async function callTool(server: unknown, name: string, args: Record<string, unkn
 test('the core store-backed tools are registered', () => {
   const store = seeded();
   const tools = registeredTools(buildServer(store));
-  for (const name of ['list_workspaces', 'list_channels', 'get_messages']) {
+  for (const name of [
+    'list_workspaces',
+    'list_channels',
+    'get_messages',
+    'sluice_list_flows',
+    'sluice_describe_flow',
+    'sluice_replay_flow',
+  ]) {
     assert.ok(tools.has(name), `${name} must be registered`);
   }
+  store.close();
+});
+
+test('flow tools advertise non-empty parameter schemas', () => {
+  const store = seeded();
+  const tools = registeredTools(buildServer(store));
+  assert.ok(advertisedParams(tools.get('sluice_list_flows')).includes('adapterId'));
+  assert.ok(advertisedParams(tools.get('sluice_describe_flow')).includes('id'));
+  assert.deepEqual(
+    advertisedParams(tools.get('sluice_replay_flow')).sort(),
+    ['adapterId', 'params', 'primaryKey', 'templateId', 'workspaceId'].sort(),
+  );
+  store.close();
+});
+
+test('sluice_list_flows and sluice_describe_flow read the store without secrets', async () => {
+  const store = seeded();
+  store.upsertFlow({
+    id: 'flow-1',
+    adapterId: 'slack',
+    label: 'open channel',
+    primaryCaptureId: 'cap-p',
+    startedAt: 1_000,
+    endedAt: 1_100,
+    source: 'observed',
+    steps: [
+      {
+        captureId: 'cap-p',
+        seq: 0,
+        role: 'primary',
+        operation: 'conversations.history',
+        required: true,
+      },
+      { captureId: 'cap-c', seq: 1, role: 'companion', operation: 'emoji.list', required: false },
+    ],
+  });
+  store.upsertFlowTemplate({
+    id: 'tmpl-1',
+    adapterId: 'slack',
+    primaryKey: 'conversations.history',
+    sampleCount: 2,
+    version: 1,
+    learnedAt: 2_000,
+    flowParams: [{ name: 'channel', required: true }],
+    steps: [
+      {
+        seq: 0,
+        role: 'primary',
+        method: 'POST',
+        path: '/api/conversations.history',
+        operation: 'conversations.history',
+        required: true,
+        support: 1,
+        delayMsP50: 0,
+        params: {
+          channel: { kind: 'flowParam', name: 'channel' },
+          token: { kind: 'session' },
+        },
+        request: {
+          headers: { 'user-agent': 'RealClient/1.0' },
+          bodyParams: {},
+          volatileParams: [],
+        },
+      },
+    ],
+  });
+
+  const server = buildServer(store);
+  const listed = (await callTool(server, 'sluice_list_flows', { adapterId: 'slack' })) as {
+    flows: Array<{ id: string; primaryOp?: string; stepCount: number }>;
+    templates: Array<{ id: string; primaryKey: string; flowParams: unknown }>;
+  };
+  assert.equal(listed.flows.length, 1);
+  assert.equal(listed.flows[0]?.id, 'flow-1');
+  assert.equal(listed.flows[0]?.primaryOp, 'conversations.history');
+  assert.equal(listed.flows[0]?.stepCount, 2);
+  assert.equal(listed.templates.length, 1);
+  assert.equal(listed.templates[0]?.primaryKey, 'conversations.history');
+  // Agent contract: guidance + qualityNotes so clients need not re-derive heuristics.
+  const listedFull = listed as typeof listed & {
+    guidance?: { prefer?: string; next?: string };
+    templates: Array<{ qualityNotes?: string[]; apiStepCount?: number; sampleCount?: number }>;
+  };
+  assert.ok(listedFull.guidance?.prefer);
+  assert.ok(listedFull.guidance?.next?.includes('describe'));
+  assert.equal(listedFull.templates[0]?.sampleCount, 2);
+  assert.ok(Array.isArray(listedFull.templates[0]?.qualityNotes));
+
+  const described = (await callTool(server, 'sluice_describe_flow', { id: 'tmpl-1' })) as {
+    kind: string;
+    primaryKey: string;
+    qualityNotes?: string[];
+    apiStepCount?: number;
+    steps: Array<{ params?: Record<string, { kind: string }> }>;
+  };
+  assert.equal(described.kind, 'template');
+  assert.equal(described.primaryKey, 'conversations.history');
+  assert.ok(Array.isArray(described.qualityNotes));
+  assert.ok(typeof described.apiStepCount === 'number');
+  assert.equal(described.steps[0]?.params?.channel?.kind, 'flowParam');
+  assert.equal(described.steps[0]?.params?.token?.kind, 'session');
+  // No literal token values in the payload.
+  assert.equal(JSON.stringify(described).includes('xox'), false);
+
+  const reg = registeredTools(server).get('sluice_describe_flow');
+  assert.ok(reg?.handler);
+  const errOut = await reg.handler({ id: 'nope' }, {});
+  assert.equal((errOut as { isError?: boolean }).isError, true);
+
   store.close();
 });
 

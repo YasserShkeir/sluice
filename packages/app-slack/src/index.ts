@@ -54,6 +54,22 @@ export const slackApp: App = {
   ...slackAdapter,
   credentials: slackCredentials,
   redaction: slackRedaction,
+  /**
+   * Hand-authored companion sketch when clustering is sparse. Data-learned
+   * templates always win at replay; this only documents expected neighbors.
+   */
+  listFlowHints: () => [
+    {
+      primaryKey: 'conversations.history',
+      label: 'Open channel',
+      companions: ['conversations.members', 'conversations.info', 'emoji.list', 'users.info'],
+    },
+    {
+      primaryKey: 'conversations.replies',
+      label: 'Open thread',
+      companions: ['conversations.history', 'users.info'],
+    },
+  ],
 };
 
 // ── Named re-exports (adapter alias + raw pieces for callers/tests) ─────────────

@@ -163,6 +163,31 @@ test('classify reports a failure as an error but keeps the operation', () => {
   assert.equal(got.operation, 'members/me');
 });
 
+test('classify collapses shortLink card/board paths to :id ops', () => {
+  // Live traffic uses /1/card/6uQ2uchS; templates must not key on the short id.
+  const card = classifyTrelloCapture(trelloJson('/1/card/6uQ2uchS', { id: 'c1' }));
+  assert.equal(card.class, 'messages');
+  assert.equal(card.operation, 'cards/:id');
+  const board = classifyTrelloCapture(trelloJson('/1/board/tTcMzr1z', { id: BOARD, name: 'B' }));
+  assert.equal(board.class, 'structure');
+  assert.equal(board.operation, 'boards/:id');
+});
+
+test('classify names gateway GraphQL as API, not SPA asset', () => {
+  // Regression: notApi catch-all used to label /gateway/api/* as asset, which
+  // then seeded noise flow primaries and blocked real board/card templates.
+  const gq = classifyTrelloCapture(
+    trelloJson('/gateway/api/graphql', { data: {} }, { method: 'POST' }),
+  );
+  assert.notEqual(gq.class, 'asset');
+  assert.ok(gq.operation?.includes('gateway'), gq.operation);
+  assert.ok(gq.operation?.includes('graphql') || gq.operation === 'gateway/api/graphql', gq.operation);
+
+  const gas = classifyTrelloCapture(trelloJson('/gateway/api/gasv3/session/heartbeat', {}));
+  assert.notEqual(gas.class, 'asset');
+  assert.ok(gas.operation && !/^asset$/i.test(gas.operation));
+});
+
 // ── nextCursors ──────────────────────────────────────────────────────────────────
 
 test('a boards response fans out one seed per board', () => {

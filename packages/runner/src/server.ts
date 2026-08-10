@@ -237,10 +237,18 @@ export async function startServer(opts: StartServerOpts): Promise<StartServerRes
     const capture = sanitizeCapture(raw);
     const adapter = adapterFor(capture);
     if (adapter && !capture.adapterId) capture.adapterId = adapter.id; // attribute to its app
-    // Name the operation once, here, rather than re-deriving it per render in
-    // the traffic table. Populated even for unclassified traffic, because the
-    // recon workflow — pointing Sluice at a service with no adapter yet — is
-    // exactly where "which endpoints does this thing call?" is the question.
+    // Prefer the adapter's semantic op (cards/:id, not card/6uQ2uchS). Generic
+    // operationName is the fallback for unattributed traffic and adapters without
+    // classify — calling only operationName was how Trello shortLinks and gateway
+    // paths never collapsed and polluted flow templates.
+    if (capture.classification == null && adapter?.classify) {
+      try {
+        const named = adapter.classify(capture);
+        if (named.operation) capture.classification = named.operation;
+      } catch {
+        // classify is contractually non-throwing; never lose a capture to one that does.
+      }
+    }
     capture.classification ??= operationName(capture.path);
     // Parsing happens immediately below, so this row is done before it lands.
     // Writing it here rather than in a second UPDATE keeps it one statement.

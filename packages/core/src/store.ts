@@ -13,6 +13,15 @@ import type {
   CursorState,
   Edge,
   EdgeQuery,
+  FlowInput,
+  FlowQuery,
+  FlowSource,
+  FlowStep,
+  FlowStepRole,
+  FlowTemplate,
+  FlowTemplateInput,
+  FlowTemplateQuery,
+  InteractionFlow,
   Item,
   ItemFilter,
   ItemQuery,
@@ -131,6 +140,14 @@ function captureWhere(q: CaptureQuery): Where {
   // predicate from `adapterId` (which requires a value), so a delete and the
   // count shown beside it can share this exact WHERE — see deleteCaptures.
   if (q.unattributed) parts.push('adapter_id IS NULL');
+  if (q.ids && q.ids.length > 0) {
+    // Bound the IN list so a huge hydrate request cannot blow the query planner
+    // or the bind limit. Callers batch if they need more.
+    const capped = q.ids.slice(0, 500);
+    const placeholders = capped.map((_, i) => `@id${i}`).join(', ');
+    parts.push(`id IN (${placeholders})`);
+    for (let i = 0; i < capped.length; i++) params[`id${i}`] = capped[i];
+  }
   if (q.bodyMatch) {
     // Contentless FTS reads back as NULL, so the index can only be used to
     // narrow rowids — the row itself always comes from `captures`.
@@ -296,12 +313,12 @@ export class SqliteStore {
           `INSERT INTO captures
          (id, ts, source, adapter_id, method, url, host, path, status, duration_ms,
           req_headers, req_body, res_headers, res_body, pid, process_name,
-          tab_id, tab_url, direction, ws_id,
+          tab_id, tab_url, loader_id, page_load_id, navigation_id, direction, ws_id,
           classification, parsed_at, req_body_encoding, res_body_encoding)
          VALUES
          (@id, @ts, @source, @adapter_id, @method, @url, @host, @path, @status, @duration_ms,
           @req_headers, @req_body, @res_headers, @res_body, @pid, @process_name,
-          @tab_id, @tab_url, @direction, @ws_id,
+          @tab_id, @tab_url, @loader_id, @page_load_id, @navigation_id, @direction, @ws_id,
           @classification, @parsed_at, @req_body_encoding, @res_body_encoding)
          ON CONFLICT(id) DO UPDATE SET
            ts = excluded.ts, source = excluded.source, adapter_id = excluded.adapter_id,
@@ -311,6 +328,8 @@ export class SqliteStore {
            res_headers = excluded.res_headers, res_body = excluded.res_body,
            pid = excluded.pid, process_name = excluded.process_name,
            tab_id = excluded.tab_id, tab_url = excluded.tab_url,
+           loader_id = excluded.loader_id, page_load_id = excluded.page_load_id,
+           navigation_id = excluded.navigation_id,
            direction = excluded.direction, ws_id = excluded.ws_id,
            classification = excluded.classification, parsed_at = excluded.parsed_at,
            req_body_encoding = excluded.req_body_encoding,
@@ -335,6 +354,9 @@ export class SqliteStore {
           process_name: c.processName ?? null,
           tab_id: c.tabId ?? null,
           tab_url: c.tabUrl ?? null,
+          loader_id: c.loaderId ?? null,
+          page_load_id: c.pageLoadId ?? null,
+          navigation_id: c.navigationId ?? null,
           direction: c.direction ?? null,
           ws_id: c.wsId ?? null,
           classification: c.classification ?? null,
@@ -554,7 +576,20 @@ export class SqliteStore {
   wipe(): { captures: number } {
     return this.db.transaction(() => {
       const captures = (this.db.prepare(`SELECT COUNT(*) AS n FROM captures`).get() as { n: number }).n;
-      for (const t of ['captures_fts', 'items_fts', 'edges', 'items', 'containers', 'actors', 'workspaces', 'cursors', 'captures']) {
+      for (const t of [
+        'captures_fts',
+        'items_fts',
+        'edges',
+        'items',
+        'containers',
+        'actors',
+        'workspaces',
+        'cursors',
+        'interaction_flow_steps',
+        'interaction_flows',
+        'flow_templates',
+        'captures',
+      ]) {
         try {
           this.db.exec(`DELETE FROM ${t}`);
         } catch {
@@ -908,6 +943,335 @@ export class SqliteStore {
     return out;
   }
 
+  // ── Interaction flows ──────────────────────────────────────────────────────
+
+  /**
+   * Insert or replace one flow and its steps. Replacing drops prior steps so a
+   * re-cluster or pin edit cannot leave orphan companions attached.
+   *
+   * The primary must appear in `steps` (as role `primary`); if the caller forgot,
+   * it is prepended. Empty step lists are rejected — a flow of nothing is not a
+   * flow, and storing one would make list/get look like data when nothing is linked.
+   */
+  upsertFlow(input: FlowInput): InteractionFlow {
+    if (input.steps.length === 0) {
+      throw new Error('upsertFlow requires at least one step');
+    }
+    const id = input.id ?? newId();
+    let steps = input.steps.slice().sort((a, b) => a.seq - b.seq);
+    if (!steps.some((s) => s.captureId === input.primaryCaptureId)) {
+      steps = [
+        {
+          captureId: input.primaryCaptureId,
+          seq: 0,
+          role: 'primary',
+          required: true,
+        },
+        ...steps.map((s, i) => ({ ...s, seq: i + 1 })),
+      ];
+    } else {
+      // Ensure the primary row is marked primary + required.
+      steps = steps.map((s) =>
+        s.captureId === input.primaryCaptureId
+          ? { ...s, role: 'primary' as const, required: true }
+          : s,
+      );
+    }
+
+    const tx = this.db.transaction(() => {
+      this.db
+        .prepare(
+          `INSERT INTO interaction_flows
+             (id, adapter_id, label, primary_capture_id, started_at, ended_at, source)
+           VALUES
+             (@id, @adapter_id, @label, @primary_capture_id, @started_at, @ended_at, @source)
+           ON CONFLICT(id) DO UPDATE SET
+             adapter_id = excluded.adapter_id,
+             label = excluded.label,
+             primary_capture_id = excluded.primary_capture_id,
+             started_at = excluded.started_at,
+             ended_at = excluded.ended_at,
+             source = excluded.source`,
+        )
+        .run({
+          id,
+          adapter_id: input.adapterId,
+          label: input.label ?? null,
+          primary_capture_id: input.primaryCaptureId,
+          started_at: input.startedAt,
+          ended_at: input.endedAt,
+          source: input.source,
+        });
+
+      this.db.prepare(`DELETE FROM interaction_flow_steps WHERE flow_id = ?`).run(id);
+      const ins = this.db.prepare(
+        `INSERT INTO interaction_flow_steps
+           (flow_id, capture_id, seq, role, operation, required)
+         VALUES
+           (@flow_id, @capture_id, @seq, @role, @operation, @required)`,
+      );
+      for (const s of steps) {
+        ins.run({
+          flow_id: id,
+          capture_id: s.captureId,
+          seq: s.seq,
+          role: s.role,
+          operation: s.operation ?? null,
+          required: s.required ? 1 : 0,
+        });
+      }
+    });
+    tx();
+
+    const got = this.getFlow(id);
+    if (!got) throw new Error(`upsertFlow failed to read back ${id}`);
+    return got;
+  }
+
+  getFlow(id: string): InteractionFlow | undefined {
+    const row = this.db
+      .prepare(`SELECT * FROM interaction_flows WHERE id = ?`)
+      .get(id) as FlowRow | undefined;
+    if (!row) return undefined;
+    return this.flowFromRow(row);
+  }
+
+  listFlows(q: FlowQuery = {}): InteractionFlow[] {
+    const parts: string[] = [];
+    const params: Record<string, unknown> = { limit: q.limit ?? 200 };
+    if (q.adapterId) {
+      parts.push('adapter_id = @adapterId');
+      params.adapterId = q.adapterId;
+    }
+    if (q.source) {
+      parts.push('source = @source');
+      params.source = q.source;
+    }
+    if (q.sinceTs !== undefined) {
+      parts.push('started_at >= @sinceTs');
+      params.sinceTs = q.sinceTs;
+    }
+    if (q.q && q.q.trim().length > 0) {
+      parts.push(`(
+        IFNULL(label, '') LIKE @qq
+        OR primary_capture_id IN (
+          SELECT capture_id FROM interaction_flow_steps
+           WHERE role = 'primary' AND IFNULL(operation, '') LIKE @qq
+        )
+        OR id IN (
+          SELECT flow_id FROM interaction_flow_steps
+           WHERE IFNULL(operation, '') LIKE @qq
+        )
+      )`);
+      params.qq = `%${q.q.trim()}%`;
+    }
+    const where = parts.length ? `WHERE ${parts.join(' AND ')}` : '';
+    const rows = this.db
+      .prepare(
+        `SELECT * FROM interaction_flows ${where}
+          ORDER BY started_at DESC LIMIT @limit`,
+      )
+      .all(params) as FlowRow[];
+    return rows.map((r) => this.flowFromRow(r));
+  }
+
+  /** Drop a flow and its steps. Captures are never touched. */
+  deleteFlow(id: string): boolean {
+    const n = this.db.prepare(`DELETE FROM interaction_flows WHERE id = ?`).run(id).changes;
+    return n > 0;
+  }
+
+  /**
+   * Mark an existing flow as manually pinned so template learning keeps it
+   * even when heuristics would have clustered differently.
+   */
+  pinFlow(id: string): InteractionFlow | undefined {
+    return this.setFlowSource(id, 'pinned');
+  }
+
+  /** Revert a pinned flow to ordinary observed status. */
+  unpinFlow(id: string): InteractionFlow | undefined {
+    return this.setFlowSource(id, 'observed');
+  }
+
+  /**
+   * Manually assemble a pinned flow from ordered capture ids.
+   * Captures must exist; adapterId defaults to the primary capture's adapter.
+   */
+  createPinnedFlow(input: {
+    id?: string;
+    adapterId?: string;
+    label?: string;
+    primaryCaptureId: string;
+    /** Ordered capture ids for the burst (primary may be anywhere; will be marked). */
+    captureIds: string[];
+  }): InteractionFlow {
+    if (input.captureIds.length === 0) {
+      throw new Error('createPinnedFlow requires at least one capture id');
+    }
+    const primary = this.getCapture(input.primaryCaptureId);
+    if (!primary) throw new Error(`unknown primary capture "${input.primaryCaptureId}"`);
+    const ids = input.captureIds.includes(input.primaryCaptureId)
+      ? input.captureIds.slice()
+      : [input.primaryCaptureId, ...input.captureIds];
+    const caps = ids.map((cid) => {
+      const c = this.getCapture(cid);
+      if (!c) throw new Error(`unknown capture "${cid}"`);
+      return c;
+    });
+    const startedAt = Math.min(...caps.map((c) => c.ts));
+    const endedAt = Math.max(...caps.map((c) => c.ts + (c.durationMs ?? 0)));
+    const adapterId = input.adapterId ?? primary.adapterId;
+    if (!adapterId) throw new Error('createPinnedFlow needs adapterId (primary has none)');
+
+    const steps = caps.map((c, i) => ({
+      captureId: c.id,
+      seq: i,
+      role: (c.id === input.primaryCaptureId ? 'primary' : 'companion') as FlowStepRole,
+      operation: c.classification ?? undefined,
+      required: c.id === input.primaryCaptureId,
+    }));
+
+    return this.upsertFlow({
+      id: input.id,
+      adapterId,
+      label: input.label,
+      primaryCaptureId: input.primaryCaptureId,
+      startedAt,
+      endedAt,
+      source: 'pinned',
+      steps,
+    });
+  }
+
+  private setFlowSource(id: string, source: FlowSource): InteractionFlow | undefined {
+    const n = this.db
+      .prepare(`UPDATE interaction_flows SET source = ? WHERE id = ?`)
+      .run(source, id).changes;
+    if (n === 0) return undefined;
+    return this.getFlow(id);
+  }
+
+  private flowFromRow(row: FlowRow): InteractionFlow {
+    const steps = (
+      this.db
+        .prepare(
+          `SELECT capture_id, seq, role, operation, required
+             FROM interaction_flow_steps
+            WHERE flow_id = ?
+            ORDER BY seq ASC`,
+        )
+        .all(row.id) as FlowStepRow[]
+    ).map(
+      (s): FlowStep => ({
+        captureId: s.capture_id,
+        seq: s.seq,
+        role: s.role as FlowStepRole,
+        operation: s.operation ?? undefined,
+        required: s.required === 1,
+      }),
+    );
+    return {
+      id: row.id,
+      adapterId: row.adapter_id,
+      label: row.label ?? undefined,
+      primaryCaptureId: row.primary_capture_id,
+      startedAt: row.started_at,
+      endedAt: row.ended_at,
+      source: row.source as FlowSource,
+      steps,
+    };
+  }
+
+  // ── Flow templates ─────────────────────────────────────────────────────────
+
+  /**
+   * Insert or replace a learned multi-step plan. Unique on (adapter_id, primary_key)
+   * so re-learning the same primary overwrites rather than stacking duplicates.
+   */
+  upsertFlowTemplate(input: FlowTemplateInput): FlowTemplate {
+    if (input.steps.length === 0) {
+      throw new Error('upsertFlowTemplate requires at least one step');
+    }
+    // Prefer the existing row for this primary so re-learn overwrites cleanly
+    // even when the caller omits id (or passes a stale one).
+    const existing = this.getFlowTemplateByPrimary(input.adapterId, input.primaryKey);
+    const id = existing?.id ?? input.id ?? newId();
+    this.db
+      .prepare(
+        `INSERT INTO flow_templates
+           (id, adapter_id, primary_key, label, sample_count, version, learned_at, steps_json, flow_params_json)
+         VALUES
+           (@id, @adapter_id, @primary_key, @label, @sample_count, @version, @learned_at, @steps_json, @flow_params_json)
+         ON CONFLICT(id) DO UPDATE SET
+           adapter_id = excluded.adapter_id,
+           primary_key = excluded.primary_key,
+           label = excluded.label,
+           sample_count = excluded.sample_count,
+           version = excluded.version,
+           learned_at = excluded.learned_at,
+           steps_json = excluded.steps_json,
+           flow_params_json = excluded.flow_params_json`,
+      )
+      .run({
+        id,
+        adapter_id: input.adapterId,
+        primary_key: input.primaryKey,
+        label: input.label ?? null,
+        sample_count: input.sampleCount,
+        version: input.version,
+        learned_at: input.learnedAt,
+        steps_json: JSON.stringify(input.steps),
+        flow_params_json: JSON.stringify(input.flowParams),
+      });
+    const got = this.getFlowTemplate(id);
+    if (!got) throw new Error(`upsertFlowTemplate failed to read back ${id}`);
+    return got;
+  }
+
+  getFlowTemplate(id: string): FlowTemplate | undefined {
+    const row = this.db
+      .prepare(`SELECT * FROM flow_templates WHERE id = ?`)
+      .get(id) as FlowTemplateRow | undefined;
+    return row ? rowToFlowTemplate(row) : undefined;
+  }
+
+  getFlowTemplateByPrimary(adapterId: string, primaryKey: string): FlowTemplate | undefined {
+    const row = this.db
+      .prepare(`SELECT * FROM flow_templates WHERE adapter_id = ? AND primary_key = ?`)
+      .get(adapterId, primaryKey) as FlowTemplateRow | undefined;
+    return row ? rowToFlowTemplate(row) : undefined;
+  }
+
+  listFlowTemplates(q: FlowTemplateQuery = {}): FlowTemplate[] {
+    const parts: string[] = [];
+    const params: Record<string, unknown> = { limit: q.limit ?? 200 };
+    if (q.adapterId) {
+      parts.push('adapter_id = @adapterId');
+      params.adapterId = q.adapterId;
+    }
+    if (q.primaryKey) {
+      parts.push('primary_key = @primaryKey');
+      params.primaryKey = q.primaryKey;
+    }
+    if (q.q && q.q.trim().length > 0) {
+      parts.push(`(IFNULL(label, '') LIKE @qq OR primary_key LIKE @qq)`);
+      params.qq = `%${q.q.trim()}%`;
+    }
+    const where = parts.length ? `WHERE ${parts.join(' AND ')}` : '';
+    const rows = this.db
+      .prepare(
+        `SELECT * FROM flow_templates ${where}
+          ORDER BY learned_at DESC LIMIT @limit`,
+      )
+      .all(params) as FlowTemplateRow[];
+    return rows.map(rowToFlowTemplate);
+  }
+
+  deleteFlowTemplate(id: string): boolean {
+    return this.db.prepare(`DELETE FROM flow_templates WHERE id = ?`).run(id).changes > 0;
+  }
+
   listWorkspaces(): Workspace[] {
     return (this.db.prepare(`SELECT * FROM workspaces ORDER BY name`).all() as WorkspaceRow[]).map(
       rowToWorkspace,
@@ -1125,6 +1489,9 @@ interface CaptureRow {
   process_name: string | null;
   tab_id: string | null;
   tab_url: string | null;
+  loader_id: string | null;
+  page_load_id: string | null;
+  navigation_id: string | null;
   direction: string | null;
   ws_id: string | null;
   classification: string | null;
@@ -1155,6 +1522,33 @@ interface CursorRow {
   last_error: string | null;
   created_ts: number;
   updated_ts: number;
+}
+interface FlowRow {
+  id: string;
+  adapter_id: string;
+  label: string | null;
+  primary_capture_id: string;
+  started_at: number;
+  ended_at: number;
+  source: string;
+}
+interface FlowStepRow {
+  capture_id: string;
+  seq: number;
+  role: string;
+  operation: string | null;
+  required: number;
+}
+interface FlowTemplateRow {
+  id: string;
+  adapter_id: string;
+  primary_key: string;
+  label: string | null;
+  sample_count: number;
+  version: number;
+  learned_at: number;
+  steps_json: string;
+  flow_params_json: string;
 }
 interface WorkspaceRow {
   id: string;
@@ -1233,6 +1627,9 @@ function rowToCapture(r: CaptureRow): Capture {
     processName: r.process_name,
     tabId: r.tab_id,
     tabUrl: r.tab_url,
+    loaderId: r.loader_id,
+    pageLoadId: r.page_load_id,
+    navigationId: r.navigation_id,
     direction: (r.direction as Capture['direction']) ?? null,
     wsId: r.ws_id,
     classification: r.classification,
@@ -1264,6 +1661,20 @@ function rowToWorkItem(r: CursorRow): WorkItem {
     lastError: r.last_error ?? undefined,
     createdTs: r.created_ts,
     updatedTs: r.updated_ts,
+  };
+}
+function rowToFlowTemplate(r: FlowTemplateRow): FlowTemplate {
+  return {
+    id: r.id,
+    adapterId: r.adapter_id,
+    primaryKey: r.primary_key,
+    label: r.label ?? undefined,
+    sampleCount: r.sample_count,
+    version: r.version,
+    learnedAt: r.learned_at,
+    steps: (unj<FlowTemplate['steps']>(r.steps_json) ?? []) as FlowTemplate['steps'],
+    flowParams: (unj<FlowTemplate['flowParams']>(r.flow_params_json) ??
+      []) as FlowTemplate['flowParams'],
   };
 }
 function rowToWorkspace(r: WorkspaceRow): Workspace {

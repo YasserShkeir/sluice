@@ -221,3 +221,8 @@ including the argument-passing and traffic-capture traps, is in the
 - Consider documenting the service's endpoints first — see the `sluice-api-doc`
   skill. Writing the adapter is much easier when you already know what the client
   actually calls.
+
+## Optional flow hints
+
+Adapters may implement `listFlowHints()` returning `{ primaryKey, label?, companions[] }` sketches when capture clustering is weak. Data-learned templates from `learnFlowTemplates` always win at replay — hints are documentation for agents/UI, not a second fingerprint path. Never hardcode frozen Chrome UAs in flow builders; use cartographer `buildFlowStepRequest`.
+

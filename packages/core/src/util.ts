@@ -22,9 +22,13 @@ const PREFIX_NOISE = /^(api|v\d+|\d+)$/i;
  * Segments that are an identity rather than a name. Deliberately conservative:
  * mistaking a real path segment for an id merges two distinct operations into
  * one row, which is a worse failure than leaving an id in the name.
+ *
+ * Includes Trello shortLinks (8-char base62 with both a letter and a digit,
+ * e.g. `6uQ2uchS`, `tTcMzr1z`) so unattributed traffic still groups. Pure
+ * words like `messages` stay names.
  */
 const LOOKS_LIKE_ID =
-  /^(\d+|[0-9a-f]{8,}|[0-9a-fA-F-]{32,}|[A-Z][0-9A-Z]{6,}|[\w-]{22,})$/;
+  /^(\d+|[0-9a-f]{8,}|[0-9a-fA-F-]{32,}|[A-Z][0-9A-Z]{6,}|[\w-]{22,}|(?=[a-zA-Z0-9]*\d)(?=[a-zA-Z0-9]*[a-zA-Z])[a-zA-Z0-9]{8})$/;
 
 /**
  * A stable, human-readable name for what an endpoint DOES, derived from its path.

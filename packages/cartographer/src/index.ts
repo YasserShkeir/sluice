@@ -9,6 +9,7 @@
  *   - deriveTables(store)  → TableSpec[] (proposed per-app tables)
  *   - materialize(store)   → creates + upserts per-app tables (idempotent)
  *   - renderMarkdown(map)  → human-readable API docs
+ *   - clusterFlows(store)  → clusters of flows
  *
  * Everything below reads the store's captures and, for materialize, writes
  * per-app tables into the SAME db via the store's readonly `db` handle. Only
@@ -20,3 +21,6 @@ export * from './map.js';
 export * from './materialize.js';
 export * from './render.js';
 export * from './faithful.js';
+export * from './flows.js';
+export * from './flow-learn.js';
+export * from './flow-build.js';

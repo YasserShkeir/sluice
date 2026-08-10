@@ -145,6 +145,35 @@ Verify a new tool end to end rather than trusting registration: start the server
 confirm the tool is listed with the parameters you expect (not an empty schema),
 and call it once with real arguments.
 
+
+## Multi-step flows
+
+Core tools (not app tools) for observation-learned bursts:
+
+- `sluice_list_flows` — observed/pinned flows + learned templates (ids, step counts, params, **qualityNotes**, **apiStepCount**). No secrets. Includes a short `guidance` object for agents.
+- `sluice_describe_flow` — step roles, bindings, `offsetFromPrimaryMsP50` / `offsetSpreadMs`, unreproducible flags, qualityNotes. No secrets.
+- `sluice_replay_flow` — sequential read-only run via `buildFlowStepRequest` (**must pass `allowedHosts: app.hosts`**) + `runFlowReplay` + `runReplay`.
+
+App tools that need multiple hops should call `ctx.replayFlow(templateId, params)` rather than chaining bare `fetch`. Single hops still use `ctx.replay(req)`.
+
+### Operational contract (do not omit from tool descriptions)
+
+From live Trello/Slack capture review — keep these in descriptions when editing flow tools:
+
+1. MCP does **not** cluster or learn; operators run `sluice learn-flows --adapter <id>` after capture.
+2. Prefer templates with `sampleCount ≥ 2` and API primaries (`cards/:id`, `boards/:id`, …) — **not** `assets/*`.
+3. MITM/WS → no page-load correlation; CDP → `loaderId`/`pageLoadId`. WS excluded from HTTP bursts.
+4. Sibling pacing is **primary-anchored** (`offsetFromPrimaryMsP50`, 2s cap); negative offsets = pre-primary, fire immediately if late.
+5. Soft unreproducible companions skip; required failures stop; no write ops; hosts must match adapter allowlist.
+6. List/describe expose `qualityNotes` so agents can reject asset-primary or single-sample junk without re-deriving heuristics.
+
+### Checklist (flow-related)
+
+- Descriptions state read-only, budgeted, this-machine-only, skip-don't-guess.
+- `allowedHosts: app.hosts` on every `buildFlowStepRequest` call site.
+- No secrets in list/describe/replay results.
+- `pnpm --filter @sluice/mcp test` after description or schema changes.
+
 ## Checklist
 
 - Right seam: does `packages/mcp` need to know a specific app? Then it belongs in the app.

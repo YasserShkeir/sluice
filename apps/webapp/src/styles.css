@@ -275,6 +275,12 @@ select {
 .tb-btn:hover:not(:disabled) {
   border-color: var(--accent);
 }
+
+.tb-btn.is-active {
+  background: var(--color-accent-dim, rgba(99, 102, 241, 0.2));
+  color: var(--color-fg);
+  border-color: var(--color-accent, #6366f1);
+}
 .tb-btn:disabled {
   color: var(--fg-mute);
   cursor: not-allowed;
@@ -942,10 +948,6 @@ select {
 .badge.lock {
   color: #9ad0a0;
   border-color: #2c4a30;
-}
-.badge.tos {
-  color: var(--warn);
-  border-color: #4a3a1a;
 }
 .catalog {
   height: 100%;

@@ -29,10 +29,10 @@
  *     echo-server test — so a request whose real value was `same-origin` goes
  *     out as `cors`. That one is a residual tell we cannot correct from here.
  *
- * This raises fidelity and cuts anomaly-flag false positives on your own
- * account's reads. It is not perfect camouflage, it does not defeat a service's
- * bot detection, and it does not change a service's Terms.
+ * This raises fidelity on your own account's reads by reconstructing the
+ * request the way the real client did, within what Node's fetch can emit.
  */
+
 import { randomUUID } from 'node:crypto';
 import { decodeBody } from '@sluice/core';
 import type { ReplayRequest, SqliteStore } from '@sluice/core';

@@ -2,9 +2,17 @@
 import { useEffect, useMemo, useState } from 'react';
 import type { Capture, Item } from '@sluice/core';
 import { formatClock, formatDuration, humanizeBytes, prettyJson, statusClass, toCurl } from '../format.js';
-import { fetchCaptureBody, fetchCaptureEntities } from '../api.js';
+import {
+  fetchCaptureBody,
+  fetchCaptureEntities,
+  fetchFlowTemplates,
+  fetchFlows,
+  type FlowSummary,
+  type FlowTemplateSummary,
+} from '../api.js';
 import { diffLines, diffStat } from '../diff.js';
 import { setPin, usePin } from '../pin.js';
+import { matchTemplateForFlow, primaryMembership, indexFlowsByCapture } from '../flow-ui.js';
 import { JsonTree } from './JsonTree.js';
 
 interface Props {
@@ -12,7 +20,7 @@ interface Props {
   onClose: () => void;
 }
 
-type Tab = 'response' | 'request' | 'timing' | 'entities' | 'curl' | 'diff';
+type Tab = 'response' | 'request' | 'timing' | 'entities' | 'flow' | 'curl' | 'diff';
 
 /** Copy-to-clipboard button with a brief "copied" acknowledgement. */
 function CopyButton({ text, label = 'Copy' }: { text: string; label?: string }) {
@@ -102,11 +110,16 @@ export function CaptureInspector({ capture, onClose }: Props) {
     resHeaders: Record<string, string>;
   } | null>(null);
   const [entities, setEntities] = useState<Item[] | null>(null);
+  const [flowInfo, setFlowInfo] = useState<{
+    flows: FlowSummary[];
+    templates: FlowTemplateSummary[];
+  } | null>(null);
   const pinned = usePin();
 
   useEffect(() => {
     setFetched(null);
     setEntities(null);
+    setFlowInfo(null);
     let live = true;
     fetchCaptureBody(capture.id)
       .then((b) => {
@@ -136,6 +149,25 @@ export function CaptureInspector({ capture, onClose }: Props) {
     };
   }, [tab, capture.id, entities]);
 
+  // Lazy: flow membership + matching templates when the Flow tab opens.
+  useEffect(() => {
+    if (tab !== 'flow' || flowInfo !== null) return;
+    let live = true;
+    Promise.all([
+      fetchFlows({ limit: 100, app: capture.adapterId ?? undefined }),
+      fetchFlowTemplates({ limit: 100, app: capture.adapterId ?? undefined }),
+    ])
+      .then(([f, tmpl]) => {
+        if (live) setFlowInfo({ flows: f.flows, templates: tmpl.templates });
+      })
+      .catch(() => {
+        if (live) setFlowInfo({ flows: [], templates: [] });
+      });
+    return () => {
+      live = false;
+    };
+  }, [tab, capture.id, capture.adapterId, flowInfo]);
+
   const reqHeaders = fetched?.reqHeaders ?? capture.reqHeaders;
   const resHeaders = fetched?.resHeaders ?? capture.resHeaders;
   const reqBody = fetched?.reqBody ?? capture.reqBody;
@@ -149,6 +181,7 @@ export function CaptureInspector({ capture, onClose }: Props) {
     { id: 'request', label: 'Request' },
     { id: 'timing', label: 'Timing' },
     { id: 'entities', label: 'Entities' },
+    { id: 'flow', label: 'Flow' },
     { id: 'curl', label: 'cURL' },
   ];
   // The Diff tab appears only once something else is pinned to compare against.
@@ -241,6 +274,12 @@ export function CaptureInspector({ capture, onClose }: Props) {
         {tab === 'entities' ? (
           <div className="min-h-0 flex-1 overflow-auto">
             <Entities items={entities} parsedAt={capture.parsedAt ?? null} />
+          </div>
+        ) : null}
+
+        {tab === 'flow' ? (
+          <div className="min-h-0 flex-1 overflow-auto">
+            <FlowPanel capture={capture} info={flowInfo} />
           </div>
         ) : null}
 
@@ -354,6 +393,110 @@ function Diff({ pinnedLabel, left, right }: { pinnedLabel: string; left: string;
           </div>
         ))}
       </div>
+    </div>
+  );
+}
+
+
+function FlowPanel({
+  capture,
+  info,
+}: {
+  capture: Capture;
+  info: { flows: FlowSummary[]; templates: FlowTemplateSummary[] } | null;
+}) {
+  if (info === null) return <div className="text-[12px] text-fg-mute">Loading…</div>;
+
+  const memberships = indexFlowsByCapture(info.flows).get(capture.id) ?? [];
+  const primary = primaryMembership(memberships);
+
+  if (memberships.length === 0) {
+    return (
+      <div className="flex flex-col gap-2 text-[12px] text-fg-mute">
+        <p>This capture is not part of an observed or pinned interaction flow yet.</p>
+        <p>
+          After capturing a burst, run{' '}
+          <code className="font-mono text-fg">sluice learn-flows</code> (or pin captures with{' '}
+          <code className="font-mono text-fg">sluice flows pin-captures</code>). Toggle{' '}
+          <span className="text-fg">Group flows</span> on the traffic table to browse bursts.
+        </p>
+      </div>
+    );
+  }
+
+  return (
+    <div className="flex flex-col gap-4 text-[12px]">
+      {memberships.map((m) => {
+        const tmpl = matchTemplateForFlow(m.flow, info.templates);
+        const steps = [...(m.flow.steps ?? [])].sort((a, b) => a.seq - b.seq);
+        return (
+          <div key={m.flow.id} className="rounded border border-border/60 p-2">
+            <div className="mb-1 flex flex-wrap items-center gap-2">
+              <span className="font-medium text-fg">{m.flow.label || m.flow.primaryOp || m.flow.id}</span>
+              <span className="rounded bg-bg-3 px-1.5 py-0.5 font-mono text-[10px] text-fg-dim">
+                {m.flow.source}
+              </span>
+              <span className="font-mono text-[10px] text-fg-mute">{m.flow.adapterId}</span>
+            </div>
+            <div className="mb-2 text-[11px] text-fg-mute">
+              This row is step {m.step.seq} · <span className="text-fg-dim">{m.step.role}</span>
+              {m.step.required ? ' · required' : ' · optional'}
+              {m.isPrimary ? ' · primary' : ''}
+            </div>
+            <ol className="mb-2 flex flex-col gap-0.5 border-l border-border pl-2">
+              {steps.map((s) => {
+                const here = s.captureId === capture.id;
+                return (
+                  <li
+                    key={`${s.seq}-${s.captureId}`}
+                    className={[
+                      'font-mono text-[11px]',
+                      here ? 'font-medium text-fg' : 'text-fg-dim',
+                    ].join(' ')}
+                  >
+                    <span className="text-fg-mute">{s.seq}.</span> {s.role}
+                    {s.operation ? ` · ${s.operation}` : ''}
+                    {s.required ? '' : ' (soft)'}
+                    {here ? ' ←' : ''}
+                  </li>
+                );
+              })}
+            </ol>
+            {tmpl ? (
+              <div className="rounded bg-bg-0/40 p-2 text-[11px]">
+                <div className="text-fg">
+                  Learned template <span className="font-mono">{tmpl.primaryKey}</span>
+                  <span className="text-fg-mute">
+                    {' '}
+                    · {tmpl.stepCount} steps · {tmpl.sampleCount} sample
+                    {tmpl.sampleCount === 1 ? '' : 's'}
+                  </span>
+                </div>
+                {tmpl.steps && tmpl.steps.some((s) => s.unreproducible) ? (
+                  <div className="mt-1 text-warn">
+                    Some companions marked unreproducible — soft steps may skip at run time.
+                  </div>
+                ) : null}
+                <pre className="mt-1 overflow-x-auto font-mono text-[10px] text-fg-mute">
+                  sluice replay --flow {tmpl.id}
+                </pre>
+                <div className="mt-0.5 text-[10px] text-fg-mute">
+                  Or MCP tool <code className="font-mono">sluice_replay_flow</code> (read-only,
+                  budgeted). Multi-step run is not wired to the dashboard WebSocket yet.
+                </div>
+              </div>
+            ) : (
+              <div className="text-[11px] text-fg-mute">
+                No learned template for this primary yet. Run{' '}
+                <code className="font-mono text-fg">sluice learn-flows --adapter {m.flow.adapterId}</code>.
+              </div>
+            )}
+          </div>
+        );
+      })}
+      {primary && memberships.length > 1 ? (
+        <p className="text-[11px] text-fg-mute">Showing all flows that include this capture.</p>
+      ) : null}
     </div>
   );
 }

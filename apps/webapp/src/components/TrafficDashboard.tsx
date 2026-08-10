@@ -31,10 +31,13 @@ import type { Capture } from '@sluice/core';
 import type { ConnectionState } from '../ws.js';
 import { distinctValues, sendCaptureControl, sendSync } from '../ws.js';
 import { appOf } from '../analytics.js';
-import { searchCaptureBodies } from '../api.js';
+import { fetchFlows, fetchCapturesByIds, searchCaptureBodies } from '../api.js';
+import type { FlowSummary } from '../api.js';
 import { formatClock, formatDuration, humanizeBytes, statusClass, toCurl } from '../format.js';
 import { EMPTY_QUERY, matchesFilter, parseFilter, serverSideTerms } from '../filter.js';
 import type { FilterQuery } from '../filter.js';
+import { buildFlowGroupedRows, primaryMembership, indexFlowsByCapture } from '../flow-ui.js';
+import type { CaptureFlowMembership, FlowDisplayRow } from '../flow-ui.js';
 
 /** Cap the visible grid; the runner's SQLite store keeps the full history. */
 const MAX_ROWS = 8000;
@@ -130,11 +133,22 @@ export function TrafficDashboard({
    *  body term in play, which is different from "searched and found nothing". */
   const [bodyHits, setBodyHits] = useState<ReadonlySet<string> | null>(null);
   const [searchError, setSearchError] = useState<string | null>(null);
+  /** F7.1 — collapse companions under observed/pinned interaction flows. */
+  const [groupByFlow, setGroupByFlow] = useState(false);
+  const [flows, setFlows] = useState<FlowSummary[]>([]);
+  const [flowsError, setFlowsError] = useState<string | null>(null);
+  const [expandedFlows, setExpandedFlows] = useState<ReadonlySet<string>>(() => new Set());
 
   const listRef = useRef<Capture[]>([]);
   const indexRef = useRef<Map<string, number>>(new Map());
   const seqRef = useRef<Map<string, number>>(new Map());
   const seqCounter = useRef(0);
+  /**
+   * Captures pulled for Group-flows that are not in the live ingest ring.
+   * Kept off listRef so hydration does not invent seqs or churn version /
+   * re-fetch flows on every gap fill.
+   */
+  const flowHydrateRef = useRef<Map<string, Capture>>(new Map());
   // Ids present at the last Clear — skipped so a Clear taken while recording doesn't
   // immediately re-ingest everything still in the store's live window.
   const ignoredRef = useRef<Set<string>>(new Set());
@@ -233,6 +247,74 @@ export function TrafficDashboard({
     };
   }, [bodyQueries]);
 
+  // ── Flow index for F7 grouping (only while the toggle is on) ─────────────────
+  useEffect(() => {
+    if (!groupByFlow) {
+      flowHydrateRef.current.clear();
+      return;
+    }
+    let cancelled = false;
+    const load = () => {
+      fetchFlows({ limit: 200, app: appFilter || undefined })
+        .then((r) => {
+          if (cancelled) return;
+          setFlows((prev) => (flowsListUnchanged(prev, r.flows) ? prev : r.flows));
+          setFlowsError(null);
+        })
+        .catch((e: unknown) => {
+          if (cancelled) return;
+          setFlowsError(e instanceof Error ? e.message : String(e));
+          setFlows([]);
+        });
+    };
+    load();
+    const t = setInterval(load, 15_000);
+    return () => {
+      cancelled = true;
+      clearInterval(t);
+    };
+    // Intentionally omit `version` — live ingest must not storm GET /api/flows.
+  }, [groupByFlow, appFilter]);
+
+  // Pull flow step captures that fell out of the live WS ring so Group flows
+  // shows full bursts, not only members still in the client window.
+  useEffect(() => {
+    if (!groupByFlow || flows.length === 0) return;
+    let cancelled = false;
+    const have = new Set<string>([
+      ...listRef.current.map((c) => c.id),
+      ...flowHydrateRef.current.keys(),
+    ]);
+    const missing: string[] = [];
+    for (const f of flows) {
+      for (const s of f.steps ?? []) {
+        if (s.captureId && !have.has(s.captureId)) missing.push(s.captureId);
+      }
+    }
+    const unique = [...new Set(missing)].slice(0, 500);
+    if (unique.length === 0) return;
+    fetchCapturesByIds(unique)
+      .then((r) => {
+        if (cancelled || r.captures.length === 0) return;
+        let changed = false;
+        for (const c of r.captures) {
+          if (listRef.current.some((x) => x.id === c.id)) continue;
+          if (flowHydrateRef.current.has(c.id)) continue;
+          flowHydrateRef.current.set(c.id, c);
+          changed = true;
+        }
+        // Recompute grouped rows without treating hydrate as live ingest.
+        if (changed) setVersion((v) => v + 1);
+      })
+      .catch(() => {
+        /* hydrate is best-effort; grouping still works with the live ring */
+      });
+    return () => {
+      cancelled = true;
+    };
+    // Do not depend on `version` — that re-triggered hydrate on every ingest frame.
+  }, [groupByFlow, flows]);
+
   // ── Filter-menu options: distinct values across everything ingested ───────────
   const options = useMemo(
     () => ({
@@ -256,9 +338,13 @@ export function TrafficDashboard({
   );
 
   // ── Derived rows: newest last, every term AND-combined ────────────────────────
-  const rows = useMemo(() => {
+  const filteredCaptures = useMemo(() => {
+    const pool =
+      groupByFlow && flowHydrateRef.current.size > 0
+        ? mergeLiveAndHydrated(listRef.current, flowHydrateRef.current)
+        : listRef.current;
     const out: Capture[] = [];
-    for (const c of listRef.current) {
+    for (const c of pool) {
       // `body:` was answered by the server; skip it locally so a row the server
       // matched is not then rejected by a substring test over a body the client
       // may not even hold.
@@ -267,25 +353,47 @@ export function TrafficDashboard({
       out.push(c);
     }
     return out;
-  }, [version, query, bodyHits]);
+  }, [version, query, bodyHits, groupByFlow]);
+
+  const flowMembership = useMemo(() => indexFlowsByCapture(flows), [flows]);
+
+  const displayRows: FlowDisplayRow[] | null = useMemo(() => {
+    if (!groupByFlow) return null;
+    return buildFlowGroupedRows(filteredCaptures, flows, expandedFlows);
+  }, [groupByFlow, filteredCaptures, flows, expandedFlows]);
+
+  /** Flat capture list used for selection / multi / follow when not grouping. */
+  const rows = filteredCaptures;
+
+  const virtualCount = displayRows ? displayRows.length : rows.length;
 
   const total = listRef.current.length;
 
   // ── Virtualizer ───────────────────────────────────────────────────────────────
   const virtualizer = useVirtualizer({
-    count: rows.length,
+    count: virtualCount,
     getScrollElement: () => scrollRef.current,
     estimateSize: () => ROW_H,
     overscan: 12,
-    getItemKey: (i) => rows[i]?.id ?? i,
+    getItemKey: (i) => {
+      if (displayRows) {
+        const r = displayRows[i];
+        if (!r) return i;
+        if (r.kind === 'flow') return `flow:${r.flow.id}`;
+        if (r.kind === 'ungrouped-header') return 'ungrouped';
+        const flowId = r.membership?.flow.id ?? (r.nested ? 'nested' : 'top');
+        return `cap:${flowId}:${r.capture.id}`;
+      }
+      return rows[i]?.id ?? i;
+    },
   });
 
   // Follow the tail. Re-run on row count so a burst keeps the newest row visible.
   useLayoutEffect(() => {
-    if (!follow || rows.length === 0) return;
-    virtualizer.scrollToIndex(rows.length - 1, { align: 'end' });
+    if (!follow || virtualCount === 0) return;
+    virtualizer.scrollToIndex(virtualCount - 1, { align: 'end' });
     setUnseen(0);
-  }, [rows.length, follow, virtualizer]);
+  }, [virtualCount, follow, virtualizer]);
 
   const onScroll = useCallback(() => {
     const el = scrollRef.current;
@@ -316,6 +424,7 @@ export function TrafficDashboard({
     indexRef.current = new Map();
     seqRef.current = new Map();
     seqCounter.current = 0;
+    flowHydrateRef.current.clear();
     ignoredRef.current = new Set(captures.map((c) => c.id));
     setMarks(new Set());
     setMulti(new Set());
@@ -425,6 +534,15 @@ export function TrafficDashboard({
         </div>
 
         <div className="tb-group tb-filters">
+          <button
+            type="button"
+            className={`tb-btn ${groupByFlow ? 'is-active' : ''}`}
+            aria-pressed={groupByFlow}
+            title="Group companions under observed/pinned interaction flows (run sluice learn-flows to populate)"
+            onClick={() => setGroupByFlow((v) => !v)}
+          >
+            {groupByFlow ? '☰ Flows on' : '☰ Group flows'}
+          </button>
           <input
             className="tb-filter font-mono"
             placeholder={'status:429 op:conversations.* dur:>1500 body:"not_in_channel" -op:client.counts'}
@@ -453,16 +571,24 @@ export function TrafficDashboard({
 
         <div className="tb-group tb-count">
           <span className="tabnum muted">
-            {rows.length.toLocaleString()} / {total.toLocaleString()} requests
+            {(displayRows ? filteredCaptures.length : rows.length).toLocaleString()} /{' '}
+            {total.toLocaleString()} requests
+            {groupByFlow
+              ? ` · ${displayRows ? displayRows.filter((r) => r.kind === 'flow').length : 0}/${flows.length} flows in view`
+              : ''}
             {multi.size > 1 ? ` · ${multi.size} selected` : ''}
             {marks.size > 0 ? ` · ${marks.size} marked` : ''}
           </span>
         </div>
       </header>
 
-      {query.errors.length > 0 || searchError ? (
+      {query.errors.length > 0 || searchError || flowsError ? (
         <div className="border-b border-border bg-warn/10 px-3 py-1 font-mono text-[11px] text-warn" role="status">
-          {searchError ? `body search failed: ${searchError}` : query.errors.join(' · ')}
+          {searchError
+            ? `body search failed: ${searchError}`
+            : flowsError
+              ? `flows: ${flowsError}`
+              : query.errors.join(' · ')}
         </div>
       ) : null}
 
@@ -479,7 +605,7 @@ export function TrafficDashboard({
       <div
         role="grid"
         aria-label="Captured traffic"
-        aria-rowcount={rows.length + 1}
+        aria-rowcount={virtualCount + 1}
         aria-colcount={COLUMNS.length}
         className="relative flex min-h-0 flex-1 flex-col"
       >
@@ -506,11 +632,84 @@ export function TrafficDashboard({
                 ? 'Recording… waiting for traffic. Start the proxy and generate requests.'
                 : 'Paused. No traffic captured — press ● Record to start.'}
             </div>
-          ) : rows.length === 0 ? (
-            <div className="empty">No requests match the current filter.</div>
+          ) : virtualCount === 0 ? (
+            <div className="empty">
+              {groupByFlow && flows.length > 0 && filteredCaptures.length === 0
+                ? 'No requests match the current filter.'
+                : groupByFlow && flows.length > 0
+                  ? 'Flows are loaded, but none of their captures are in this traffic window. Clear filters, press Sync, or capture a fresh burst and re-run learn-flows.'
+                  : groupByFlow && flows.length === 0
+                    ? 'No interaction flows in the store yet. Run: sluice learn-flows'
+                    : 'No requests match the current filter.'}
+            </div>
           ) : (
             <div role="rowgroup" className="relative w-full" style={{ height: virtualizer.getTotalSize() }}>
               {virtualizer.getVirtualItems().map((v) => {
+                if (displayRows) {
+                  const r = displayRows[v.index];
+                  if (!r) return null;
+                  if (r.kind === 'flow') {
+                    return (
+                      <FlowGroupRow
+                        key={`flow:${r.flow.id}`}
+                        flow={r.flow}
+                        members={r.members}
+                        expanded={r.expanded}
+                        top={v.start}
+                        rowIndex={v.index}
+                        onToggle={() => {
+                          setExpandedFlows((prev) => {
+                            const next = new Set(prev);
+                            if (!next.delete(r.flow.id)) next.add(r.flow.id);
+                            return next;
+                          });
+                        }}
+                        onSelectPrimary={() => {
+                          const primary =
+                            r.members.find((c) => c.id === r.flow.primaryCaptureId) ?? r.members[0];
+                          if (primary) onSelect(primary);
+                        }}
+                      />
+                    );
+                  }
+                  if (r.kind === 'ungrouped-header') {
+                    return (
+                      <div
+                        key="ungrouped"
+                        role="row"
+                        aria-rowindex={v.index + 2}
+                        className="absolute inset-x-0 flex items-center border-b border-border/80 bg-bg-2/80 px-3 font-mono text-[11px] text-fg-mute"
+                        style={{ height: ROW_H, transform: `translateY(${v.start}px)` }}
+                      >
+                        <div role="gridcell" aria-colindex={1} className="truncate">
+                          Ungrouped · {r.count} request{r.count === 1 ? '' : 's'} not in a learned/pinned flow
+                        </div>
+                      </div>
+                    );
+                  }
+                  const c = r.capture;
+                  return (
+                    <Row
+                      key={`cap:${c.id}:${r.nested ? 'n' : 't'}`}
+                      capture={c}
+                      seq={seqRef.current.get(c.id) ?? 0}
+                      rowIndex={v.index}
+                      top={v.start}
+                      selected={c.id === selectedId}
+                      inSelection={multi.has(c.id)}
+                      marked={marks.has(c.id)}
+                      nested={r.nested}
+                      membership={r.membership ?? primaryMembership(flowMembership.get(c.id))}
+                      onClick={onRowClick}
+                      onToggleMark={toggleMark}
+                      onCopyCurl={copyCurl}
+                      onCopySelection={copySelection}
+                      onFilterOp={(op) => addTerm(`op:${op}`)}
+                      onExcludeOp={(op) => addTerm(`-op:${op}`)}
+                      selectionSize={multi.size}
+                    />
+                  );
+                }
                 const c = rows[v.index];
                 if (!c) return null;
                 return (
@@ -523,6 +722,7 @@ export function TrafficDashboard({
                     selected={c.id === selectedId}
                     inSelection={multi.has(c.id)}
                     marked={marks.has(c.id)}
+                    membership={primaryMembership(flowMembership.get(c.id))}
                     onClick={onRowClick}
                     onToggleMark={toggleMark}
                     onCopyCurl={copyCurl}
@@ -564,6 +764,100 @@ function localQuery(q: FilterQuery): FilterQuery {
   return { terms: q.terms.filter((t) => !server.includes(t)), errors: q.errors };
 }
 
+/** Skip setFlows when id+endedAt fingerprint is unchanged (avoids hydrate thrash). */
+function flowsListUnchanged(a: FlowSummary[], b: FlowSummary[]): boolean {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) {
+    const x = a[i]!;
+    const y = b[i]!;
+    if (x.id !== y.id || x.endedAt !== y.endedAt) return false;
+  }
+  return true;
+}
+
+/** Live ring first, then side-map hydrates not already present. */
+function mergeLiveAndHydrated(live: Capture[], hydrated: Map<string, Capture>): Capture[] {
+  if (hydrated.size === 0) return live;
+  const have = new Set(live.map((c) => c.id));
+  const extra: Capture[] = [];
+  for (const c of hydrated.values()) {
+    if (!have.has(c.id)) extra.push(c);
+  }
+  return extra.length === 0 ? live : live.concat(extra);
+}
+
+function FlowGroupRow({
+  flow,
+  members,
+  expanded,
+  top,
+  rowIndex,
+  onToggle,
+  onSelectPrimary,
+}: {
+  flow: FlowSummary;
+  members: Capture[];
+  expanded: boolean;
+  top: number;
+  rowIndex: number;
+  onToggle: () => void;
+  onSelectPrimary: () => void;
+}) {
+  const label = flow.label || flow.primaryOp || flow.id;
+  return (
+    <div
+      role="row"
+      aria-rowindex={rowIndex + 2}
+      aria-expanded={expanded}
+      tabIndex={0}
+      className="absolute inset-x-0 grid cursor-pointer items-center border-b border-border bg-bg-2/90 px-2 font-mono text-[12px] text-fg hover:bg-bg-3"
+      style={{ gridTemplateColumns: GRID_COLS, height: ROW_H, transform: `translateY(${top}px)` }}
+      onClick={onToggle}
+      onKeyDown={(e) => {
+        if (e.key === 'Enter' || e.key === ' ') {
+          e.preventDefault();
+          onToggle();
+        }
+      }}
+    >
+      <div role="gridcell" aria-colindex={1} className="truncate px-1 text-fg-mute">
+        {expanded ? '▼' : '▶'}
+      </div>
+      <div role="gridcell" aria-colindex={2} className="truncate px-1 text-fg-dim" title={flow.id}>
+        flow
+      </div>
+      <div role="gridcell" aria-colindex={3} className="truncate px-1">
+        {flow.adapterId}
+      </div>
+      <div role="gridcell" aria-colindex={4} className="truncate px-1 text-fg-dim">
+        {flow.source}
+      </div>
+      <div
+        role="gridcell"
+        aria-colindex={5}
+        className="truncate px-1 font-medium"
+        style={{ gridColumn: '5 / 10' }}
+        title={`${label} · ${members.length}/${flow.stepCount} in window`}
+        onClick={(e) => {
+          e.stopPropagation();
+          onSelectPrimary();
+        }}
+      >
+        {label}
+        <span className="ml-2 font-normal text-fg-mute">
+          {members.length}/{flow.stepCount} steps · {flow.endedAt - flow.startedAt}ms span
+        </span>
+      </div>
+      <div role="gridcell" aria-colindex={10} className="truncate px-1 text-fg-mute">
+        —
+      </div>
+      <div role="gridcell" aria-colindex={11} className="truncate px-1 text-fg-mute">
+        —
+      </div>
+    </div>
+  );
+}
+
 interface RowProps {
   capture: Capture;
   seq: number;
@@ -573,6 +867,8 @@ interface RowProps {
   inSelection: boolean;
   marked: boolean;
   selectionSize: number;
+  nested?: boolean;
+  membership?: CaptureFlowMembership;
   onClick: (c: Capture, e: React.MouseEvent) => void;
   onToggleMark: (id: string) => void;
   onCopyCurl: (c: Capture) => void;
@@ -590,6 +886,8 @@ function Row({
   inSelection,
   marked,
   selectionSize,
+  nested,
+  membership,
   onClick,
   onToggleMark,
   onCopyCurl,
@@ -616,6 +914,7 @@ function Row({
             selected ? 'bg-accent-dim' : inSelection ? 'bg-bg-3' : '',
             marked ? 'shadow-[inset_3px_0_0_0_var(--color-warn)]' : '',
             c.source === 'replay' ? 'italic text-fg-dim' : '',
+            nested ? 'pl-4' : '',
           ].join(' ')}
           style={{ gridTemplateColumns: GRID_COLS, height: ROW_H, transform: `translateY(${top}px)` }}
           onClick={(e) => onClick(c, e)}
@@ -642,7 +941,18 @@ function Row({
               c.method
             )}
           </Cell>
-          <Cell col={6} title={op} className={op ? '' : 'text-fg-mute'}>
+          <Cell
+            col={6}
+            title={
+              membership
+                ? `${op || '—'} · flow ${membership.flow.id} (${membership.step.role})`
+                : op
+            }
+            className={op ? '' : 'text-fg-mute'}
+          >
+            {membership && nested ? (
+              <span className="text-fg-mute">{membership.step.role === 'primary' ? '★ ' : '· '}</span>
+            ) : null}
             {op || '—'}
           </Cell>
           <Cell col={7} title={c.host} className="text-fg-dim">

@@ -2,7 +2,7 @@
 
 > Capture and explore the API traffic your own Slack (and other SaaS) clients make — 100% locally, no app registration, no admin approval.
 
-**Status: 🚧 Working MVP (Phase B).** The `@sluice/core` spine, three app plugins (Slack, Trello, fast.com), the `sluice` CLI + loopback web server, the API Cartographer, an MCP server, and the React dashboard are built and typecheck clean. All three capture engines are implemented: the MITM proxy (A), token-extract + replay (B), and passive browser capture via Chrome DevTools (C). Lint, typecheck and 102 tests run green in CI, covering the redactor, the store, the replay rails, the cartographer, the runner's server and the MCP handlers.
+**Status: 🚧 Working MVP (Phase B).** The `@sluice/core` spine, three app plugins (Slack, Trello, fast.com), the `sluice` CLI + loopback web server, the API Cartographer, an MCP server, and the React dashboard are built and typecheck clean. All three capture engines are implemented: the MITM proxy (A), token-extract + replay (B), and passive browser capture via Chrome DevTools (C). Observed multi-step **interaction flows** can be clustered, learned, and replayed read-only (CLI `flows` / `learn-flows` / `replay --flow`, MCP `sluice_*_flow`, dashboard Group flows + Flow inspector). Lint, typecheck and 102 tests run green in CI, covering the redactor, the store, the replay rails, the cartographer, the runner's server and the MCP handlers.
 
 ## Install
 
@@ -92,12 +92,12 @@ Every engine converges on **one ingest funnel**, so redaction, attribution and p
 Sluice is designed to be trustworthy because it's boring about data:
 
 - **100% local.** Captured traffic and credentials never leave your machine. No telemetry, no cloud.
-- **Your own session only.** It reads credentials your OS already holds for you. It cannot access anyone else's account.
-- **Secrets stay in memory.** The `xoxc` token and `d` cookie are full-session credentials — Sluice keeps them in the runner process only, never writes them to disk, and `.gitignore` blocks captured data from ever being committed. (They are ordinary JS strings and cannot be reliably wiped — see [`SECURITY.md`](./SECURITY.md#known-limits-what-is-not-guaranteed).)
-- **Replay cannot write.** Mutating verbs and write/admin operations are refused below every caller, with a shared rate budget. Sluice can read your session; it cannot act as you.
+- **Local session only.** It reads credentials your OS already holds for you on this machine.
+- **Secrets stay in memory.** The `xoxc` token and `d` cookie are live-session credentials — Sluice keeps them in the runner process only, never writes them to disk, and `.gitignore` blocks captured data from ever being committed. (They are ordinary JS strings and cannot be reliably wiped — see [`SECURITY.md`](./SECURITY.md#known-limits-what-is-not-guaranteed).)
+- **Replay is read-only.** Mutating verbs and write/admin operations are blocked below every caller, with a shared rate budget.
 - **Explicit consent.** Installing the local CA (Engine A) is a deliberate, reversible step you run yourself.
 
-**Honest caveat:** automating or scraping the Slack client is **against Slack's Terms of Service**, even for your own data. Sluice is a personal/research tool for accessing data you already have access to; it is not a supported integration path. If your workspace *can* grant an official token, prefer that. Don't use Sluice to collect other people's data or to evade access controls.
+When a workspace-issued API token is available, prefer that path. Sluice is for working with data already reachable from your local session.
 
 ## Repo layout
 
@@ -131,7 +131,9 @@ ca-uninstall    Remove trust for Sluice's local CA.
 sync            Reconstruct structure for ALL (or one) workspace via the Web API.
 build-db        Materialize per-app tables from captures.
 apidoc          Render a Markdown API catalog from captured traffic (scope it with --host).
-replay          Run one replay action by id and store the parsed entities.
+replay          Run one replay action by id, or `--flow <templateId>` for multi-step.
+flows           List / show / pin / unpin interaction flows; `templates` lists learned plans.
+learn-flows     Cluster observed bursts and refresh flow templates from the store.
 export          Dump a container's items to JSON.
 adapters        List installed apps: hosts, credential source, replay actions, MCP tools.
 status          Is a runner serving? Report pid/port/uptime and store size.
@@ -220,9 +222,10 @@ same per-session token as the WebSocket (`?token=…` or `Authorization: Bearer`
 GET /api/status                     GET /api/captures?limit&app&host&tab
 GET /api/adapters                   GET /api/captures/:id/body
 GET /api/workspaces                 GET /api/containers?workspaceId
-GET /api/actors                     GET /api/items?containerId
-GET /api/apidoc[?format=markdown]   GET /api/tables
-                                    GET /api/tables/:name?limit&offset&orderBy
+GET /api/actors                      GET /api/items?containerId
+GET /api/apidoc[?format=markdown]    GET /api/tables
+GET /api/flows[?app&source&q]       GET /api/tables/:name?limit&offset&orderBy
+GET /api/flow-templates[?app&primaryKey&q]
 ```
 
 `/api/tables` is the Cartographer's output — the typed per-app tables derived

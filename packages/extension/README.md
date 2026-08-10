@@ -72,3 +72,9 @@ page world (inject.js)  ──window.postMessage──▶  isolated world (conte
   (when the worker stays alive) are unaffected.
 - Response bodies are read up to 512 KB each; the runner caps the batch as well.
 - WebSocket frames are not captured by this engine (the MITM engine does).
+
+## Capture completeness
+
+See the engine matrix in [`packages/interceptor/README.md`](../interceptor/README.md)
+(F0): this extension covers `fetch`/XHR on allowlisted hosts only — not WebSockets,
+beacons, or document navigations.

@@ -2,7 +2,7 @@
   "name": "@sluice/mcp",
   "version": "0.0.0",
   "type": "module",
-  "description": "Sluice MCP server \u2014 exposes your captured API traffic and each app's tools over MCP.",
+  "description": "Sluice MCP server \u2014 captured traffic, single + multi-step read-only replay (sluice_replay_flow), and each app's tools over MCP.",
   "bin": {
     "sluice-mcp": "./dist/cli.js"
   },
@@ -17,14 +17,14 @@
     "@modelcontextprotocol/sdk": "^1.0.0",
     "better-sqlite3": "^11.7.0",
     "classic-level": "^1.4.0",
-    "zod": "^3.23.8"
+    "zod": "^3.23.8",
+    "@sluice/core": "workspace:*",
+    "@sluice/cartographer": "workspace:*",
+    "@sluice/interceptor": "workspace:*"
   },
   "devDependencies": {
     "@sluice/adapter-sdk": "workspace:*",
     "@sluice/apps": "workspace:*",
-    "@sluice/cartographer": "workspace:*",
-    "@sluice/core": "workspace:*",
-    "@sluice/interceptor": "workspace:*",
     "@types/node": "^20.10.0"
   },
   "license": "AGPL-3.0-or-later",

@@ -99,6 +99,16 @@ export function searchCaptureBodies(
   return getJson('/api/captures/search', { q, ...params });
 }
 
+/**
+ * Hydrate specific captures by id (flow members outside the live WS ring).
+ * Server caps at 500 ids; empty input short-circuits.
+ */
+export function fetchCapturesByIds(ids: string[]): Promise<{ captures: Capture[]; total: number }> {
+  if (ids.length === 0) return Promise.resolve({ captures: [], total: 0 });
+  // Comma-joined; ids are store uuids without commas.
+  return getJson('/api/captures', { ids: ids.slice(0, 500).join(','), limit: Math.min(ids.length, 500) });
+}
+
 // ── Normalized entities ─────────────────────────────────────────────────────────
 
 /**
@@ -143,4 +153,69 @@ export interface StorageInfo {
 
 export function fetchStorage(): Promise<StorageInfo> {
   return getJson('/api/storage');
+}
+
+// ── Interaction flows ───────────────────────────────────────────────────────────
+
+export interface FlowSummary {
+  id: string;
+  adapterId: string;
+  label?: string;
+  source: string;
+  primaryCaptureId: string;
+  primaryOp?: string;
+  stepCount: number;
+  startedAt: number;
+  endedAt: number;
+  steps?: Array<{
+    seq: number;
+    role: string;
+    operation?: string;
+    required: boolean;
+    captureId: string;
+  }>;
+}
+
+export interface FlowTemplateSummary {
+  id: string;
+  adapterId: string;
+  primaryKey: string;
+  label?: string;
+  sampleCount: number;
+  stepCount: number;
+  flowParams: Array<{ name: string; required: boolean }>;
+  learnedAt: number;
+  version: number;
+  steps?: Array<{
+    seq: number;
+    role: string;
+    method: string;
+    path: string;
+    operation?: string;
+    required: boolean;
+    support: number;
+    delayMsP50?: number;
+    /** Median ms from primary start; preferred pacing for siblings. */
+    offsetFromPrimaryMsP50?: number;
+    offsetSpreadMs?: number;
+    unreproducible?: boolean;
+  }>;
+}
+
+export function fetchFlows(params: {
+  app?: string;
+  source?: string;
+  q?: string;
+  limit?: number;
+} = {}): Promise<{ flows: FlowSummary[] }> {
+  return getJson('/api/flows', params);
+}
+
+export function fetchFlowTemplates(params: {
+  app?: string;
+  primaryKey?: string;
+  q?: string;
+  limit?: number;
+} = {}): Promise<{ templates: FlowTemplateSummary[] }> {
+  return getJson('/api/flow-templates', params);
 }

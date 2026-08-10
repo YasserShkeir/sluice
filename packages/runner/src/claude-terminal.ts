@@ -76,7 +76,7 @@ const BYPASS_TOKENS = [
 ];
 
 export interface ClaudeTerminalOpts {
-  /** Working directory claude is launched in — the user-confirmed blast radius. */
+  /** Working directory claude is launched in — the user-confirmed working tree. */
   cwd: string;
   /** Model alias or full id. Defaults to the requested `claude-opus-4-8`. */
   model?: string;

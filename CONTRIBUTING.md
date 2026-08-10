@@ -36,8 +36,8 @@ app package — that seam is the whole architecture.
 
 ```
 packages/core          types · store · WS protocol · redactor      (Apache-2.0)
-packages/interceptor   MITM + CDP engines · replay + safety rails   (AGPL)
-packages/cartographer  API map · per-app tables · faithful replay   (AGPL)
+packages/interceptor   MITM + CDP engines · replay + flow-replay · rails (AGPL)
+packages/cartographer  API map · per-app tables · faithful + flow templates (AGPL)
 packages/apps          the installed-apps registry                  (AGPL)
 packages/app-*         one service each                             (AGPL)
 packages/runner        the `sluice` CLI, HTTP/WS server, HTTP API    (AGPL)
@@ -61,6 +61,27 @@ new shape — it is the one file where a regression is a credential leak.
 **Replay is read-only.** `runReplay` enforces method, operation-denylist and rate
 limits in `packages/interceptor/src/replay-policy.ts`. Those checks sit below every
 caller on purpose. Do not add a network path that bypasses them.
+
+**Single vs flow replay.** One request goes through `faithfulReplayRequest` →
+`runReplay` (CLI `sluice replay <actionId>`, MCP `sluice_replay`). A multi-step
+**interaction flow** is learned from observed/pinned bursts (`sluice learn-flows`),
+built per step with `buildFlowStepRequest` (pass `allowedHosts: app.hosts`), and
+executed by `runFlowReplay` (CLI `sluice replay --flow`, MCP `sluice_replay_flow`).
+Each step still pays the same rails and budget. Templates never train on prior
+replay traffic.
+
+Flow details agents must know (also in MCP tool descriptions and
+`packages/mcp/README.md`):
+
+- **Cluster then learn** offline (`learn-flows`); MCP only reads/replays.
+- **Pacing** uses `offsetFromPrimaryMsP50` (primary-anchored sibling timing), not
+  only chained delays — so skipping a soft companion does not desync the rest.
+- **Assets / SPA bundles** must not seed primaries and are omitted as soft
+  template steps; prefer API `primaryKey`s with `sampleCount ≥ 2`.
+- **Correlation** (`loaderId` / `pageLoadId`) exists when CDP captured; MITM is
+  time-window only. WS frames are not HTTP flow members.
+- **F4.4**: build refuses denied methods/ops and hosts outside the adapter list;
+  `FlowBuildError` surfaces as replay `denied`.
 
 **Schema changes are additive.** `CREATE TABLE IF NOT EXISTS` does nothing to an
 existing database, so a new column goes in **both** `SCHEMA_SQL` (for new stores)
@@ -151,9 +172,3 @@ Split on purpose: `packages/core` is **Apache-2.0** so anyone can build adapters
 against the data model, everything else is **AGPL-3.0-or-later**. Every source
 file carries an SPDX header — keep it when you add a file, and match the package
 it lives in. See [`LICENSING.md`](./LICENSING.md).
-
-## Scope
-
-Sluice reads **your own** session on **your own** machine. Contributions that
-help access someone else's account, evade access controls, or disguise traffic to
-defeat abuse detection are out of scope regardless of how they are framed.

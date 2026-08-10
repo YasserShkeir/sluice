@@ -4,8 +4,8 @@
  *   node --import tsx --test src/*.test.ts   (from this package)
  *
  * The property under test is the one that keeps Sluice a read-only tool: it can
- * observe your session but must not act as you. These rails sit below every
- * caller, so this suite is what stops a future refactor from quietly
+ * observe traffic and issue read replays, not mutating calls. These rails sit
+ * below every caller, so this suite is what stops a future refactor from quietly
  * re-opening the write path.
  */
 import assert from 'node:assert/strict';
