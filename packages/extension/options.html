@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Sluice Capture — options</title>
+    <style>
+      :root { color-scheme: light dark; }
+      body { font: 14px/1.5 ui-sans-serif, system-ui, sans-serif; max-width: 34rem; margin: 1.5rem auto; padding: 0 1.25rem; }
+      h1 { font-size: 1.2rem; margin: 0 0 .25rem; }
+      p.muted { opacity: .7; margin-top: 0; }
+      label { display: block; margin: .9rem 0 .25rem; font-weight: 600; }
+      input[type="text"], input[type="password"], textarea { width: 100%; box-sizing: border-box; padding: .5rem .6rem; border-radius: 6px; border: 1px solid rgba(127,127,127,.5); background: transparent; color: inherit; font-family: inherit; }
+      textarea { min-height: 4.5rem; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+      .row { display: flex; align-items: center; gap: .5rem; margin-top: 1rem; }
+      .row label { margin: 0; }
+      button { margin-top: 1.25rem; padding: .5rem 1rem; border-radius: 6px; border: 1px solid rgba(127,127,127,.5); background: rgba(127,127,127,.12); color: inherit; cursor: pointer; font: inherit; }
+      code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+      #status { margin-left: .75rem; opacity: .8; }
+      .hint { font-size: 12px; opacity: .65; margin-top: .2rem; }
+    </style>
+  </head>
+  <body>
+    <h1>Sluice Capture</h1>
+    <p class="muted">Send this browser's API traffic to a local Sluice runner. Nothing is sent until you set a token and at least one host below.</p>
+
+    <label for="endpoint">Runner endpoint</label>
+    <input id="endpoint" type="text" placeholder="http://127.0.0.1:7788" />
+    <div class="hint">The loopback URL Sluice printed. Only 127.0.0.1 / localhost are reachable.</div>
+
+    <label for="token">Ingest token</label>
+    <input id="token" type="password" placeholder="paste the token from `sluice serve --ingest`" />
+    <div class="hint">Its own secret — not the dashboard token. Shown once on the runner's terminal.</div>
+
+    <label for="hosts">In-scope hosts (one per line or comma-separated)</label>
+    <textarea id="hosts" placeholder="slack.com&#10;trello.com&#10;mail.google.com"></textarea>
+    <div class="hint">Only requests to these hosts (and their subdomains) are captured. Empty = capture nothing.</div>
+
+    <div class="row">
+      <input id="enabled" type="checkbox" checked />
+      <label for="enabled">Capturing enabled</label>
+    </div>
+
+    <button id="save">Save</button><span id="status"></span>
+
+    <script src="options.js"></script>
+  </body>
+</html>

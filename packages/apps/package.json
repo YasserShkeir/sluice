@@ -1,0 +1,26 @@
+{
+  "name": "@sluice/apps",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Sluice installed-apps registry: the single place that names app packages and exposes them as a generic App[] to the engine.",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "node --import tsx --test src/*.test.ts"
+  },
+  "dependencies": {
+    "@sluice/core": "workspace:*",
+    "@sluice/app-slack": "workspace:*",
+    "@sluice/app-fast": "workspace:*",
+    "@sluice/app-trello": "workspace:*",
+    "@sluice/app-gmail": "workspace:*",
+    "@sluice/app-loom": "workspace:*",
+    "@sluice/adapter-sdk": "workspace:*"
+  },
+  "devDependencies": {
+    "@types/node": "^20.10.0"
+  }
+}

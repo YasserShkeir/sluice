@@ -1,0 +1,21 @@
+{
+  "name": "@sluice/app-fast",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Sluice Fast.com app: a self-contained, credential-free plugin \u2014 adapter, parser, replay action, and an MCP tool that runs a real fast.com (Netflix Open Connect) speed test.",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "node --import tsx --test src/*.test.ts"
+  },
+  "dependencies": {
+    "@sluice/adapter-sdk": "workspace:*",
+    "@sluice/core": "workspace:*"
+  },
+  "devDependencies": {
+    "@types/node": "^20.10.0"
+  }
+}

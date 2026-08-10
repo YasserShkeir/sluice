@@ -1,0 +1,22 @@
+{
+  "name": "@sluice/interceptor",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Sluice capture engines: mockttp MITM proxy, passive CDP capture, replay, and the auth-reconstructor seed. App-agnostic.",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "node --import tsx --test src/*.test.ts"
+  },
+  "dependencies": {
+    "@sluice/core": "workspace:*",
+    "chrome-remote-interface": "^0.34.0",
+    "mockttp": "^4.6.0"
+  },
+  "devDependencies": {
+    "@types/chrome-remote-interface": "^0.34.0"
+  }
+}

@@ -1,0 +1,38 @@
+{
+  "name": "@sluice/mcp",
+  "version": "0.0.0",
+  "type": "module",
+  "description": "Sluice MCP server \u2014 exposes your captured API traffic and each app's tools over MCP.",
+  "bin": {
+    "sluice-mcp": "./dist/cli.js"
+  },
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "node --import tsx --test src/*.test.ts"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.0",
+    "better-sqlite3": "^11.7.0",
+    "classic-level": "^1.4.0",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@sluice/adapter-sdk": "workspace:*",
+    "@sluice/apps": "workspace:*",
+    "@sluice/cartographer": "workspace:*",
+    "@sluice/core": "workspace:*",
+    "@sluice/interceptor": "workspace:*",
+    "@types/node": "^20.10.0"
+  },
+  "license": "AGPL-3.0-or-later",
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "publishConfig": {
+    "access": "public"
+  }
+}

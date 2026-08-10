@@ -1,0 +1,42 @@
+{
+  "name": "sluice",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Local-only interceptor + explorer for your own Slack (and other SaaS) API traffic.",
+  "packageManager": "pnpm@10.29.1",
+  "engines": {
+    "node": ">=20"
+  },
+  "bin": {
+    "sluice": "packages/runner/dist/cli.js"
+  },
+  "scripts": {
+    "sluice": "tsx packages/runner/src/cli.ts",
+    "sluice:doctor": "tsx packages/runner/src/cli.ts doctor",
+    "serve": "tsx packages/runner/src/cli.ts serve",
+    "webapp:dev": "pnpm --filter @sluice/webapp dev",
+    "webapp:build": "pnpm --filter @sluice/webapp build",
+    "typecheck": "pnpm -r --if-present typecheck",
+    "test": "pnpm -r --if-present test",
+    "clean": "rm -rf packages/*/dist apps/*/dist node_modules/.cache",
+    "lint": "biome lint packages apps",
+    "lint:fix": "biome lint --write packages apps",
+    "build": "pnpm webapp:build && node scripts/build.mjs"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "^2.5.7",
+    "@types/node": "^20.10.0",
+    "esbuild": "^0.28.1",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2"
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": [
+      "better-sqlite3",
+      "classic-level",
+      "esbuild",
+      "node-pty"
+    ]
+  }
+}

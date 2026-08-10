@@ -1,0 +1,1264 @@
+/* Sluice webapp — the hand-written stylesheet, plus Tailwind on top.
+
+   Tailwind is imported WITHOUT preflight, on purpose. Preflight is a global
+   reset, and this file already IS one for everything currently on screen; layering
+   a second reset underneath would restyle every existing component to prove a
+   point about a table that has not been written yet. So the theme and the
+   utilities are imported, base is not, and the rules below stay authoritative for
+   what they already cover.
+
+   The palette lives in @theme rather than :root so the same values are BOTH CSS
+   custom properties and Tailwind utilities — `var(--fg-dim)` and `text-fg-dim`
+   are the same colour by construction, not by two people remembering. The legacy
+   `--bg` / `--fg` names alias the theme tokens so the ~1200 rules below need no
+   edit.
+
+   Dark developer-tool aesthetic: dense monospace rows, hairline borders, semantic
+   colour only, no shadows except overlays. */
+
+@layer theme, base, components, utilities;
+@import 'tailwindcss/theme.css' layer(theme);
+@import 'tailwindcss/utilities.css' layer(utilities);
+
+@theme {
+  --color-bg: #0f1115;
+  --color-bg-1: #14171d;
+  --color-bg-2: #191d25;
+  --color-bg-3: #202631;
+  --color-border: #262c37;
+  --color-border-2: #303845;
+  --color-fg: #d6dbe4;
+  --color-fg-dim: #8b93a3;
+  --color-fg-mute: #5c6474;
+  --color-accent: #4f8cff;
+  --color-accent-dim: #2b3a57;
+
+  --color-ok: #37b24d;
+  --color-info: #4f8cff;
+  --color-warn: #f0a020;
+  --color-warn-2: #f76707;
+  --color-err: #f03e3e;
+  --color-none: #6b7280;
+
+  --font-mono: ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, 'Liberation Mono', monospace;
+  --font-sans: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+
+  /* The traffic table's row height. A Tailwind token so a virtualizer and the
+     CSS cannot disagree about it — they must not, or rows drift from their
+     scroll offsets. */
+  --spacing-row: 26px;
+}
+
+:root {
+  --bg: var(--color-bg);
+  --bg-1: var(--color-bg-1);
+  --bg-2: var(--color-bg-2);
+  --bg-3: var(--color-bg-3);
+  --border: var(--color-border);
+  --border-2: var(--color-border-2);
+  --fg: var(--color-fg);
+  --fg-dim: var(--color-fg-dim);
+  --fg-mute: var(--color-fg-mute);
+  --accent: var(--color-accent);
+  --accent-dim: var(--color-accent-dim);
+
+  --ok: var(--color-ok);
+  --info: var(--color-info);
+  --warn: var(--color-warn);
+  --warn-2: var(--color-warn-2);
+  --err: var(--color-err);
+  --none: var(--color-none);
+
+  --mono: var(--font-mono);
+  --sans: var(--font-sans);
+  --row-h: 26px;
+  --fs: 12.5px;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  background: var(--bg);
+  color: var(--fg);
+  font-family: var(--sans);
+  font-size: var(--fs);
+  line-height: 1.4;
+  -webkit-font-smoothing: antialiased;
+}
+
+button,
+input,
+select {
+  font-family: inherit;
+  font-size: inherit;
+  color: inherit;
+}
+
+.mono {
+  font-family: var(--mono);
+}
+.tabnum {
+  font-variant-numeric: tabular-nums;
+}
+.muted {
+  color: var(--fg-dim);
+}
+.small {
+  font-size: 11px;
+}
+
+/* ── Shell: a persistent nav over one routed page ───────────────────────────── */
+
+.app {
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+  overflow: hidden;
+}
+
+/* Height comes from the routed <main>; each page scrolls itself rather than the
+   document, so the nav never scrolls away. */
+.overview {
+  height: 100%;
+  min-height: 0;
+  overflow-y: auto;
+  background: var(--bg);
+}
+
+/* height, not flex: the traffic page's panel gives its content a definite box
+   but not a flex context, and a table whose height comes from its own rows
+   defeats the virtualizer that assumes a fixed-height scroller. */
+.dashboard {
+  height: 100%;
+  min-height: 0;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+/* ── Toolbar ────────────────────────────────────────────────────────────────── */
+
+.toolbar {
+  display: flex;
+  align-items: center;
+  gap: 10px 14px;
+  flex-wrap: wrap;
+  padding: 7px 12px;
+  background: var(--bg-1);
+  border-bottom: 1px solid var(--border);
+}
+.tb-group {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.tb-filters {
+  flex: 1 1 320px;
+  min-width: 220px;
+}
+.tb-count {
+  margin-left: auto;
+}
+.brand {
+  font-weight: 600;
+  letter-spacing: 0.02em;
+}
+
+.conn-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 2px 8px;
+  border-radius: 999px;
+  border: 1px solid var(--border-2);
+  background: var(--bg-2);
+  font-size: 11.5px;
+}
+.conn-pill .dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--none);
+}
+.conn-open .dot {
+  background: var(--ok);
+  box-shadow: 0 0 6px var(--ok);
+}
+.conn-connecting .dot {
+  background: var(--warn);
+  animation: pulse 1s ease-in-out infinite;
+}
+.conn-closed .dot {
+  background: var(--err);
+}
+@keyframes pulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.3;
+  }
+}
+
+.engines {
+  display: inline-flex;
+  gap: 6px;
+}
+.engine {
+  padding: 2px 7px;
+  border-radius: 4px;
+  border: 1px solid var(--border-2);
+  background: var(--bg-2);
+  font-size: 11px;
+  font-family: var(--mono);
+}
+.engine-running {
+  color: #9ad0a0;
+  border-color: #2c4a30;
+}
+.engine-starting {
+  color: var(--warn);
+}
+/*
+ * Restarting reads as a WARNING that is still in progress, and it pulses so it
+ * is distinguishable across a room from `starting`. The distinction matters:
+ * `starting` means the session is beginning, `restarting` means it broke and
+ * there is a hole in the capture — the one thing a recording tool must not be
+ * quiet about.
+ */
+.engine-restarting {
+  color: var(--warn);
+  border-color: #4a3c20;
+  animation: engine-pulse 1.4s ease-in-out infinite;
+}
+@keyframes engine-pulse {
+  50% {
+    opacity: 0.55;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .engine-restarting {
+    animation: none;
+  }
+}
+.engine-error {
+  color: var(--err);
+  border-color: #4a2020;
+}
+.engine-stopped {
+  color: var(--fg-mute);
+}
+
+.tb-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 11px;
+  background: var(--bg-2);
+  border: 1px solid var(--border-2);
+  border-radius: 5px;
+  color: var(--fg);
+  cursor: pointer;
+  white-space: nowrap;
+}
+.tb-btn:hover:not(:disabled) {
+  border-color: var(--accent);
+}
+.tb-btn:disabled {
+  color: var(--fg-mute);
+  cursor: not-allowed;
+}
+.rec-toggle.is-recording {
+  color: #f0a0a0;
+  border-color: #4a2020;
+  background: #1d1416;
+}
+.rec-toggle.is-recording:hover {
+  border-color: var(--err);
+}
+.rec-toggle.is-paused {
+  color: var(--ok);
+  border-color: #2c4a30;
+  background: #131a15;
+}
+
+.tb-filter {
+  flex: 1 1 auto;
+  min-width: 120px;
+  padding: 4px 9px;
+  background: var(--bg-2);
+  border: 1px solid var(--border-2);
+  border-radius: 4px;
+  color: var(--fg);
+  outline: none;
+}
+.tb-filter::placeholder {
+  color: var(--fg-mute);
+}
+.tb-filter:focus {
+  border-color: var(--accent);
+}
+.tb-select {
+  padding: 4px 6px;
+  background: var(--bg-2);
+  border: 1px solid var(--border-2);
+  border-radius: 4px;
+  color: var(--fg);
+  outline: none;
+  cursor: pointer;
+  max-width: 160px;
+}
+.tb-select:focus {
+  border-color: var(--accent);
+}
+
+/* ── Traffic table ──────────────────────────────────────────────────────────── */
+
+.traffic-scroll {
+  flex: 1;
+  overflow: auto;
+  min-height: 0;
+}
+.empty {
+  padding: 18px 14px;
+  color: var(--fg-mute);
+}
+.traffic-row.selected {
+  background: var(--accent-dim);
+}
+.traffic-row.replay {
+  border-left: 2px dashed var(--accent);
+}
+
+.status-badge {
+  display: inline-block;
+  min-width: 30px;
+  text-align: center;
+  padding: 0 5px;
+  border-radius: 3px;
+  font-size: 11px;
+  border: 1px solid transparent;
+}
+.st-2xx {
+  color: var(--ok);
+  border-color: #234a2b;
+}
+.st-3xx {
+  color: var(--info);
+  border-color: #21385c;
+}
+.st-4xx {
+  color: var(--warn);
+  border-color: #4a3a1a;
+}
+.st-429 {
+  color: var(--warn-2);
+  border-color: #5a2e12;
+}
+.st-5xx {
+  color: var(--err);
+  border-color: #4a2020;
+}
+.st-none {
+  color: var(--none);
+  border-color: var(--border-2);
+}
+
+/* ── Inspector (right-side detail panel) ──────────────────────────────────────
+   A docked pane in the traffic page's panel group, not a drawer any more. As an
+   overlay it covered the table's Status, Size and Duration columns — the three
+   you are comparing against when you open a row in the first place. */
+.inspector {
+  height: 100%;
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  border-left: 1px solid var(--border);
+  background: var(--bg);
+  overflow: hidden;
+}
+.inspector-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 6px 10px;
+  background: var(--bg-1);
+  border-bottom: 1px solid var(--border);
+  min-height: 30px;
+}
+.inspector-head-right {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+.pane-title {
+  font-size: 10.5px;
+  letter-spacing: 0.09em;
+  color: var(--fg-dim);
+  font-weight: 600;
+}
+.icon-btn {
+  background: transparent;
+  border: 1px solid var(--border-2);
+  border-radius: 4px;
+  color: var(--fg-dim);
+  cursor: pointer;
+  padding: 1px 7px;
+  line-height: 1.3;
+}
+.icon-btn:hover {
+  border-color: var(--accent);
+  color: var(--fg);
+}
+
+.detail-summary {
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg-1);
+}
+.req-line {
+  font-size: 12px;
+  word-break: break-all;
+  margin-bottom: 5px;
+}
+.detail-meta {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.detail-meta .host {
+  font-family: var(--mono);
+  font-size: 11px;
+}
+
+.tabs {
+  display: flex;
+  gap: 2px;
+  padding: 4px 8px 0;
+  background: var(--bg-1);
+  border-bottom: 1px solid var(--border);
+}
+.tab {
+  padding: 4px 12px;
+  background: transparent;
+  border: 1px solid transparent;
+  border-bottom: none;
+  border-radius: 5px 5px 0 0;
+  color: var(--fg-dim);
+  cursor: pointer;
+}
+.tab.active {
+  background: var(--bg-2);
+  border-color: var(--border);
+  color: var(--fg);
+}
+
+.detail-body {
+  flex: 1;
+  overflow: auto;
+  min-height: 0;
+  padding: 8px 10px;
+}
+.subhead {
+  font-size: 10.5px;
+  letter-spacing: 0.06em;
+  color: var(--fg-dim);
+  margin: 10px 0 4px;
+  text-transform: uppercase;
+}
+.subhead:first-child {
+  margin-top: 0;
+}
+.kv {
+  width: 100%;
+  border-collapse: collapse;
+}
+.kv td {
+  padding: 2px 6px;
+  vertical-align: top;
+  border-bottom: 1px solid var(--bg-1);
+  font-size: 11px;
+}
+.kv-key {
+  color: var(--fg-dim);
+  white-space: nowrap;
+  width: 1%;
+}
+.kv-val {
+  color: var(--fg);
+  word-break: break-all;
+}
+.json-block {
+  margin: 0;
+  padding: 8px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  font-family: var(--mono);
+  font-size: 11.5px;
+  white-space: pre-wrap;
+  word-break: break-word;
+  overflow-x: auto;
+}
+
+/* ── Toast (transient notices) ──────────────────────────────────────────────── */
+
+.toast {
+  position: fixed;
+  bottom: 18px;
+  right: 18px;
+  z-index: 10;
+  max-width: 420px;
+  padding: 9px 14px;
+  border-radius: 7px;
+  border: 1px solid var(--border-2);
+  background: var(--bg-2);
+  color: var(--fg);
+  box-shadow: 0 6px 24px rgba(0, 0, 0, 0.45);
+  animation: toast-in 0.14s ease-out;
+}
+.toast-error {
+  border-color: #5a2323;
+  background: #24161a;
+  color: #f4b9b9;
+}
+@keyframes toast-in {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+/* ── Overview (top region) ──────────────────────────────────────────────────── */
+
+.overview {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 10px 12px 14px;
+}
+.ov-head {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+.ov-title {
+  font-weight: 600;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+  font-size: 12px;
+  color: var(--fg);
+}
+
+/* KPI tiles */
+.kpi-row {
+  display: grid;
+  grid-template-columns: repeat(7, minmax(0, 1fr));
+  gap: 8px;
+}
+@media (max-width: 1100px) {
+  .kpi-row {
+    grid-template-columns: repeat(auto-fit, minmax(130px, 1fr));
+  }
+}
+.kpi {
+  background: var(--bg-1);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 8px 10px;
+  min-width: 0;
+}
+.kpi-val {
+  font-size: 20px;
+  font-weight: 600;
+  line-height: 1.15;
+  color: var(--fg);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.kpi-sev-ok {
+  color: var(--ok);
+}
+.kpi-sev-warn {
+  color: var(--warn);
+}
+.kpi-sev-err {
+  color: var(--err);
+}
+.kpi-label {
+  margin-top: 3px;
+  font-size: 10.5px;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+  color: var(--fg-dim);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.kpi-hint {
+  color: var(--fg-mute);
+  text-transform: none;
+  letter-spacing: 0;
+}
+
+/* Charts */
+.charts-row {
+  display: grid;
+  grid-template-columns: 1.5fr 1.3fr 1.5fr;
+  gap: 8px;
+}
+@media (max-width: 1000px) {
+  .charts-row {
+    grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+  }
+}
+.chart-card {
+  background: var(--bg-1);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 8px 10px;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+.chart-title {
+  font-size: 10.5px;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  color: var(--fg-dim);
+  margin-bottom: 6px;
+}
+.chart-svg {
+  display: block;
+  width: 100%;
+  height: auto;
+}
+.chart-empty {
+  color: var(--fg-mute);
+  font-size: 11px;
+  padding: 20px 2px;
+}
+
+/* Donut + legend */
+.donut-wrap {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+.donut {
+  flex: 0 0 auto;
+  width: 96px;
+  height: 96px;
+}
+.donut-legend {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  flex: 1 1 auto;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  font-size: 11px;
+}
+.donut-legend li {
+  display: grid;
+  grid-template-columns: 10px auto 1fr auto;
+  align-items: center;
+  gap: 7px;
+}
+.swatch {
+  width: 10px;
+  height: 10px;
+  border-radius: 2px;
+  display: inline-block;
+}
+.lg-label {
+  color: var(--fg);
+}
+.lg-val {
+  color: var(--fg);
+}
+.lg-pct {
+  text-align: right;
+}
+
+/* Smart cards */
+.cards-row {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+  gap: 8px;
+}
+.ov-card {
+  background: var(--bg-1);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 8px 10px;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+}
+.ov-card-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 10.5px;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  color: var(--fg-dim);
+  margin-bottom: 5px;
+}
+.ov-card-empty {
+  color: var(--fg-mute);
+  font-size: 11px;
+  padding: 10px 2px;
+}
+.ov-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+.ov-list-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 3px 4px;
+  border-bottom: 1px solid var(--bg-2);
+  cursor: pointer;
+  font-family: var(--mono);
+  font-size: 11.5px;
+}
+.ov-list-row:last-child {
+  border-bottom: none;
+}
+.ov-list-row:hover {
+  background: var(--bg-2);
+}
+.ov-list-row:focus-visible {
+  outline: 1px solid var(--accent);
+  outline-offset: -1px;
+}
+.ov-ep {
+  flex: 1 1 auto;
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: var(--fg);
+}
+.ov-reason {
+  flex: 0 1 auto;
+  max-width: 42%;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.ov-method {
+  flex: 0 0 auto;
+  min-width: 40px;
+  color: var(--fg-dim);
+}
+.ov-count {
+  flex: 0 0 auto;
+}
+.ov-dur {
+  flex: 0 0 auto;
+  color: var(--fg-dim);
+}
+
+/* ── Pagination (bottom of the traffic list) ────────────────────────────────── */
+
+.pagination {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+  padding: 5px 12px;
+  background: var(--bg-1);
+  border-top: 1px solid var(--border);
+}
+.pg-size .tb-select {
+  max-width: 80px;
+}
+
+/* ── Scrollbars ─────────────────────────────────────────────────────────────── */
+
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+::-webkit-scrollbar-thumb {
+  background: var(--bg-3);
+  border-radius: 5px;
+  border: 2px solid var(--bg);
+}
+::-webkit-scrollbar-thumb:hover {
+  background: var(--border-2);
+}
+
+/* ── First-run consent gate ──────────────────────────────────────────────────
+   Blocking, deliberately plain, and readable in one screen. The caveats are the
+   product's honesty; burying them in small print would defeat the point. */
+
+.consent-backdrop {
+  position: fixed;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+  background: var(--bg);
+  overflow-y: auto;
+  z-index: 100;
+}
+
+.consent-card {
+  max-width: 660px;
+  width: 100%;
+  background: var(--bg-1);
+  border: 1px solid var(--border-2);
+  border-radius: 8px;
+  padding: 28px 30px;
+  font-family: var(--sans);
+  line-height: 1.55;
+}
+
+.consent-card h1 {
+  margin: 0 0 10px;
+  font-size: 19px;
+  font-weight: 600;
+  color: var(--fg);
+}
+
+.consent-lede {
+  margin: 0 0 18px;
+  color: var(--fg-dim);
+  font-size: 13.5px;
+}
+
+.consent-list {
+  margin: 0 0 18px;
+  padding-left: 20px;
+  font-size: 13px;
+  color: var(--fg);
+}
+
+.consent-list li {
+  margin-bottom: 10px;
+}
+
+.consent-list strong {
+  color: var(--warn);
+  font-weight: 600;
+}
+
+.consent-note {
+  margin: 0 0 20px;
+  padding: 11px 13px;
+  background: var(--bg-2);
+  border-left: 2px solid var(--ok);
+  border-radius: 3px;
+  font-size: 12.5px;
+  color: var(--fg-dim);
+}
+
+.consent-note code {
+  font-family: var(--mono);
+  color: var(--fg);
+}
+
+.consent-ack {
+  display: flex;
+  gap: 9px;
+  align-items: flex-start;
+  margin-bottom: 18px;
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.consent-ack input {
+  margin-top: 3px;
+  accent-color: var(--accent);
+  flex: none;
+}
+
+.consent-actions {
+  display: flex;
+  justify-content: flex-end;
+}
+
+.consent-accept {
+  padding: 8px 20px;
+  font: inherit;
+  font-size: 13px;
+  font-weight: 500;
+  color: #fff;
+  background: var(--accent);
+  border: 1px solid var(--accent);
+  border-radius: 5px;
+  cursor: pointer;
+}
+
+.consent-accept:disabled {
+  background: var(--bg-3);
+  border-color: var(--border-2);
+  color: var(--fg-mute);
+  cursor: not-allowed;
+}
+
+.consent-accept:not(:disabled):hover {
+  filter: brightness(1.1);
+}
+
+/* ── App catalog launcher (restored) ─────────────────────────────────────── */
+.badge {
+  padding: 2px 7px;
+  border-radius: 4px;
+  border: 1px solid var(--border-2);
+  background: var(--bg-2);
+  font-size: 11px;
+  color: var(--fg-dim);
+}
+.badge.lock {
+  color: #9ad0a0;
+  border-color: #2c4a30;
+}
+.badge.tos {
+  color: var(--warn);
+  border-color: #4a3a1a;
+}
+.catalog {
+  height: 100%;
+  overflow-y: auto;
+  padding: 16px 20px 28px;
+}
+.catalog-head h1 {
+  font-size: 20px;
+  font-weight: 600;
+  margin: 0 0 6px;
+}
+.catalog-head p {
+  color: var(--fg-dim);
+  max-width: 62ch;
+  margin: 0 0 24px;
+  line-height: 1.5;
+}
+.catalog-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
+  gap: 14px;
+}
+.app-card {
+  display: flex;
+  flex-direction: column;
+  background: var(--bg-1);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  transition: border-color 0.12s, transform 0.12s, background 0.12s;
+}
+.app-card:has(.app-card-link:hover),
+.app-card:has(.app-card-link:focus-visible) {
+  border-color: var(--accent);
+  transform: translateY(-1px);
+  background: var(--bg-2);
+}
+/* The card body is the link. A <button> nested inside an <a> is not valid and
+   not operable, so the secondary action is a sibling below it rather than an
+   overlay on top of it. */
+.app-card-link {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 16px 16px 12px;
+  color: inherit;
+  text-decoration: none;
+  outline: none;
+}
+.app-card-actions {
+  display: flex;
+  justify-content: flex-end;
+  padding: 0 12px 10px;
+}
+.app-card-filter {
+  font: inherit;
+  font-size: 11px;
+  color: var(--fg-dim);
+  background: var(--bg-2);
+  border: 1px solid var(--border-2);
+  border-radius: 4px;
+  padding: 2px 8px;
+  cursor: pointer;
+}
+.app-card-filter:hover {
+  border-color: var(--accent);
+  color: var(--fg);
+}
+.app-card-filter[aria-pressed='true'] {
+  color: var(--fg);
+  background: var(--accent-dim);
+  border-color: var(--accent);
+}
+.app-card--planned {
+  opacity: 0.6;
+}
+.app-card-top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+.app-name {
+  font-size: 15px;
+  font-weight: 600;
+}
+.app-stats {
+  color: var(--fg-mute);
+  font-family: var(--mono);
+  font-size: 11px;
+}
+.build-checklist {
+  list-style: none;
+  margin: 2px 0 0;
+  padding: 0;
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 4px 12px;
+}
+.build-checklist li {
+  font-size: 11.5px;
+  color: var(--fg-mute);
+}
+.build-checklist li.on {
+  color: var(--fg);
+}
+.build-checklist .tick {
+  display: inline-block;
+  width: 1.1em;
+  font-weight: 700;
+}
+.build-checklist li.on .tick {
+  color: var(--ok);
+}
+.badge-live {
+  color: #9ad0a0;
+  border: 1px solid #2c4a30;
+  border-radius: 999px;
+  padding: 1px 8px;
+  font-size: 10.5px;
+}
+.badge-idle,
+.badge-planned {
+  color: var(--fg-mute);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 1px 8px;
+  font-size: 10.5px;
+}
+
+/* The card of the app the traffic table is currently scoped to. */
+.app-card--selected {
+  border-color: var(--accent);
+  background: var(--accent-dim);
+}
+
+/* ── Derived-data browser (per-app tables + API catalog) ─────────────────────
+   Its own page now, so it fills the height it is given rather than sitting in a
+   340px strip under the traffic table. */
+
+.databrowser {
+  height: 100%;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  background: var(--bg-1);
+}
+
+.db-head {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 7px 12px;
+}
+
+.db-toggle {
+  font: inherit;
+  font-size: var(--fs);
+  color: var(--fg);
+  background: none;
+  border: none;
+  cursor: pointer;
+  padding: 2px 0;
+}
+
+.db-hint {
+  font-size: 11.5px;
+}
+
+.db-modes {
+  display: flex;
+  gap: 4px;
+}
+
+.db-modes button,
+.db-pager button {
+  font: inherit;
+  font-size: 11.5px;
+  color: var(--fg-dim);
+  background: var(--bg-2);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 3px 9px;
+  cursor: pointer;
+}
+
+.db-modes button.on {
+  color: var(--fg);
+  background: var(--accent-dim);
+  border-color: var(--accent);
+}
+
+.db-pager button:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.db-body {
+  display: flex;
+  gap: 0;
+  border-top: 1px solid var(--border);
+  flex: 1;
+  min-height: 0;
+}
+
+.db-tablelist {
+  flex: none;
+  width: 210px;
+  border-right: 1px solid var(--border);
+  overflow-y: auto;
+}
+
+.db-tablelist button {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  width: 100%;
+  font: inherit;
+  font-family: var(--mono);
+  font-size: 11.5px;
+  text-align: left;
+  color: var(--fg-dim);
+  background: none;
+  border: none;
+  border-bottom: 1px solid var(--border);
+  padding: 5px 10px;
+  cursor: pointer;
+}
+
+.db-tablelist button.on {
+  color: var(--fg);
+  background: var(--accent-dim);
+}
+
+.db-tname {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.db-trows {
+  color: var(--fg-mute);
+  flex: none;
+}
+
+.db-grid {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.db-gridscroll {
+  flex: 1;
+  overflow: auto;
+}
+
+.db-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-family: var(--mono);
+  font-size: 11.5px;
+}
+
+.db-table th {
+  position: sticky;
+  top: 0;
+  text-align: left;
+  font-weight: 500;
+  color: var(--fg-dim);
+  background: var(--bg-2);
+  border-bottom: 1px solid var(--border-2);
+  padding: 4px 9px;
+  white-space: nowrap;
+}
+
+.db-table td {
+  border-bottom: 1px solid var(--border);
+  padding: 3px 9px;
+  max-width: 260px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.db-pager {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 6px 10px;
+  border-top: 1px solid var(--border);
+}
+
+.db-empty {
+  padding: 16px 14px;
+  font-size: 12.5px;
+}
+
+.db-empty.err {
+  color: var(--err);
+}
+
+.db-empty code {
+  font-family: var(--mono);
+  color: var(--fg);
+}
+
+/* The overview rows are real <button>s (browser-provided Enter/Space + focus),
+   so they need the usual button reset to keep the row layout. */
+button.ov-list-row {
+  width: 100%;
+  font: inherit;
+  color: inherit;
+  background: none;
+  border: none;
+  text-align: left;
+  cursor: pointer;
+}
