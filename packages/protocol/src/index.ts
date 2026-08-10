@@ -156,7 +156,8 @@ const dataVacuum = z.object({ type: z.literal('data.vacuum'), requestId: id });
 
 const dataWipe = z.object({
   type: z.literal('data.wipe'),
-  confirm: z.string(),
+  // Bound so a hostile client cannot force huge string compares on wipe path.
+  confirm: z.string().max(64),
   requestId: id,
 });
 

@@ -70,6 +70,7 @@ async function issue(
   const timer = setTimeout(() => ctrl.abort(), timeoutMs);
 
   let res: Response;
+  let resBodyRaw: string | null = null;
   try {
     res = await fetch(req.url, {
       method: req.method,
@@ -77,6 +78,13 @@ async function issue(
       body: req.body,
       signal: ctrl.signal,
     });
+    // Timeout must cover the body too — a stalled res.text() used to hold the
+    // single-flight slot forever after headers arrived.
+    try {
+      resBodyRaw = await res.text();
+    } catch {
+      resBodyRaw = null;
+    }
   } catch (err) {
     const msg = ctrl.signal.aborted
       ? `timed out after ${timeoutMs}ms`
@@ -93,13 +101,6 @@ async function issue(
   res.headers.forEach((value, key) => {
     resHeaders[key] = value;
   });
-
-  let resBodyRaw: string | null = null;
-  try {
-    resBodyRaw = await res.text();
-  } catch {
-    resBodyRaw = null;
-  }
 
   return {
     id: newId('cap'),

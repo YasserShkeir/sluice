@@ -358,7 +358,8 @@ async function cmdDoctor(args: string[]): Promise<number> {
   });
   if (values.help) {
     console.log(
-      'sluice doctor [--net] — check the local environment (no secrets printed).\n' +
+      'sluice doctor [--db PATH] [--net] — check the local environment (no secrets printed).\n' +
+        '  --db PATH  capture database to inspect (default: config / ~/.sluice).\n' +
         '  --net also runs the checks that touch the network: a round-trip through a\n' +
         '        running proxy, and the TLS-pinning probe. Off by default so doctor\n' +
         '        stays fast, offline-safe, and makes no outbound request you did not ask for.',
@@ -460,13 +461,8 @@ async function cmdDoctor(args: string[]): Promise<number> {
   // second one determines whether capture works. Generating a CA and forgetting
   // to trust it presents as every HTTPS request failing once the proxy is on,
   // with nothing in the output pointing at the cause.
-  const caPath = join(
-    process.platform === 'darwin'
-      ? join(homedir(), 'Library', 'Application Support', 'Sluice')
-      : join(homedir(), '.sluice'),
-    'ca',
-    'sluice-ca.cert',
-  );
+  const caPath = sluiceCaCertPath();
+
   if (!existsSync(caPath)) {
     // This used to offer `sluice start` as an equivalent second option. It is
     // not one: start calls ensureSluiceCA(), which GENERATES the certificate and
@@ -547,7 +543,7 @@ async function cmdDoctor(args: string[]): Promise<number> {
     }
   }
 
-  const dbPath = values.db ?? config.defaultDbPath();
+  const dbPath = resolveDb(values.db, (values as { config?: string }).config);
   let dbOk = true;
   try {
     config.ensureSluiceHome();
@@ -671,7 +667,7 @@ async function cmdExtractToken(args: string[]): Promise<number> {
     return 1;
   }
 
-  const store = openStore(values.db);
+  const store = openStore(resolveDb(values.db, (values as { config?: string }).config));
   const redacted = redactSession(session);
   store.upsertSession(redacted);
   store.close();
@@ -875,7 +871,7 @@ async function cmdServe(args: string[]): Promise<number> {
   const cfg = fileConfig(values.config);
   const port = parsePort(values.port, cfg.port ?? config.DEFAULT_HTTP_PORT);
   const proxyPort = parsePort(values['proxy-port'], cfg.proxyPort ?? config.DEFAULT_PROXY_PORT);
-  const store = openStore(resolveDb(values.db, values.config));
+  const store = openStore(resolveDb(values.db, (values as { config?: string }).config));
   applyRetention(store, values.config);
   await seedWorkspaces(store, values['app-support']);
   materializeQuiet(store);
@@ -892,7 +888,7 @@ async function cmdServe(args: string[]): Promise<number> {
     proxyPort,
     adapters,
     interceptHosts: [...(cfg.interceptHosts ?? []), ...(values.host ?? [])],
-    interceptAllHosts: Boolean(values['all-hosts']),
+    interceptAllHosts: values['all-hosts'] ?? cfg.interceptAllHosts ?? false,
     isolated: Boolean(values.isolated),
   });
 
@@ -991,32 +987,23 @@ async function cmdStart(args: string[]): Promise<number> {
   const cfg = fileConfig(values.config);
   const port = parsePort(values.port, cfg.port ?? config.DEFAULT_HTTP_PORT);
   const proxyPort = parsePort(values['proxy-port'], cfg.proxyPort ?? config.DEFAULT_PROXY_PORT);
-  const store = openStore(resolveDb(values.db, values.config));
+  const store = openStore(resolveDb(values.db, (values as { config?: string }).config));
   applyRetention(store, values.config);
   await seedWorkspaces(store, values['app-support']);
   materializeQuiet(store);
+  // Same order as serve: external adapters widen TLS intercept hosts — print them.
+  for (const line of describeDiscovery(await installExternalAdapters())) console.error(line);
   const adapters = selectApps(values.config);
   const sessions = await bestEffortSessions(values);
   for (const s of sessions) store.upsertSession(redactSession(s));
 
-  // The engine needs onCapture/onStatus at construction, but both funnels live in
-  // the server (built next). Forward-reference them through mutable closures.
-  let ingest: (c: Capture) => void = () => {};
-  let publishStatus: (s: EngineStatus) => void = () => {};
-  const engine = new MitmEngine({
-    port: proxyPort,
+  // EngineController owns lifecycle (same path as serve + dashboard control).
+  const { controller, wire } = makeController({
+    proxyPort,
     adapters,
-    onCapture: (c) => {
-      try {
-        ingest(c);
-      } catch (e) {
-        console.error(`ingest error: ${errMsg(e)}`);
-      }
-    },
-    onError: (e) => console.error(`engine error: ${errMsg(e)}`),
-    onStatus: (s) => publishStatus(s),
     interceptHosts: [...(cfg.interceptHosts ?? []), ...(values.host ?? [])],
     interceptAllHosts: values['all-hosts'] ?? cfg.interceptAllHosts ?? false,
+    isolated: false,
   });
 
   const server = await startServer({
@@ -1024,75 +1011,40 @@ async function cmdStart(args: string[]): Promise<number> {
     adapters,
     port,
     getSessions: () => sessions,
-    engine,
+    engine: controller,
+    control: controller,
   });
-  ingest = server.ingest;
-  publishStatus = server.broadcastEngineStatus;
+  wire(server);
 
-  /** Restarts the engine if it stops answering; see packages/interceptor/supervisor.ts. */
-  let supervisor: Supervisor | undefined;
-
+  // start = serve + engine immediately. Controller owns supervise + lifecycle.
   try {
-    const started = await engine.start();
+    await controller.startEngine();
     console.log('');
     console.log('MITM proxy engine started (Engine A).');
-    console.log(`  Proxy:   127.0.0.1:${started.port}`);
-    console.log(`  CA cert: ${started.caPath}`);
-    // Which hosts get decrypted is the single most privacy-relevant thing this
-    // command does, so it is stated rather than left to the source.
-    const scoped = engine.interceptedHosts();
-    if (scoped === undefined) {
-      console.log('  Decrypting: EVERY host (--all-hosts). Unrelated traffic will be stored.');
-    } else if (scoped.length === 0) {
-      console.log('  Decrypting: nothing — no adapters are installed and no --host was given.');
-    } else {
-      console.log(`  Decrypting: ${scoped.join(', ')}`);
-      console.log('              everything else is tunnelled through unread. Add --host to widen.');
-    }
-    console.log('  Trust the CA (macOS, reversible, SSL-only, no sudo):');
-    console.log(
-      `    security add-trusted-cert -r trustRoot -p ssl -k "$HOME/Library/Keychains/login.keychain-db" "${started.caPath}"`,
-    );
+    console.log(`  Proxy:   127.0.0.1:${proxyPort}`);
     const appName = apps[0]?.displayName ?? 'the app';
     console.log(`  Route the ${appName} desktop app through it (fully quit ${appName} first):`);
     console.log(
-      `    open -a ${appName} --args --proxy-server=127.0.0.1:${started.port} --proxy-bypass-list="<-loopback>"`,
+      `    open -a ${appName} --args --proxy-server=127.0.0.1:${proxyPort} --proxy-bypass-list="<-loopback>"`,
     );
-    // Supervision starts only once the engine is genuinely up, so a start that
-    // failed is reported as a failed start rather than as the first of five
-    // restart attempts.
-    supervisor = superviseEngine({
-      engine,
-      // The only detector available. mockttp swallows post-start server errors
-      // and exposes no server-level event, so "is anything still listening?" is
-      // what there is — it cannot tell a dead listener from a wedged one, and
-      // it does catch the case that actually happens, which is the port going
-      // away underneath a session nobody is watching.
-      healthy: () => isPortListening(started.port),
-      onStatus: (st) => publishStatus?.(st),
-    });
   } catch (e) {
     console.error(`Failed to start the MITM engine: ${errMsg(e)}`);
     console.error('Run `sluice doctor` to check the environment. The web UI + replay still work without it.');
   }
 
   printServerBanner(server, sessions.length > 0);
-  writeRunState({ pid: process.pid, port, db: store.db.name, mode: 'start (mitm)', startedAt: Date.now(), proxyPort });
+  writeRunState({
+    pid: process.pid,
+    port,
+    db: store.db.name,
+    mode: 'start (mitm)',
+    startedAt: Date.now(),
+    proxyPort,
+  });
 
   await runUntilSignal(async () => {
     clearRunState();
-    // Before the engine: otherwise a deliberate shutdown looks exactly like a
-    // crash to the probe, and the supervisor restarts what is being torn down.
-    supervisor?.stop();
-    try {
-      await engine.stop();
-    } catch {
-      /* already stopped */
-    }
-    // If this process pointed the system proxy at itself, put it back. Leaving
-    // it set sends ALL of the machine's HTTPS to a port that just closed, which
-    // looks like the network is broken rather than like Sluice exited.
-    await restoreSystemProxyIfOurs(proxyPort);
+    await controller.shutdown();
     await server.close();
     reconcileAll(store);
     store.close();
@@ -1149,7 +1101,7 @@ async function cmdCapture(args: string[]): Promise<number> {
   const cdpPort = parsePort(values['cdp-port'], config.DEFAULT_CDP_PORT);
   const startUrl = values.url ?? defaultCaptureUrl();
   const profileDir = values['chrome-profile'] ?? defaultChromeProfileDir();
-  const store = openStore(values.db);
+  const store = openStore(resolveDb(values.db, (values as { config?: string }).config));
   await seedWorkspaces(store);
   const adapters = apps;
 
@@ -1514,7 +1466,7 @@ async function cmdReplay(args: string[]): Promise<number> {
       console.error(errMsg(e));
       return 1;
     }
-    const store = openStore(values.db);
+    const store = openStore(resolveDb(values.db, (values as { config?: string }).config));
     try {
       let tmpl = store.getFlowTemplate(values.flow);
       if (!tmpl && values.adapter) {
@@ -1628,7 +1580,7 @@ async function cmdReplay(args: string[]): Promise<number> {
     return 1;
   }
 
-  const store = openStore(values.db);
+  const store = openStore(resolveDb(values.db, (values as { config?: string }).config));
   const req = faithfulReplayRequest(store, found.adapter.buildReplayRequest(found.action, params, session));
   const capture = await runReplay(req); // secret-redacted Capture
   capture.adapterId = found.adapter.id; // attribute so the Cartographer + stats include it
@@ -1832,7 +1784,7 @@ async function cmdExport(args: string[]): Promise<number> {
   }
   const format: ExportFormat = requested;
 
-  const store = openStore(values.db);
+  const store = openStore(resolveDb(values.db, (values as { config?: string }).config));
 
   if (values.list) {
     for (const c of store.listContainers()) {
@@ -1962,7 +1914,7 @@ async function cmdRecord(args: string[]): Promise<number> {
     return 0;
   }
 
-  const store = openStore(values.db);
+  const store = openStore(resolveDb(values.db, (values as { config?: string }).config));
   const limit = values.limit ? Number(values.limit) : 10_000;
   if (!Number.isFinite(limit) || limit <= 0) {
     console.error('--limit must be a positive number.');
@@ -2082,7 +2034,7 @@ async function cmdMock(args: string[]): Promise<number> {
     return 1;
   }
 
-  const store = openStore(resolveDb(values.db, values.config));
+  const store = openStore(resolveDb(values.db, (values as { config?: string }).config));
   const adapters = selectApps(values.config);
   const port = parsePort(values.port, fileConfig(values.config).port ?? config.DEFAULT_HTTP_PORT);
   const server = await startServer({ store, adapters, port, getSessions: () => [] });
@@ -2205,7 +2157,13 @@ async function cmdCaUninstall(args: string[]): Promise<number> {
     console.log("sluice ca-uninstall\n  Remove trust for Sluice's local CA.");
     return 0;
   }
-  const { caPath } = await ensureSluiceCA();
+  // Do not call ensureSluiceCA() — uninstall must not mint a brand-new CA just
+  // to remove trust for one that may already be gone from disk.
+  const caPath = sluiceCaCertPath();
+  if (!existsSync(caPath)) {
+    console.error(`No CA certificate at ${caPath}. Nothing to untrust (or already wiped).`);
+    return 1;
+  }
   try {
     execFileSync('/usr/bin/security', ['remove-trusted-cert', '-d', caPath], { stdio: 'inherit' });
     console.log('CA trust removed.');
@@ -2259,7 +2217,7 @@ async function cmdSync(args: string[]): Promise<number> {
     return 1;
   }
 
-  const store = openStore(values.db);
+  const store = openStore(resolveDb(values.db, (values as { config?: string }).config));
   for (const s of picked) {
     store.upsertSession(redactSession(s));
     const app = apps.find((a) => a.id === s.adapterId);
@@ -2310,7 +2268,7 @@ async function cmdBuildDb(args: string[]): Promise<number> {
     );
     return 0;
   }
-  const store = openStore(values.db);
+  const store = openStore(resolveDb(values.db, (values as { config?: string }).config));
   const { tables } = materialize(store);
   store.close();
   if (tables.length === 0) {
@@ -2342,7 +2300,7 @@ async function cmdApiDoc(args: string[]): Promise<number> {
     );
     return 0;
   }
-  const store = openStore(values.db);
+  const store = openStore(resolveDb(values.db, (values as { config?: string }).config));
   const hostContains = values.host
     ? values.host.split(',').map((s) => s.trim()).filter(Boolean)
     : undefined;
@@ -2398,7 +2356,7 @@ async function cmdPrune(args: string[]): Promise<number> {
     return 1;
   }
 
-  const store = openStore(values.db);
+  const store = openStore(resolveDb(values.db, (values as { config?: string }).config));
   const before = store.countCaptures();
   const removed = store.pruneCaptures({
     maxAgeMs: days === undefined ? undefined : days * 24 * 60 * 60 * 1000,
@@ -2435,7 +2393,7 @@ async function cmdWipe(args: string[]): Promise<number> {
     return 0;
   }
 
-  const dbPath = values.db ?? config.defaultDbPath();
+  const dbPath = resolveDb(values.db, (values as { config?: string }).config);
   const targets: string[] = [dbPath, `${dbPath}-wal`, `${dbPath}-shm`];
   // dirname(sluiceCaCertPath()) rather than sluiceHome()/ca: on macOS the CA
   // lives under ~/Library/Application Support/Sluice, not ~/.sluice, so the old
@@ -2690,7 +2648,7 @@ async function cmdStatus(args: string[]): Promise<number> {
 
   const st = readRunState();
   const running = st !== undefined && pidAlive(st.pid);
-  const dbPath = resolveDb(values.db, values.config);
+  const dbPath = resolveDb(values.db, (values as { config?: string }).config);
   let captures = 0;
   try {
     const store = openStore(dbPath);
@@ -2750,8 +2708,18 @@ async function cmdStop(args: string[]): Promise<number> {
     return 1;
   }
   console.log(`Sent ${values.force ? 'SIGKILL' : 'SIGTERM'} to pid ${st.pid}.`);
-  // A clean shutdown clears its own state; --force cannot, so do it here.
-  if (values.force) clearRunState();
+  // A clean shutdown clears its own state and restores the system proxy;
+  // --force cannot, so do both here when we know the proxy port.
+  if (values.force) {
+    if (typeof st.proxyPort === 'number' && st.proxyPort > 0) {
+      try {
+        await restoreSystemProxyIfOurs(st.proxyPort);
+      } catch (e) {
+        console.error(`Warning: could not restore system proxy: ${errMsg(e)}`);
+      }
+    }
+    clearRunState();
+  }
   return 0;
 }
 
@@ -2784,7 +2752,7 @@ async function cmdAuth(args: string[]): Promise<number> {
     return 0;
   }
 
-  const store = openStore(resolveDb(values.db, values.config));
+  const store = openStore(resolveDb(values.db, (values as { config?: string }).config));
   const captures = store.listCaptures({ limit: 1_000_000, adapterId: values.app });
   const flow = mapAuthFlow(captures, values.app ?? null);
 
@@ -2867,7 +2835,7 @@ async function cmdFlows(args: string[]): Promise<number> {
       },
     });
     if (values.help) return cmdFlows(['help']);
-    const store = openStore(values.db);
+    const store = openStore(resolveDb(values.db, (values as { config?: string }).config));
     try {
       const flows = store.listFlows({
         adapterId: values.adapter,
@@ -2901,7 +2869,7 @@ async function cmdFlows(args: string[]): Promise<number> {
       options: { adapter: { type: 'string' }, db: { type: 'string' }, help: { type: 'boolean', short: 'h' } },
     });
     if (values.help) return cmdFlows(['help']);
-    const store = openStore(values.db);
+    const store = openStore(resolveDb(values.db, (values as { config?: string }).config));
     try {
       const tmpls = store.listFlowTemplates({ adapterId: values.adapter, limit: 200 });
       if (tmpls.length === 0) {
@@ -2932,7 +2900,7 @@ async function cmdFlows(args: string[]): Promise<number> {
       console.error('Provide a flow or template id.');
       return 1;
     }
-    const store = openStore(values.db);
+    const store = openStore(resolveDb(values.db, (values as { config?: string }).config));
     try {
       const flow = store.getFlow(id);
       if (flow) {
@@ -2983,7 +2951,7 @@ async function cmdFlows(args: string[]): Promise<number> {
       console.error(`Provide a flow id to ${sub}.`);
       return 1;
     }
-    const store = openStore(values.db);
+    const store = openStore(resolveDb(values.db, (values as { config?: string }).config));
     try {
       const got = sub === 'pin' ? store.pinFlow(id) : store.unpinFlow(id);
       if (!got) {
@@ -3019,7 +2987,7 @@ async function cmdFlows(args: string[]): Promise<number> {
       console.error('Pass at least one --capture <id>.');
       return 1;
     }
-    const store = openStore(values.db);
+    const store = openStore(resolveDb(values.db, (values as { config?: string }).config));
     try {
       const flow = store.createPinnedFlow({
         primaryCaptureId: values.primary,
@@ -3064,7 +3032,7 @@ async function cmdLearnFlows(args: string[]): Promise<number> {
     return 0;
   }
 
-  const store = openStore(values.db);
+  const store = openStore(resolveDb(values.db, (values as { config?: string }).config));
   try {
     let clustered = 0;
     if (!values['no-cluster']) {

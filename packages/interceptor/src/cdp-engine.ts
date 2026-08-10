@@ -131,6 +131,10 @@ export class CdpEngine {
   private detail: string | undefined;
   private stopping = false;
   private discoverTimer: ReturnType<typeof setInterval> | undefined;
+  /** True while a discover() pass is in flight — concurrent polls must not double-attach. */
+  private discovering = false;
+  /** Target ids currently mid-attach (await CDP) so a second discover cannot race. */
+  private attaching = new Set<string>();
 
   /** Attached page targets, keyed by CDP target id. */
   private readonly attached = new Map<string, Attached>();
@@ -203,37 +207,45 @@ export class CdpEngine {
 
   /** Poll for tabs that appeared or vanished since the last check. */
   private async discover(): Promise<void> {
-    if (this.stopping) return;
-    let targets: TargetInfo[];
+    if (this.stopping || this.discovering) return;
+    this.discovering = true;
     try {
-      targets = await this.listPageTargets();
-    } catch {
-      return; // Chrome may be shutting down; the disconnect handlers will cope
-    }
-    const live = new Set(targets.map((t) => t.id));
-    for (const t of targets) {
-      if (!this.attached.has(t.id)) await this.attach(t);
-    }
-    // Drop bookkeeping for tabs that are gone; their client emits 'disconnect'
-    // too, but polling also covers a target that vanished without one.
-    for (const id of [...this.attached.keys()]) {
-      if (!live.has(id)) this.detach(id, 'tab closed');
+      let targets: TargetInfo[];
+      try {
+        targets = await this.listPageTargets();
+      } catch {
+        return; // Chrome may be shutting down; the disconnect handlers will cope
+      }
+      const live = new Set(targets.map((t) => t.id));
+      for (const t of targets) {
+        if (!this.attached.has(t.id) && !this.attaching.has(t.id)) await this.attach(t);
+      }
+      // Drop bookkeeping for tabs that are gone; their client emits 'disconnect'
+      // too, but polling also covers a target that vanished without one.
+      for (const id of [...this.attached.keys()]) {
+        if (!live.has(id)) this.detach(id, 'tab closed');
+      }
+    } finally {
+      this.discovering = false;
     }
   }
 
   private async attach(t: TargetInfo): Promise<void> {
-    if (this.attached.has(t.id) || this.stopping) return;
+    if (this.attached.has(t.id) || this.attaching.has(t.id) || this.stopping) return;
+    this.attaching.add(t.id);
     let client: CdpClient;
     try {
       const CDP = await cdp();
       client = await CDP({ port: this.port, target: t.id });
     } catch (e) {
+      this.attaching.delete(t.id);
       this.onError(e);
       return;
     }
 
     const entry: Attached = { id: t.id, url: t.url, client, sockets: new Map() };
     this.attached.set(t.id, entry);
+    this.attaching.delete(t.id);
 
     const net = client.Network;
     net.requestWillBeSent((p) => this.onRequest(entry, p as ReqWillBeSent));

@@ -248,6 +248,12 @@ CREATE VIRTUAL TABLE IF NOT EXISTS items_fts USING fts5(
  * for exactly the users who already have captured data.
  */
 export const ADDITIVE_INDEXES: string[] = [
+  // Composite filters used by dashboard/list + materialize windows.
+  `CREATE INDEX IF NOT EXISTS idx_captures_adapter_ts ON captures(adapter_id, ts)`,
+  `CREATE INDEX IF NOT EXISTS idx_captures_tab_ts ON captures(tab_id, ts)`,
+  `CREATE INDEX IF NOT EXISTS idx_items_adapter_ts ON items(adapter_id, ts)`,
+  `CREATE INDEX IF NOT EXISTS idx_items_workspace_ts ON items(workspace_id, ts)`,
+
   'CREATE INDEX IF NOT EXISTS idx_captures_tab ON captures(tab_id)',
   // Drives the "what still needs parsing?" query that replaced the in-memory
   // watermark. `parsed_at IS NULL` is the hot predicate, so the partial index is

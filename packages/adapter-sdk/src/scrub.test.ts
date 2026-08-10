@@ -451,3 +451,110 @@ test('optional fields are not invented, and are kept when present', () => {
   assert.equal(frame.direction, 'received');
   assert.equal(frame.wsId, 'ws_1');
 });
+
+test('caret passthrough is bound to label-shaped tokens only', () => {
+  const [cap] = scrubCaptures([
+    {
+      id: 'c',
+      ts: 1,
+      source: 'mitm',
+      adapterId: null,
+      method: 'GET',
+      url: 'https://example.com/',
+      host: 'example.com',
+      path: '/',
+      status: 200,
+      durationMs: 1,
+      reqHeaders: {},
+      reqBody: null,
+      resHeaders: {},
+      resBody: JSON.stringify({
+        ok: '^i',
+        leak: '^this-is-user-content-not-a-label-and-is-long',
+      }),
+    },
+  ]);
+  const body = JSON.parse(cap!.resBody!);
+  assert.equal(body.ok, '^i');
+  assert.notEqual(body.leak, '^this-is-user-content-not-a-label-and-is-long');
+  assert.equal(String(body.leak).length, '^this-is-user-content-not-a-label-and-is-long'.length);
+});
+
+test('loaderId pageLoadId navigationId survive scrubCapture', () => {
+  const [cap] = scrubCaptures([
+    {
+      id: 'c',
+      ts: 1_700_000_000_000,
+      source: 'cdp',
+      adapterId: null,
+      method: 'GET',
+      url: 'https://example.com/x',
+      host: 'example.com',
+      path: '/x',
+      status: 200,
+      durationMs: 1,
+      reqHeaders: {},
+      reqBody: null,
+      resHeaders: {},
+      resBody: null,
+      loaderId: 'loader-abc',
+      pageLoadId: 'page-xyz',
+      navigationId: 'nav-123',
+    },
+  ]);
+  assert.equal(cap!.loaderId, 'loader-abc');
+  assert.equal(cap!.pageLoadId, 'page-xyz');
+  assert.equal(cap!.navigationId, 'nav-123');
+});
+
+test('epoch-seconds numbers shift like epoch-ms', () => {
+  const sec = 1_700_000_000;
+  const [cap] = scrubCaptures([
+    {
+      id: 'c',
+      ts: 1,
+      source: 'mitm',
+      adapterId: null,
+      method: 'GET',
+      url: 'https://example.com/',
+      host: 'example.com',
+      path: '/',
+      status: 200,
+      durationMs: 1,
+      reqHeaders: {},
+      reqBody: null,
+      resHeaders: {},
+      resBody: JSON.stringify({ t: sec, n: 42 }),
+    },
+  ]);
+  const body = JSON.parse(cap!.resBody!);
+  assert.equal(body.n, 42);
+  assert.notEqual(body.t, sec);
+  assert.equal(typeof body.t, 'number');
+});
+
+test('ISO date strings shift', () => {
+  const iso = '2024-01-15T12:00:00.000Z';
+  const [cap] = scrubCaptures([
+    {
+      id: 'c',
+      ts: 1,
+      source: 'mitm',
+      adapterId: null,
+      method: 'GET',
+      url: 'https://example.com/',
+      host: 'example.com',
+      path: '/',
+      status: 200,
+      durationMs: 1,
+      reqHeaders: {},
+      reqBody: null,
+      resHeaders: {},
+      resBody: JSON.stringify({ when: iso }),
+    },
+  ]);
+  const body = JSON.parse(cap!.resBody!);
+  assert.notEqual(body.when, iso);
+  assert.equal(String(body.when).length, iso.length);
+});
+

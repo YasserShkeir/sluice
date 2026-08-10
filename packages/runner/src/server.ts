@@ -961,7 +961,7 @@ export async function startServer(opts: StartServerOpts): Promise<StartServerRes
     try {
       parsed = JSON.parse((await readBody(req, INGEST_MAX_BYTES)).toString('utf8'));
     } catch (e) {
-      return reply(413, { error: 'bad_body', detail: errMsg(e) });
+      return reply(413, { error: 'bad_body', detail: redactText(errMsg(e)) });
     }
     const list = Array.isArray((parsed as { captures?: unknown })?.captures)
       ? ((parsed as { captures: unknown[] }).captures)
@@ -1193,7 +1193,7 @@ export async function startServer(opts: StartServerOpts): Promise<StartServerRes
             if (ptySession === session) killPtySession();
           });
         } catch (e) {
-          sendPty(ws, { t: 'error', message: errMsg(e) });
+          sendPty(ws, { t: 'error', message: redactText(errMsg(e)) });
           ws.close();
           return;
         }
@@ -1417,6 +1417,10 @@ export async function startServer(opts: StartServerOpts): Promise<StartServerRes
   });
 
   async function close(): Promise<void> {
+    if (appsTimer) {
+      clearTimeout(appsTimer);
+      appsTimer = undefined;
+    }
     if (matTimer) clearTimeout(matTimer);
     // Take the terminal down first so its child dies with the server, not orphaned.
     // This is where the persistent session is reclaimed — the runner exiting is
