@@ -1,0 +1,23 @@
+{
+  "name": "@sluice/app-gmail",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Sluice Gmail app: an adapter for mail.google.com's positional-array sync API (bv/fd/s) — turns the batch-view response into labels, threads and label edges.",
+  "license": "AGPL-3.0-or-later",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "node --import tsx --test src/*.test.ts"
+  },
+  "dependencies": {
+    "@sluice/adapter-sdk": "workspace:*",
+    "@sluice/core": "workspace:*",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@types/node": "^20.10.0"
+  }
+}

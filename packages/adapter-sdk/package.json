@@ -1,0 +1,34 @@
+{
+  "name": "@sluice/adapter-sdk",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Build a Sluice adapter: shared coercion helpers, a capture factory, the mandatory conformance harness, and the NDJSON mock runner.",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "files": ["dist", "README.md"],
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "build": "tsc -p tsconfig.build.json",
+    "prepack": "pnpm build",
+    "test": "node --import tsx --test src/*.test.ts"
+  },
+  "dependencies": {
+    "@sluice/core": "workspace:^"
+  },
+  "devDependencies": {
+    "@types/node": "^20.10.0"
+  },
+  "license": "Apache-2.0",
+  "publishConfig": {
+    "access": "public",
+    "main": "./dist/index.js",
+    "types": "./dist/index.d.ts",
+    "exports": {
+      ".": {
+        "types": "./dist/index.d.ts",
+        "import": "./dist/index.js"
+      }
+    }
+  }
+}

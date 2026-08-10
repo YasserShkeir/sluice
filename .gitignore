@@ -1,0 +1,47 @@
+# Dependencies
+node_modules/
+.pnp
+.pnp.js
+.pnpm-store/
+
+# Build output
+dist/
+build/
+out/
+*.tsbuildinfo
+
+# Local runtime data — NEVER commit captured traffic or secrets
+.sluice/
+*.sqlite
+*.sqlite-journal
+*.sqlite-wal
+captures/
+*.har
+*.pcap
+
+# Secrets / credentials (belt-and-suspenders — the tool keeps these in memory only)
+*.pem
+*.key
+.env
+.env.*
+!.env.example
+
+# Local CA material
+ca/
+*.crt
+
+# Logs
+*.log
+logs/
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.example.json
+*.swp
+
+# Design docs, plans and captured API catalogs — kept locally, not in the repo.
+# The API catalogs in particular are rendered from real captured traffic.
+docs/

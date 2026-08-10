@@ -1,0 +1,24 @@
+{
+  "name": "@sluice/app-slack",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Sluice Slack app: the self-contained Slack plugin — adapter, parser, macOS credential provider, and desktop path helpers — behind the generic App interface.",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "node --import tsx --test src/*.test.ts"
+  },
+  "dependencies": {
+    "@sluice/adapter-sdk": "workspace:*",
+    "@sluice/core": "workspace:*",
+    "better-sqlite3": "^11.7.0",
+    "classic-level": "^1.4.0"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.12",
+    "@types/node": "^20.10.0"
+  }
+}

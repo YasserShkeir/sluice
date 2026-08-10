@@ -1,0 +1,23 @@
+{
+  "name": "@sluice/app-trello",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Sluice Trello app: a self-contained plugin \u2014 adapter, parser, macOS Chrome cookie credential provider, and an MCP tool that lists the logged-in user's open cards using the local Chrome session cookie.",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "node --import tsx --test src/*.test.ts"
+  },
+  "dependencies": {
+    "@sluice/adapter-sdk": "workspace:*",
+    "@sluice/core": "workspace:*",
+    "better-sqlite3": "^11.7.0"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.12",
+    "@types/node": "^20.10.0"
+  }
+}

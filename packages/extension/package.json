@@ -1,0 +1,7 @@
+{
+  "name": "@sluice/extension",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Sluice Capture — MV3 browser extension (Engine C): passive in-page capture to a local runner.",
+  "license": "AGPL-3.0-or-later"
+}

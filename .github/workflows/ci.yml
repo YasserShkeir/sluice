@@ -1,0 +1,41 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          # Kept in step with the root package.json "packageManager" field.
+          version: 10.29.1
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+
+      # better-sqlite3 and classic-level are native and listed in
+      # pnpm.onlyBuiltDependencies, so their build scripts must be allowed to run.
+      - name: Install
+        run: pnpm install --frozen-lockfile
+
+      - name: Lint
+        run: pnpm lint
+
+      - name: Typecheck
+        run: pnpm typecheck
+
+      - name: Test
+        run: pnpm test
+
+      # Builds the dashboard AND bundles the two shipping binaries, so a
+      # packaging regression fails here rather than at publish time.
+      - name: Build
+        run: pnpm build

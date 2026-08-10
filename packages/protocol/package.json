@@ -1,0 +1,22 @@
+{
+  "name": "@sluice/protocol",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Runtime validation for the runner↔webapp WebSocket protocol. Zod schemas both ends compile against, with no Node-only dependencies so the browser can use them too.",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "node --import tsx --test src/*.test.ts"
+  },
+  "dependencies": {
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@sluice/core": "workspace:*",
+    "@types/node": "^20.10.0"
+  },
+  "license": "Apache-2.0"
+}
