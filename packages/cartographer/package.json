@@ -3,7 +3,7 @@
   "version": "0.0.0",
   "private": true,
   "type": "module",
-  "description": "Sluice cartographer: turns captured traffic into an endpoint catalog and a per-app SQLite schema materialized from real responses.",
+  "description": "Sluice cartographer: turns captured traffic into an endpoint catalog and a per-app SQLite schema materialized from real responses; interaction-flow clustering and template learning.",
   "exports": {
     ".": "./src/index.ts"
   },

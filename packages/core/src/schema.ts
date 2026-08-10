@@ -24,6 +24,9 @@ CREATE TABLE IF NOT EXISTS captures (
   process_name TEXT,
   tab_id       TEXT,
   tab_url      TEXT,
+  loader_id    TEXT,
+  page_load_id TEXT,
+  navigation_id TEXT,
   direction    TEXT,
   ws_id        TEXT,
   classification    TEXT,
@@ -147,6 +150,51 @@ CREATE INDEX IF NOT EXISTS idx_cursors_state ON cursors(state, updated_ts);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_cursors_dedupe
   ON cursors(adapter_id, action_id, IFNULL(container_id, ''), IFNULL(cursor, ''));
 
+-- Interaction flows: one primary capture + the companions observed with it.
+-- Captures stay the source of truth; these tables only group existing ids.
+-- No secrets — only ids, roles, timestamps, and free-text labels.
+CREATE TABLE IF NOT EXISTS interaction_flows (
+  id                  TEXT PRIMARY KEY,
+  adapter_id          TEXT NOT NULL,
+  label               TEXT,
+  primary_capture_id  TEXT NOT NULL,
+  started_at          INTEGER NOT NULL,
+  ended_at            INTEGER NOT NULL,
+  source              TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_flows_adapter ON interaction_flows(adapter_id, started_at);
+CREATE INDEX IF NOT EXISTS idx_flows_primary ON interaction_flows(primary_capture_id);
+CREATE INDEX IF NOT EXISTS idx_flows_source  ON interaction_flows(source, started_at);
+
+CREATE TABLE IF NOT EXISTS interaction_flow_steps (
+  flow_id     TEXT NOT NULL,
+  capture_id  TEXT NOT NULL,
+  seq         INTEGER NOT NULL,
+  role        TEXT NOT NULL,
+  operation   TEXT,
+  required    INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (flow_id, capture_id),
+  FOREIGN KEY (flow_id) REFERENCES interaction_flows(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_flow_steps_capture ON interaction_flow_steps(capture_id);
+
+-- Learned multi-step plans (Phase B). JSON holds steps + flowParams; no secrets.
+CREATE TABLE IF NOT EXISTS flow_templates (
+  id            TEXT PRIMARY KEY,
+  adapter_id    TEXT NOT NULL,
+  primary_key   TEXT NOT NULL,
+  label         TEXT,
+  sample_count  INTEGER NOT NULL,
+  version       INTEGER NOT NULL,
+  learned_at    INTEGER NOT NULL,
+  steps_json    TEXT NOT NULL,
+  flow_params_json TEXT NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_flow_templates_primary
+  ON flow_templates(adapter_id, primary_key);
+CREATE INDEX IF NOT EXISTS idx_flow_templates_adapter
+  ON flow_templates(adapter_id, learned_at);
+
 -- Full-text search over capture bodies (the U1 'body:"…"' predicate and
 -- /api/captures/search) and over item text.
 --
@@ -206,6 +254,9 @@ export const ADDITIVE_INDEXES: string[] = [
   // both smaller and the one SQLite actually picks.
   'CREATE INDEX IF NOT EXISTS idx_captures_unparsed ON captures(ts) WHERE parsed_at IS NULL',
   'CREATE INDEX IF NOT EXISTS idx_captures_classification ON captures(classification)',
+  // F0.3 — cluster companions that share a document load without wall-clock alone.
+  'CREATE INDEX IF NOT EXISTS idx_captures_page_load ON captures(page_load_id)',
+  'CREATE INDEX IF NOT EXISTS idx_captures_loader ON captures(loader_id)',
 ];
 
 export const ADDITIVE_COLUMNS: Record<string, Record<string, string>> = {
@@ -214,6 +265,10 @@ export const ADDITIVE_COLUMNS: Record<string, Record<string, string>> = {
     // separate "the Slack tab" from "the Trello tab" from background noise.
     tab_id: 'TEXT',
     tab_url: 'TEXT',
+    // F0.3 correlation: one page load / navigation / CDP loader.
+    loader_id: 'TEXT',
+    page_load_id: 'TEXT',
+    navigation_id: 'TEXT',
     // WebSocket frames: direction of travel, and the socket they belong to.
     direction: 'TEXT',
     ws_id: 'TEXT',

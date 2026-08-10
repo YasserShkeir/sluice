@@ -94,7 +94,7 @@ what it means. Improve it where it pays:
   tokens, `_x_*` params. These can't be replayed verbatim and the adapter will
   need to regenerate or drop them.
 
-Keep the honest caveats: which areas you exercised, and which you didn't. A
+Keep the coverage notes: which areas you exercised, and which you didn't. A
 catalog that silently looks complete is worse than one that says "boards and
 cards only; no admin or billing endpoints were driven".
 

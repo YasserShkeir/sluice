@@ -47,11 +47,13 @@ import {
   MitmEngine,
   reconstructCredentials,
   ReplayDeniedError,
+  resolveJsonPath,
+  runFlowReplay,
   runReplay,
   superviseEngine,
 } from '@sluice/interceptor';
 import type { LaunchedChrome, Supervisor } from '@sluice/interceptor';
-import { buildApiMap, faithfulReplayRequest, materialize, renderMarkdown } from '@sluice/cartographer';
+import { buildApiMap, buildFlowStepRequest, clusterCapturesIntoFlows, faithfulReplayRequest, learnFlowTemplates, materialize, renderMarkdown } from '@sluice/cartographer';
 
 import * as config from './config.js';
 import { clearProxy, detectNetworkService, getProxyState, setProxy } from './proxy.js';
@@ -471,7 +473,16 @@ async function cmdDoctor(args: string[]): Promise<number> {
     'sluice-ca.cert',
   );
   if (!existsSync(caPath)) {
-    warn(false, 'Local CA', 'not generated yet — `sluice ca-install`, or it is created on first `sluice start`');
+    // This used to offer `sluice start` as an equivalent second option. It is
+    // not one: start calls ensureSluiceCA(), which GENERATES the certificate and
+    // stops there — trusting it is `ca-install`'s job alone. Following the old
+    // advice left users with a CA on disk that no keychain trusts, which fails
+    // every HTTPS request through the proxy while doctor still summarised OK.
+    warn(
+      false,
+      'Local CA',
+      'not generated yet — run `sluice ca-install`. (`sluice start` creates the certificate but does NOT trust it, and an untrusted CA fails every HTTPS request through the proxy.)',
+    );
   } else if (darwin) {
     let trusted = false;
     try {
@@ -1442,6 +1453,7 @@ async function cmdReplay(args: string[]): Promise<number> {
     allowPositionals: true,
     options: {
       action: { type: 'string' },
+      flow: { type: 'string' },
       param: { type: 'string', multiple: true },
       adapter: { type: 'string' },
       container: { type: 'string' },
@@ -1458,11 +1470,13 @@ async function cmdReplay(args: string[]): Promise<number> {
   if (values.help) {
     console.log(
       'sluice replay <actionId> [--param k=v ...] [--adapter ID] [--token X --cookie Y] [--db PATH]\n' +
+        'sluice replay --flow <templateId|primaryKey> [--param k=v ...] [--adapter ID] [--db PATH]\n' +
         'sluice replay --list [--adapter ID]   list available replay actions\n' +
         'sluice replay --all [--container ID] [--adapter ID] [--dry-run]\n' +
         '  Drain the cursor worklist: replay every queued page, ingest it, and queue\n' +
         '  whatever it names next. --dry-run prints what it would replay and claims\n' +
-        '  nothing. Stops cleanly when the replay budget is spent.',
+        '  nothing. Stops cleanly when the replay budget is spent.\n' +
+        '  --flow runs a learned multi-step template (see `sluice learn-flows`).',
     );
     return 0;
   }
@@ -1491,6 +1505,96 @@ async function cmdReplay(args: string[]): Promise<number> {
       }
     }
     return 0;
+  }
+
+  if (values.flow) {
+    if (values.all || values.list || values.action || positionals[0]) {
+      console.error('Pass --flow alone (with --param / --adapter / --db), not with an action id or --all.');
+      return 1;
+    }
+    let params: Record<string, string>;
+    try {
+      params = parseParams(values.param);
+    } catch (e) {
+      console.error(errMsg(e));
+      return 1;
+    }
+    const store = openStore(values.db);
+    try {
+      let tmpl = store.getFlowTemplate(values.flow);
+      if (!tmpl && values.adapter) {
+        tmpl = store.getFlowTemplateByPrimary(values.adapter, values.flow);
+      }
+      if (!tmpl) {
+        // try primaryKey match across adapters when unique
+        const hits = store.listFlowTemplates({ primaryKey: values.flow, limit: 5 });
+        if (hits.length === 1) tmpl = hits[0];
+        else if (hits.length > 1) {
+          console.error(
+            `Ambiguous primaryKey "${values.flow}". Pass --adapter. Matches: ${hits
+              .map((h) => `${h.adapterId}:${h.id}`)
+              .join(', ')}`,
+          );
+          return 1;
+        }
+      }
+      if (!tmpl) {
+        console.error(`Unknown flow template "${values.flow}". Run \`sluice learn-flows\` or \`sluice flows list\`.`);
+        return 1;
+      }
+      const app = apps.find((a) => a.id === tmpl!.adapterId);
+      if (!app) {
+        console.error(`No installed app for adapter "${tmpl.adapterId}".`);
+        return 1;
+      }
+      let session: Session;
+      try {
+        session = await acquireSession(values, app.id);
+      } catch (e) {
+        console.error(`No session: ${errMsg(e)}`);
+        return 1;
+      }
+      const result = await runFlowReplay({
+        template: tmpl,
+        params,
+        session,
+        io: {
+          build: (step, s, ctx) =>
+            buildFlowStepRequest(tmpl!, step, s, {
+              params: ctx.params,
+              priorResponses: ctx.priorResponses,
+              resolvePath: resolveJsonPath,
+              allowedHosts: app.hosts,
+            }),
+          run: (req) => runReplay(req),
+          record: (c) => {
+            c.adapterId = app.id;
+            store.insertCapture(c);
+            store.applyParseResult(app.parse(c), c.ts || Date.now());
+          },
+        },
+      });
+      if (result.flow) {
+        try {
+          store.upsertFlow(result.flow);
+        } catch {
+          /* best-effort */
+        }
+      }
+      console.log(
+        `flow ${tmpl.primaryKey}: ${result.ok ? 'ok' : 'FAILED'}${result.error ? ` — ${result.error}` : ''}`,
+      );
+      if (result.flow?.id) console.log(`parent flow id: ${result.flow.id}`);
+      for (const s of result.steps) {
+        console.log(
+          `  [${s.seq}] ${s.status.padEnd(9)} ${s.method} ${s.path}${s.operation ? ` (${s.operation})` : ''}` +
+            `${s.httpStatus != null ? ` → ${s.httpStatus}` : ''}${s.detail ? ` — ${s.detail}` : ''}`,
+        );
+      }
+      return result.ok ? 0 : 1;
+    } finally {
+      store.close();
+    }
   }
 
   const actionId = values.action ?? positionals[0];
@@ -2338,7 +2442,11 @@ async function cmdWipe(args: string[]): Promise<number> {
 
   const dbPath = values.db ?? config.defaultDbPath();
   const targets: string[] = [dbPath, `${dbPath}-wal`, `${dbPath}-shm`];
-  const caDir = join(config.sluiceHome(), 'ca');
+  // dirname(sluiceCaCertPath()) rather than sluiceHome()/ca: on macOS the CA
+  // lives under ~/Library/Application Support/Sluice, not ~/.sluice, so the old
+  // path pointed at a directory that never exists and `wipe --all` silently
+  // left the certificate behind.
+  const caDir = dirname(sluiceCaCertPath());
   const profileDir = defaultChromeProfileDir();
   if (values.all) targets.push(caDir, profileDir);
 
@@ -2734,6 +2842,270 @@ async function cmdAuth(args: string[]): Promise<number> {
   return 0;
 }
 
+
+// ── flows / learn-flows ──────────────────────────────────────────────────────
+
+async function cmdFlows(args: string[]): Promise<number> {
+  const sub = args[0];
+  const rest = args.slice(1);
+  if (!sub || sub === 'help' || sub === '--help' || sub === '-h') {
+    console.log(
+      'sluice flows list [--adapter ID] [--source observed|pinned|replay|learned] [--q TEXT] [--db PATH]\n' +
+        'sluice flows show <id> [--db PATH]\n' +
+        'sluice flows pin <id> [--db PATH]\n' +
+        'sluice flows unpin <id> [--db PATH]\n' +
+        'sluice flows pin-captures --primary <captureId> --capture <id> [--capture <id> ...] [--label TEXT] [--adapter ID] [--db PATH]\n' +
+        'sluice flows templates [--adapter ID] [--db PATH]',
+    );
+    return sub ? 0 : 1;
+  }
+
+  if (sub === 'list') {
+    const { values } = parseArgs({
+      args: rest,
+      options: {
+        adapter: { type: 'string' },
+        source: { type: 'string' },
+        q: { type: 'string' },
+        db: { type: 'string' },
+        help: { type: 'boolean', short: 'h' },
+      },
+    });
+    if (values.help) return cmdFlows(['help']);
+    const store = openStore(values.db);
+    try {
+      const flows = store.listFlows({
+        adapterId: values.adapter,
+        source: values.source as 'observed' | 'pinned' | 'replay' | 'learned' | undefined,
+        q: values.q,
+        limit: 200,
+      });
+      if (flows.length === 0) {
+        console.log('(no flows — run `sluice learn-flows` after capturing traffic)');
+        return 0;
+      }
+      for (const f of flows) {
+        const primaryOp =
+          f.steps.find((s) => s.captureId === f.primaryCaptureId)?.operation ??
+          f.steps.find((s) => s.role === 'primary')?.operation ??
+          '?';
+        console.log(
+          `${f.id}  [${f.source}] ${f.adapterId}  ${primaryOp}  steps=${f.steps.length}` +
+            (f.label ? `  ${f.label}` : ''),
+        );
+      }
+      return 0;
+    } finally {
+      store.close();
+    }
+  }
+
+  if (sub === 'templates') {
+    const { values } = parseArgs({
+      args: rest,
+      options: { adapter: { type: 'string' }, db: { type: 'string' }, help: { type: 'boolean', short: 'h' } },
+    });
+    if (values.help) return cmdFlows(['help']);
+    const store = openStore(values.db);
+    try {
+      const tmpls = store.listFlowTemplates({ adapterId: values.adapter, limit: 200 });
+      if (tmpls.length === 0) {
+        console.log('(no templates — run `sluice learn-flows`)');
+        return 0;
+      }
+      for (const t of tmpls) {
+        const params = t.flowParams.map((p) => p.name + (p.required ? '*' : '')).join(',') || '-';
+        console.log(
+          `${t.id}  ${t.adapterId}  ${t.primaryKey}  steps=${t.steps.length}  samples=${t.sampleCount}  params=${params}`,
+        );
+      }
+      return 0;
+    } finally {
+      store.close();
+    }
+  }
+
+  if (sub === 'show') {
+    const { values, positionals } = parseArgs({
+      args: rest,
+      allowPositionals: true,
+      options: { db: { type: 'string' }, help: { type: 'boolean', short: 'h' } },
+    });
+    if (values.help) return cmdFlows(['help']);
+    const id = positionals[0];
+    if (!id) {
+      console.error('Provide a flow or template id.');
+      return 1;
+    }
+    const store = openStore(values.db);
+    try {
+      const flow = store.getFlow(id);
+      if (flow) {
+        console.log(JSON.stringify(flow, null, 2));
+        return 0;
+      }
+      const tmpl = store.getFlowTemplate(id);
+      if (tmpl) {
+        // Drop request fingerprints' values that might look secret-adjacent; show structure only.
+        const safe = {
+          ...tmpl,
+          steps: tmpl.steps.map((s) => ({
+            seq: s.seq,
+            role: s.role,
+            method: s.method,
+            path: s.path,
+            operation: s.operation,
+            required: s.required,
+            support: s.support,
+            delayMsP50: s.delayMsP50,
+            unreproducible: s.unreproducible,
+            unreproducibleReason: s.unreproducibleReason,
+            params: s.params
+              ? Object.fromEntries(Object.entries(s.params).map(([k, v]) => [k, { kind: v.kind, name: 'name' in v ? v.name : undefined, fromStep: 'fromStep' in v ? v.fromStep : undefined, jsonPath: 'jsonPath' in v ? v.jsonPath : undefined }]))
+              : undefined,
+            hasRequestTemplate: Boolean(s.request),
+          })),
+        };
+        console.log(JSON.stringify(safe, null, 2));
+        return 0;
+      }
+      console.error(`No flow or template "${id}".`);
+      return 1;
+    } finally {
+      store.close();
+    }
+  }
+
+  if (sub === 'pin' || sub === 'unpin') {
+    const { values, positionals } = parseArgs({
+      args: rest,
+      allowPositionals: true,
+      options: { db: { type: 'string' }, help: { type: 'boolean', short: 'h' } },
+    });
+    if (values.help) return cmdFlows(['help']);
+    const id = positionals[0];
+    if (!id) {
+      console.error(`Provide a flow id to ${sub}.`);
+      return 1;
+    }
+    const store = openStore(values.db);
+    try {
+      const got = sub === 'pin' ? store.pinFlow(id) : store.unpinFlow(id);
+      if (!got) {
+        console.error(`No flow "${id}".`);
+        return 1;
+      }
+      console.log(`${sub}ned ${got.id} → source=${got.source}`);
+      return 0;
+    } finally {
+      store.close();
+    }
+  }
+
+  if (sub === 'pin-captures') {
+    const { values } = parseArgs({
+      args: rest,
+      options: {
+        primary: { type: 'string' },
+        capture: { type: 'string', multiple: true },
+        label: { type: 'string' },
+        adapter: { type: 'string' },
+        db: { type: 'string' },
+        help: { type: 'boolean', short: 'h' },
+      },
+    });
+    if (values.help) return cmdFlows(['help']);
+    if (!values.primary) {
+      console.error('Pass --primary <captureId>.');
+      return 1;
+    }
+    const caps = values.capture ?? [];
+    if (caps.length === 0) {
+      console.error('Pass at least one --capture <id>.');
+      return 1;
+    }
+    const store = openStore(values.db);
+    try {
+      const flow = store.createPinnedFlow({
+        primaryCaptureId: values.primary,
+        captureIds: caps,
+        label: values.label,
+        adapterId: values.adapter,
+      });
+      console.log(`pinned flow ${flow.id}  steps=${flow.steps.length}  primary=${flow.primaryCaptureId}`);
+      return 0;
+    } catch (e) {
+      console.error(errMsg(e));
+      return 1;
+    } finally {
+      store.close();
+    }
+  }
+
+  console.error(`Unknown flows subcommand "${sub}".`);
+  await cmdFlows(['help']);
+  return 1;
+}
+
+async function cmdLearnFlows(args: string[]): Promise<number> {
+  const { values } = parseArgs({
+    args,
+    options: {
+      adapter: { type: 'string' },
+      'window-ms': { type: 'string' },
+      'min-steps': { type: 'string' },
+      'min-samples': { type: 'string' },
+      'no-cluster': { type: 'boolean' },
+      db: { type: 'string' },
+      help: { type: 'boolean', short: 'h' },
+    },
+  });
+  if (values.help) {
+    console.log(
+      'sluice learn-flows [--adapter ID] [--window-ms 1000] [--min-steps 2] [--min-samples 1] [--no-cluster] [--db PATH]\n' +
+        '  Cluster recent captures into interaction flows, then learn multi-step templates.\n' +
+        '  Observation-only: only mitm/cdp/ext bursts train; replay traffic is ignored.',
+    );
+    return 0;
+  }
+
+  const store = openStore(values.db);
+  try {
+    let clustered = 0;
+    if (!values['no-cluster']) {
+      const windowMs = values['window-ms'] ? Number(values['window-ms']) : undefined;
+      const minSteps = values['min-steps'] ? Number(values['min-steps']) : undefined;
+      const proposed = clusterCapturesIntoFlows(store, {
+        adapterId: values.adapter,
+        windowMs: Number.isFinite(windowMs) ? windowMs : undefined,
+        minSteps: Number.isFinite(minSteps) ? minSteps : undefined,
+      });
+      for (const p of proposed) {
+        store.upsertFlow(p);
+        clustered++;
+      }
+      console.log(`clustered ${clustered} flow(s)`);
+    }
+
+    const minSamples = values['min-samples'] ? Number(values['min-samples']) : undefined;
+    const templates = learnFlowTemplates(store, {
+      adapterId: values.adapter,
+      minSamples: Number.isFinite(minSamples) ? minSamples : undefined,
+      persist: true,
+    });
+    console.log(`learned ${templates.length} template(s)`);
+    for (const t of templates) {
+      console.log(
+        `  ${t.adapterId}  ${t.primaryKey}  steps=${t.steps.length}  samples=${t.sampleCount}  id=${t.id}`,
+      );
+    }
+    return 0;
+  } finally {
+    store.close();
+  }
+}
+
+
 const USAGE = `sluice — local-only capture + explorer for your own SaaS API traffic
 
 Usage: sluice <command> [options]
@@ -2749,8 +3121,10 @@ Commands:
   ca-uninstall    Remove trust for Sluice's local CA.
   sync            Reconstruct structure for ALL (or one) workspace via the Web API.
   build-db        Materialize per-app tables (one per collection, e.g. channels, users) from captures.
-  apidoc          Render a Markdown API catalog from captured traffic.
-  replay          Run one replay action by id — or --all to drain the cursor worklist.
+  apidoc          Render an endpoint catalog (Markdown) from captured traffic.
+  replay          Run one replay action by id, --flow <template>, or --all to drain cursors.
+  flows           List / show / pin interaction flows and learned templates.
+  learn-flows     Cluster captures into flows and refresh multi-step templates.
   export          Dump a container's items: json | ndjson | markdown | sqlite.
   record          Dump captures as NDJSON for the mock runner (credential-free replay).
   mock            Replay a recorded NDJSON fixture through the real ingest path.
@@ -2803,6 +3177,10 @@ async function main(): Promise<number> {
       return cmdApiDoc(rest);
     case 'replay':
       return cmdReplay(rest);
+    case 'flows':
+      return cmdFlows(rest);
+    case 'learn-flows':
+      return cmdLearnFlows(rest);
     case 'record':
       return cmdRecord(rest);
     case 'mock':

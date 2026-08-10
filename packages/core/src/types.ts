@@ -49,6 +49,21 @@ export interface Capture {
   tabId?: string | null;
   tabUrl?: string | null;
   /**
+   * Correlation across a single page load / navigation burst (F0.3).
+   *
+   * Engines fill what they know; all optional so older rows and MITM-only
+   * captures stay valid. Flow clustering prefers these over wall-clock gaps
+   * when present.
+   *
+   * - `loaderId` — CDP `Network.requestWillBeSent.loaderId` (Engine C)
+   * - `pageLoadId` — stable bucket for one document load (often = loaderId on CDP;
+   *   extension may use tab+navigation counter)
+   * - `navigationId` — coarser navigation epoch when the engine has one
+   */
+  loaderId?: string | null;
+  pageLoadId?: string | null;
+  navigationId?: string | null;
+  /**
    * WebSocket frames (`source: 'ws'`). `direction` says which way the frame
    * went; `wsId` groups every frame of one socket. The payload lives in
    * `reqBody` for a sent frame and `resBody` for a received one, so the existing
@@ -228,6 +243,12 @@ export interface CaptureQuery {
   /** Only captures no adapter claimed (`adapter_id IS NULL`) — the pre-scoping noise. */
   unattributed?: boolean;
   /**
+   * Look up these capture ids (order of results is not guaranteed to match).
+   * Used by the traffic UI to hydrate flow members outside the live WS ring.
+   * Capped by the store implementation.
+   */
+  ids?: string[];
+  /**
    * FTS5 query over request + response bodies. This is a MATCH expression, not a
    * substring: `not_in_channel`, `"rate limited"`, `channel AND error`. Callers
    * taking user input should go through `ftsQuery` — an unbalanced quote or a
@@ -381,7 +402,7 @@ export interface CredentialInjection {
 }
 
 /**
- * Full-session credentials. `values` is SECRET — it must never be written to
+ * Live-session credentials. `values` is SECRET — it must never be written to
  * the store, logged, or streamed. Persist only a RedactedSession.
  */
 export interface CredentialBundle {
@@ -607,8 +628,22 @@ export interface Adapter {
   listReplayActions(): ReplayAction[];
   /** build a concrete request from an action + params + a session's credentials */
   buildReplayRequest(action: ReplayAction, params: Record<string, string>, session: Session): ReplayRequest;
+  /**
+   * Optional hand-authored companion hints when capture clustering is weak.
+   * Data-learned templates always win over these at replay time.
+   */
+  listFlowHints?(): FlowHint[];
   /** Phase-B seed: surface credential candidates seen in a capture */
   extractCredentialHints?(capture: Capture): CredentialHint[];
+}
+
+/** Adapter-authored sketch of companions that usually ride with a primary action. */
+export interface FlowHint {
+  /** Primary ReplayAction id or semantic operation key. */
+  primaryKey: string;
+  label?: string;
+  /** Companion operations (or method+path keys) expected alongside the primary. */
+  companions: string[];
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -669,6 +704,16 @@ export interface AppToolContext {
    * Resolves with the stored, secret-redacted Capture.
    */
   replay(req: ReplayRequest): Promise<Capture>;
+  /**
+   * Run a learned multi-step flow template through the same rails as
+   * `sluice_replay_flow`. Prefer this over chaining bare `fetch` calls.
+   * Optional — hosts that only wire single-request replay may omit it.
+   */
+  replayFlow?(
+    templateId: string,
+    params?: Record<string, string>,
+    opts?: { workspaceId?: string },
+  ): Promise<unknown>;
   /**
    * What this app has already captured, read-only.
    *
@@ -755,4 +800,196 @@ export interface EngineStatus {
   state: EngineState;
   detail?: string;
   proxyPort?: number;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Interaction flows — a primary capture + the companions that rode with it.
+//
+// Single-request faithful replay learns one method+path. Real clients fire a
+// burst: history + members + emoji, board + cards + members, etc. A flow is the
+// first-class name for that burst so clustering, UI grouping and (later)
+// multi-step replay share one model.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** How a capture participates in a flow. */
+export type FlowStepRole = 'primary' | 'companion' | 'auth' | 'unknown';
+
+/**
+ * Where a flow row came from.
+ *   - `observed`  — clustered from real mitm/cdp/ext captures
+ *   - `pinned`    — a person marked these captures as one flow
+ *   - `replay`    — produced by a multi-step flow replay (later phase)
+ *   - `learned`   — template materialization (later phase); reserved
+ */
+export type FlowSource = 'observed' | 'pinned' | 'replay' | 'learned';
+
+/** One hop inside a flow. */
+export interface FlowStep {
+  captureId: string;
+  /** 0-based order within the flow (usually capture time order). */
+  seq: number;
+  role: FlowStepRole;
+  /** Semantic op when known (`conversations.history`), else undefined. */
+  operation?: string;
+  /**
+   * Whether automated replay should treat a missing/failing step as fatal.
+   * Clustering defaults companions to false; the primary is always true.
+   */
+  required: boolean;
+}
+
+export interface InteractionFlow {
+  id: string;
+  adapterId: string;
+  label?: string;
+  primaryCaptureId: string;
+  startedAt: number;
+  endedAt: number;
+  source: FlowSource;
+  steps: FlowStep[];
+}
+
+export interface FlowQuery {
+  adapterId?: string;
+  source?: FlowSource;
+  /** Substring match on label or primary operation. */
+  q?: string;
+  sinceTs?: number;
+  limit?: number;
+}
+
+/** What `upsertFlow` accepts — id optional (minted when omitted). */
+export interface FlowInput {
+  id?: string;
+  adapterId: string;
+  label?: string;
+  primaryCaptureId: string;
+  startedAt: number;
+  endedAt: number;
+  source: FlowSource;
+  steps: FlowStep[];
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Flow templates — learned multi-step plans (Phase B).
+//
+// An InteractionFlow is one observed burst. A FlowTemplate is the stable shape
+// across many bursts that share a primary operation: which companions usually
+// ride along, in what order, with which request fingerprints and param bindings.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * How a value on a later step is filled.
+ *   - `literal` — stable across observations; baked into the template
+ *   - `flowParam` — supplied by the caller at replay time (channel id, cursor…)
+ *   - `bind` — taken from an earlier step's response (json path)
+ *   - `session` — filled from live credentials at build time
+ *   - `unreproducible` — observed but derivation unknown; step may be skipped
+ */
+export type FlowParamSource =
+  | { kind: 'literal'; value: string }
+  | { kind: 'flowParam'; name: string }
+  | { kind: 'bind'; fromStep: number; jsonPath: string }
+  | { kind: 'session' }
+  | { kind: 'unreproducible'; reason: string };
+
+/** One endpoint inside a learned flow template. */
+export interface FlowTemplateStep {
+  /** 0-based order (chronological in observations). */
+  seq: number;
+  role: FlowStepRole;
+  method: string;
+  /**
+   * Path template for build/replay. Id-like segments are named placeholders
+   * (`/1/cards/{cardId}`) so build can substitute caller/bind values. Legacy
+   * templates may still use `:id`.
+   */
+  path: string;
+  /** Semantic op when known. */
+  operation?: string;
+  /**
+   * Whether automated replay fails the whole flow if this step cannot run.
+   * Primary is always true; companions become true only at high support.
+   */
+  required: boolean;
+  /**
+   * Fraction of observed flows of this primary that included this step
+   * (0..1). Useful for UI and for soft vs required decisions.
+   */
+  support: number;
+  /**
+   * Median ms after the **previous template step** in observations (0 for first).
+   * Used when a primary-anchored schedule is unavailable (e.g. steps before the
+   * primary, or templates learned before offset fields existed).
+   */
+  delayMsP50: number;
+  /**
+   * Median ms from the **primary** capture's `ts` to this step's `ts` across
+   * observations of the same burst (0 for the primary itself).
+   *
+   * Negative when the companion fired before the primary (auth/bootstrap).
+   * Replay prefers this over chained `delayMsP50` so siblings keep the same
+   * spacing relative to the main call even if an earlier soft step is skipped.
+   */
+  offsetFromPrimaryMsP50?: number;
+  /**
+   * How tightly the primary→step offset clustered (p90 − p10 of observed
+   * offsets, ms). Small values mean the client fires this sibling on a stable
+   * cadence and pacing should be honored; large values mean wall-clock noise.
+   */
+  offsetSpreadMs?: number;
+  /**
+   * Endpoint fingerprint (headers + stable body params). Same shape as
+   * cartographer's RequestTemplate, stored as plain data so core stays free
+   * of a cartographer import.
+   */
+  request?: {
+    headers: Record<string, string>;
+    bodyParams: Record<string, string>;
+    volatileParams: string[];
+  };
+  /**
+   * Named params on this step and how to fill them. Keys are form/query names
+   * and path placeholder names (`cardId` for `/1/cards/{cardId}`).
+   */
+  params?: Record<string, FlowParamSource>;
+  /** True when no automated build is possible (HMAC, etc.). */
+  unreproducible?: boolean;
+  unreproducibleReason?: string;
+}
+
+export interface FlowTemplate {
+  id: string;
+  adapterId: string;
+  /** Primary semantic op, or `${method} ${path}` when unclassified. */
+  primaryKey: string;
+  label?: string;
+  /** How many observed flows contributed to this template. */
+  sampleCount: number;
+  /** Schema/learning rule version — bump when learning rules change. */
+  version: number;
+  learnedAt: number;
+  steps: FlowTemplateStep[];
+  /** Caller-supplied params the primary (and bound companions) need. */
+  flowParams: Array<{ name: string; required: boolean }>;
+}
+
+export interface FlowTemplateQuery {
+  adapterId?: string;
+  primaryKey?: string;
+  q?: string;
+  limit?: number;
+}
+
+/** What `upsertFlowTemplate` accepts — id optional. */
+export interface FlowTemplateInput {
+  id?: string;
+  adapterId: string;
+  primaryKey: string;
+  label?: string;
+  sampleCount: number;
+  version: number;
+  learnedAt: number;
+  steps: FlowTemplateStep[];
+  flowParams: Array<{ name: string; required: boolean }>;
 }

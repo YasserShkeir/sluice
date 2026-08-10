@@ -28,6 +28,7 @@ import type { AppCatalogEntry, AppCatalogReplayAction } from '@sluice/core';
 import { navigate, useLink } from '../router.js';
 import { sendReplayRun } from '../ws.js';
 import type { ReplayRecord, StoreState } from '../ws.js';
+import { fetchFlowTemplates, type FlowTemplateSummary } from '../api.js';
 import { Button } from '../ui/button.js';
 import { Input } from '../ui/input.js';
 import { Badge } from '../ui/badge.js';
@@ -59,23 +60,24 @@ export function ReplayPage({ actionId, apps, replays, budget }: Props) {
 
   return (
     <ResizablePanelGroup orientation="horizontal">
-      <ResizablePanel defaultSize="26" minSize="16">
+      <ResizablePanel defaultSize="22" minSize="14">
         <ActionList entries={entries} selectedId={actionId} />
+        <FlowTemplatesPanel />
       </ResizablePanel>
       <ResizableHandle orientation="horizontal" />
-      <ResizablePanel defaultSize="38" minSize="24">
+      <ResizablePanel defaultSize="40" minSize="24">
         {selected === undefined ? (
           <Empty>
             {entries.length === 0
               ? 'No app exposes a replay action. Adapters declare them with listReplayActions().'
-              : 'Pick an action on the left.'}
+              : 'Pick an action on the left. Multi-step templates list below — replay those via CLI (`sluice replay --flow`) or MCP `sluice_replay_flow`.'}
           </Empty>
         ) : (
           <ActionForm key={selected.action.id} entry={selected} budget={budget} />
         )}
       </ResizablePanel>
       <ResizableHandle orientation="horizontal" />
-      <ResizablePanel defaultSize="36" minSize="20">
+      <ResizablePanel defaultSize="38" minSize="20">
         <Worklist replays={replays} />
       </ResizablePanel>
     </ResizablePanelGroup>
@@ -368,4 +370,64 @@ function StateDot({ state }: { state: ReplayRecord['state'] }) {
 
 function Empty({ children }: { children: React.ReactNode }) {
   return <p className="p-4 text-[12px] text-fg-mute">{children}</p>;
+}
+
+// ── Learned multi-step templates (read-only picker) ──────────────────────────────
+
+function FlowTemplatesPanel() {
+  const [templates, setTemplates] = useState<FlowTemplateSummary[]>([]);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    void fetchFlowTemplates({ limit: 50 })
+      .then((r) => {
+        if (!cancelled) setTemplates(r.templates);
+      })
+      .catch((e: unknown) => {
+        if (!cancelled) setError(e instanceof Error ? e.message : String(e));
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  return (
+    <section className="border-t border-border">
+      <h2 className="sticky top-0 bg-bg-1 px-2.5 py-1.5 text-[12px] font-medium text-fg">
+        Learned flows
+      </h2>
+      {error ? (
+        <p className="px-2.5 py-1 text-[11px] text-fg-mute">{error}</p>
+      ) : templates.length === 0 ? (
+        <p className="px-2.5 py-1.5 text-[11px] text-fg-mute">
+          None yet. Capture traffic, run <code className="font-mono">sluice learn-flows</code>, or open Traffic → Group flows.
+        </p>
+      ) : (
+        <ul className="max-h-48 overflow-auto">
+          {templates.map((t) => (
+            <li
+              key={t.id}
+              className="border-t border-border/60 px-2.5 py-1.5 text-[11px] text-fg-dim"
+              title={`id=${t.id}`}
+            >
+              <div className="flex items-center gap-1.5">
+                <span className="truncate font-medium text-fg">{t.primaryKey}</span>
+                <Badge className="ml-auto shrink-0">{t.adapterId}</Badge>
+              </div>
+              <div className="text-fg-mute">
+                {t.stepCount} steps · {t.sampleCount} sample{t.sampleCount === 1 ? '' : 's'}
+                {t.flowParams.length > 0
+                  ? ` · params ${t.flowParams.map((p) => p.name + (p.required ? '*' : '')).join(', ')}`
+                  : ''}
+              </div>
+              <div className="mt-0.5 font-mono text-[10px] text-fg-mute">
+                sluice replay --flow {t.id}
+              </div>
+            </li>
+          ))}
+        </ul>
+      )}
+    </section>
+  );
 }

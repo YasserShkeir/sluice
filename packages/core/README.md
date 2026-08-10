@@ -30,3 +30,10 @@ const store = new SqliteStore('~/.sluice/sluice.db');
 ## License
 
 Apache-2.0.
+
+## Interaction flows
+
+`InteractionFlow` / `FlowTemplate` types and store APIs (`listFlows`, `pinFlow`,
+`createPinnedFlow`, `listFlowTemplates`, …) back multi-step observation. Secrets
+never live on flow tables; MCP/HTTP summaries stay secret-free. See
+`docs/FULL-FLOW-FIDELITY.md`.

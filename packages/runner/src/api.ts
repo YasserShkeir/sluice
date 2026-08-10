@@ -132,12 +132,21 @@ export function handleApi(req: IncomingMessage, res: ServerResponse, url: URL, d
 
     // ── captures ──────────────────────────────────────────────────────────────
     if (path === '/api/captures') {
+      const idsRaw = url.searchParams.get('ids');
+      const ids = idsRaw
+        ? idsRaw
+            .split(',')
+            .map((s) => s.trim())
+            .filter(Boolean)
+            .slice(0, 500)
+        : undefined;
       const captures = store.listCaptures({
         limit: intParam(url, 'limit', DEFAULT_LIMIT),
         adapterId: url.searchParams.get('app') ?? undefined,
         host: url.searchParams.get('host') ?? undefined,
         tabId: url.searchParams.get('tab') ?? undefined,
         sinceTs: url.searchParams.has('since') ? intParam(url, 'since', 0, Number.MAX_SAFE_INTEGER) : undefined,
+        ids: ids && ids.length > 0 ? ids : undefined,
       });
       json(res, 200, { captures, total: store.countCaptures() });
       return true;
@@ -238,6 +247,79 @@ export function handleApi(req: IncomingMessage, res: ServerResponse, url: URL, d
         offset,
         limit,
       });
+      return true;
+    }
+
+    // ── interaction flows + learned templates (secret-free summaries) ────────
+    if (path === '/api/flows') {
+      const source = url.searchParams.get('source') ?? undefined;
+      const flows = store
+        .listFlows({
+          adapterId: url.searchParams.get('app') ?? undefined,
+          source: source as 'observed' | 'pinned' | 'replay' | 'learned' | undefined,
+          q: url.searchParams.get('q') ?? undefined,
+          limit: intParam(url, 'limit', 100),
+        })
+        .map((f) => ({
+          id: f.id,
+          adapterId: f.adapterId,
+          label: f.label,
+          source: f.source,
+          primaryCaptureId: f.primaryCaptureId,
+          primaryOp:
+            f.steps.find((s) => s.captureId === f.primaryCaptureId)?.operation ??
+            f.steps.find((s) => s.role === 'primary')?.operation,
+          stepCount: f.steps.length,
+          startedAt: f.startedAt,
+          endedAt: f.endedAt,
+          steps: f.steps.map((s) => ({
+            seq: s.seq,
+            role: s.role,
+            operation: s.operation,
+            required: s.required,
+            captureId: s.captureId,
+          })),
+        }));
+      json(res, 200, { flows });
+      return true;
+    }
+
+    if (path === '/api/flow-templates') {
+      const templates = store
+        .listFlowTemplates({
+          adapterId: url.searchParams.get('app') ?? undefined,
+          primaryKey: url.searchParams.get('primaryKey') ?? undefined,
+          q: url.searchParams.get('q') ?? undefined,
+          limit: intParam(url, 'limit', 100),
+        })
+        .map((t) => ({
+          id: t.id,
+          adapterId: t.adapterId,
+          primaryKey: t.primaryKey,
+          label: t.label,
+          sampleCount: t.sampleCount,
+          stepCount: t.steps.length,
+          flowParams: t.flowParams,
+          learnedAt: t.learnedAt,
+          version: t.version,
+          steps: t.steps.map((s) => ({
+            seq: s.seq,
+            role: s.role,
+            method: s.method,
+            path: s.path,
+            operation: s.operation,
+            required: s.required,
+            support: s.support,
+            delayMsP50: s.delayMsP50,
+            offsetFromPrimaryMsP50: s.offsetFromPrimaryMsP50,
+            offsetSpreadMs: s.offsetSpreadMs,
+            unreproducible: s.unreproducible || undefined,
+            paramKinds: s.params
+              ? Object.fromEntries(Object.entries(s.params).map(([k, v]) => [k, v.kind]))
+              : undefined,
+          })),
+        }));
+      json(res, 200, { templates });
       return true;
     }
 

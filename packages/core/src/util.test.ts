@@ -48,6 +48,15 @@ test('numeric, uuid and long opaque segments read as ids', () => {
   assert.equal(operationName('/files/T02ABCDEFGH/download'), 'files/:id/download');
 });
 
+test('Trello-style 8-char shortLinks collapse to :id', () => {
+  assert.equal(operationName('/1/card/SynCard1'), 'card/:id');
+  assert.equal(operationName('/1/board/SynBrd01'), 'board/:id');
+  assert.equal(
+    operationName('/1/card/SynCard1'),
+    operationName('/1/card/SynCard2'),
+  );
+});
+
 test('ordinary words are not mistaken for ids', () => {
   // Merging two real operations into one row is worse than leaving an id in a
   // name, so the id test stays conservative about short lowercase words.

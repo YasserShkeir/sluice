@@ -67,6 +67,8 @@ interface TargetInfo {
 
 interface ReqWillBeSent {
   requestId: string;
+  /** CDP document loader id — shared by every request that belongs to one navigation. */
+  loaderId?: string;
   request: { url: string; method: string; headers: Record<string, string>; postData?: string };
   type?: string;
 }
@@ -105,6 +107,8 @@ interface Pending {
   /** Which attached tab this exchange belongs to. */
   tabId: string;
   tabUrl: string;
+  /** CDP Network loader id — F0.3 correlation for one document load. */
+  loaderId?: string | null;
 }
 
 /** One attached page target and everything scoped to it. */
@@ -295,6 +299,7 @@ export class CdpEngine {
     const match = this.adapters.find((a) =>
       a.matchRequest({ host, path, method: p.request.method, url: p.request.url }),
     );
+    const loaderId = p.loaderId ?? null;
     this.pending.set(this.key(tab.id, p.requestId), {
       method: p.request.method,
       url: p.request.url,
@@ -308,6 +313,7 @@ export class CdpEngine {
       resHeaders: {},
       tabId: tab.id,
       tabUrl: tab.url,
+      loaderId,
     });
   }
 
@@ -357,6 +363,10 @@ export class CdpEngine {
         processName: null,
         tabId: pend.tabId,
         tabUrl: pend.tabUrl,
+        // F0.3: loaderId is the CDP document load; pageLoadId aliases it so
+        // clustering can use one field across engines.
+        loaderId: pend.loaderId ?? null,
+        pageLoadId: pend.loaderId ?? null,
       });
     } catch (e) {
       this.onError(e);

@@ -25,9 +25,8 @@ import type { ZodRawShape } from 'zod';
 import { decodeBody, readOnlyStore, redactText, SqliteStore } from '@sluice/core';
 import type { App, AppToolContext, Capture, ReplayAction, Session } from '@sluice/core';
 import { enabledApps, getApp, installExternalAdapters } from '@sluice/apps';
-import { faithfulReplayRequest } from '@sluice/cartographer';
-import { mapAuthFlow } from '@sluice/interceptor';
-import { replayWithRefresh, runReplay } from '@sluice/interceptor';
+import { buildFlowStepRequest, faithfulReplayRequest } from '@sluice/cartographer';
+import { mapAuthFlow, replayWithRefresh, runFlowReplay, runReplay, resolveJsonPath } from '@sluice/interceptor';
 
 // ── MCP result helpers ──────────────────────────────────────────────────────────
 
@@ -118,7 +117,157 @@ const SYNTHETIC_SESSION: Session = {
 /**
  * Build (but do not start) the MCP server bound to an already-open store.
  * Every tool is a thin, typed wrapper over `@sluice/core` store reads, except
- * `replay`, which is the one network-touching tool.
+ * `replay` / `sluice_replay_flow`, which are the network-touching tools.
+ */
+
+/** Secret-free template summary for MCP describe/list. */
+function summarizeTemplate(t: {
+  id: string;
+  adapterId: string;
+  primaryKey: string;
+  label?: string;
+  sampleCount: number;
+  version: number;
+  learnedAt: number;
+  steps: Array<{
+    seq: number;
+    role: string;
+    method: string;
+    path: string;
+    operation?: string;
+    required: boolean;
+    support: number;
+    delayMsP50: number;
+    offsetFromPrimaryMsP50?: number;
+    offsetSpreadMs?: number;
+    unreproducible?: boolean;
+    unreproducibleReason?: string;
+    params?: Record<string, { kind: string; name?: string; fromStep?: number; jsonPath?: string; reason?: string }>;
+  }>;
+  flowParams: Array<{ name: string; required: boolean }>;
+}): Record<string, unknown> {
+  const steps = t.steps.map((s) => ({
+    seq: s.seq,
+    role: s.role,
+    method: s.method,
+    path: s.path,
+    operation: s.operation,
+    required: s.required,
+    support: s.support,
+    delayMsP50: s.delayMsP50,
+    /** Median ms from primary start (may be negative for pre-primary auth/bootstrap). */
+    offsetFromPrimaryMsP50: s.offsetFromPrimaryMsP50,
+    offsetSpreadMs: s.offsetSpreadMs,
+    unreproducible: s.unreproducible || undefined,
+    unreproducibleReason: s.unreproducibleReason,
+    params: s.params
+      ? Object.fromEntries(
+          Object.entries(s.params).map(([k, src]) => [
+            k,
+            {
+              kind: src.kind,
+              name: src.name,
+              fromStep: src.fromStep,
+              jsonPath: src.jsonPath,
+              reason: src.reason,
+            },
+          ]),
+        )
+      : undefined,
+  }));
+  const apiSteps = steps.filter(
+    (s) =>
+      s.role === 'primary' ||
+      (s.operation &&
+        !/^assets?\b/i.test(s.operation) &&
+        !/\.(js|css|png|svg)(\?|$)/i.test(s.path)),
+  );
+  const negOffsets = steps.filter(
+    (s) => typeof s.offsetFromPrimaryMsP50 === 'number' && s.offsetFromPrimaryMsP50 < 0,
+  ).length;
+  return {
+    id: t.id,
+    adapterId: t.adapterId,
+    primaryKey: t.primaryKey,
+    label: t.label,
+    sampleCount: t.sampleCount,
+    version: t.version,
+    learnedAt: t.learnedAt,
+    flowParams: t.flowParams,
+    stepCount: steps.length,
+    /** Steps that look like API (not SPA bundles) — prefer these when explaining a flow. */
+    apiStepCount: apiSteps.length,
+    /** Pre-primary companions (auth/bootstrap). Replay fires them immediately if still pending. */
+    negativeOffsetSteps: negOffsets || undefined,
+    qualityNotes: templateQualityNotes(t.primaryKey, steps.length, apiSteps.length, t.sampleCount, negOffsets),
+    steps,
+  };
+}
+
+function templateQualityNotes(
+  primaryKey: string,
+  stepCount: number,
+  apiStepCount: number,
+  sampleCount: number,
+  negOffsets: number,
+): string[] {
+  const notes: string[] = [];
+  if (/^assets?\b/i.test(primaryKey) || primaryKey === 'asset') {
+    notes.push('primary looks like a static asset — prefer another template for agent replay');
+  }
+  if (sampleCount < 2) {
+    notes.push('single-sample template — timing and companions are less reliable until more bursts are learned');
+  }
+  if (stepCount > 0 && apiStepCount / stepCount < 0.4) {
+    notes.push('many non-API companions (SPA bundles); soft steps may skip at replay');
+  }
+  if (negOffsets > 0) {
+    notes.push(
+      'some offsetFromPrimaryMsP50 values are negative (companions observed before the learned primary); pacing clamps those to immediate',
+    );
+  }
+  if (primaryKey.includes('graphql') || primaryKey.includes('gateway/api/gasv3')) {
+    notes.push(
+      'gateway/GraphQL primaries often sit inside large page-load bursts — confirm flowParams and required steps before replay',
+    );
+  }
+  return notes;
+}
+
+// FLOW_AGENT_GUIDANCE is inlined into tool descriptions so every MCP client
+// sees the same operational contract without reading a separate doc.
+const FLOW_LIST_DESCRIPTION =
+  "List observed/pinned interaction flows and learned multi-step templates from THIS machine's captures only. " +
+  'Returns ids, primary ops, step counts, sampleCount, qualityNotes — never secrets, cookies, tokens, or bodies. ' +
+  'Flows = one observed burst (primary + companions). Templates = parameterizable plans for sluice_replay_flow. ' +
+  'Agent guidance: (1) Prefer templates with sampleCount≥2 and primaryKey that is a real API op (cards/:id, boards/:id, conversations.history) — not assets/* or bare hashed filenames. ' +
+  '(2) MITM/WS capture has no pageLoadId; bursts are time-window clustered. CDP adds loaderId correlation when available. ' +
+  '(3) WebSocket frames are excluded from HTTP flow clustering. ' +
+  '(4) Call sluice_describe_flow before replay. Optional adapterId/source/q. Default limit 50.';
+
+const FLOW_DESCRIBE_DESCRIPTION =
+  'Detail one interaction flow (by flow id) or learned template (by template id or adapterId+primaryKey). ' +
+  'Shows ordered steps, roles, required/support, delayMsP50, offsetFromPrimaryMsP50 (sibling timing from primary start; may be negative for pre-primary auth), ' +
+  'offsetSpreadMs, param binding kinds (flowParam|bind|session|literal|unreproducible), qualityNotes. ' +
+  'Never returns secrets, live tokens, or full bodies — binding kinds and names only. ' +
+  'Agent guidance: required=false companions may soft-fail or skip; unreproducible steps are not guessed; ' +
+  'F4.4 build rails refuse write-shaped ops and hosts outside the adapter allowlist. Pass id, or adapterId+primaryKey.';
+
+const FLOW_REPLAY_DESCRIPTION =
+  'Run a learned multi-step flow template READ-ONLY through the same rails as single replay ' +
+  '(method allowlist GET|HEAD|POST, operation denylist, per-step budget, adapter hosts allowlist at build). ' +
+  "Built only from this machine's observed/pinned captures — never invents fingerprints or credentials. " +
+  'Pacing prefers offsetFromPrimaryMsP50 (primary-anchored; cap 2s) so siblings keep observed deltas when a soft step skips; falls back to delayMsP50. ' +
+  'Auth failure → optional session refresh → full flow restart once. ' +
+  'Unreproducible soft companions are skipped; required failures stop the flow. ' +
+  'Agent guidance: pass params for every required flowParam from sluice_describe_flow; pick workspaceId when multiple sessions exist; ' +
+  'expect SPA asset steps to be absent or skipped; do not use flow replay for writes. ' +
+  'Returns per-step status summaries + parent flow id. No secrets returned.';
+
+/**
+ * Build (but do not start) the MCP server bound to an already-open store.
+ * Every tool is a thin, typed wrapper over `@sluice/core` store reads, except
+ * `replay` / `sluice_replay_flow`, which are the network-touching tools.
  */
 export function buildServer(store: SqliteStore): McpServer {
   const server = new McpServer({ name: 'sluice', version: '0.0.0' });
@@ -413,6 +562,255 @@ export function buildServer(store: SqliteStore): McpServer {
     },
   );
 
+
+  // ── Interaction flows (multi-step, observation-learned) ────────────────────
+
+  server.registerTool(
+    'sluice_list_flows',
+    {
+      title: 'List interaction flows and templates',
+      description: FLOW_LIST_DESCRIPTION,
+      inputSchema: {
+        adapterId: z.string().optional(),
+        source: z.enum(['observed', 'pinned', 'replay', 'learned']).optional(),
+        q: z.string().optional(),
+        limit: z.number().int().positive().max(500).optional(),
+        templates: z.boolean().optional(),
+      },
+    },
+    async ({ adapterId, source, q, limit, templates }) => {
+      const lim = limit ?? 50;
+      const flows = store.listFlows({ adapterId, source, q, limit: lim }).map((f) => ({
+        id: f.id,
+        adapterId: f.adapterId,
+        label: f.label,
+        source: f.source,
+        primaryCaptureId: f.primaryCaptureId,
+        primaryOp:
+          f.steps.find((s) => s.captureId === f.primaryCaptureId)?.operation ??
+          f.steps.find((s) => s.role === 'primary')?.operation,
+        stepCount: f.steps.length,
+        startedAt: f.startedAt,
+        endedAt: f.endedAt,
+      }));
+      const out: Record<string, unknown> = {
+        flows,
+        guidance: {
+          prefer: 'templates with sampleCount≥2 and API primaryKey (not assets/*)',
+          next: 'sluice_describe_flow → sluice_replay_flow',
+          learn: 'Run CLI `sluice learn-flows --adapter <id>` after capturing; MCP does not cluster',
+          correlation:
+            'pageLoadId/loaderId only when CDP captured; MITM bursts use time windows only',
+        },
+      };
+      if (templates !== false) {
+        out.templates = store.listFlowTemplates({ adapterId, q, limit: lim }).map((t) => {
+          const apiStepCount = t.steps.filter(
+            (s) =>
+              s.role === 'primary' ||
+              (s.operation && !/^assets?\b/i.test(s.operation) && !/^\/assets\//i.test(s.path)),
+          ).length;
+          const neg = t.steps.filter(
+            (s) => typeof s.offsetFromPrimaryMsP50 === 'number' && s.offsetFromPrimaryMsP50 < 0,
+          ).length;
+          return {
+            id: t.id,
+            adapterId: t.adapterId,
+            primaryKey: t.primaryKey,
+            label: t.label,
+            sampleCount: t.sampleCount,
+            stepCount: t.steps.length,
+            apiStepCount,
+            flowParams: t.flowParams,
+            learnedAt: t.learnedAt,
+            version: t.version,
+            qualityNotes: templateQualityNotes(
+              t.primaryKey,
+              t.steps.length,
+              apiStepCount,
+              t.sampleCount,
+              neg,
+            ),
+          };
+        });
+      }
+      return jsonResult(out);
+    },
+  );
+
+  server.registerTool(
+    'sluice_describe_flow',
+    {
+      title: 'Describe a flow or flow template',
+      description: FLOW_DESCRIBE_DESCRIPTION,
+      inputSchema: {
+        id: z.string().optional(),
+        adapterId: z.string().optional(),
+        primaryKey: z.string().optional(),
+      },
+    },
+    async ({ id, adapterId, primaryKey }) => {
+      if (id) {
+        const flow = store.getFlow(id);
+        if (flow) {
+          return jsonResult({
+            kind: 'flow',
+            id: flow.id,
+            adapterId: flow.adapterId,
+            label: flow.label,
+            source: flow.source,
+            primaryCaptureId: flow.primaryCaptureId,
+            startedAt: flow.startedAt,
+            endedAt: flow.endedAt,
+            steps: flow.steps.map((s) => ({
+              seq: s.seq,
+              role: s.role,
+              operation: s.operation,
+              required: s.required,
+              captureId: s.captureId,
+            })),
+          });
+        }
+        const tmpl = store.getFlowTemplate(id);
+        if (tmpl) return jsonResult({ kind: 'template', ...summarizeTemplate(tmpl) });
+        return errorResult(`No flow or template with id "${id}".`);
+      }
+      if (adapterId && primaryKey) {
+        const tmpl = store.getFlowTemplateByPrimary(adapterId, primaryKey);
+        if (!tmpl) {
+          return errorResult(`No template for ${adapterId} / ${primaryKey}. Run learn-flows first.`);
+        }
+        return jsonResult({ kind: 'template', ...summarizeTemplate(tmpl) });
+      }
+      return errorResult('Pass id, or adapterId + primaryKey.');
+    },
+  );
+
+  server.registerTool(
+    'sluice_replay_flow',
+    {
+      title: 'Replay a multi-step flow (MAKES LIVE NETWORK REQUESTS)',
+      description: FLOW_REPLAY_DESCRIPTION,
+      inputSchema: {
+        templateId: z.string().optional(),
+        adapterId: z.string().optional(),
+        primaryKey: z.string().optional(),
+        params: z.record(z.string()).optional(),
+        workspaceId: z.string().optional(),
+      },
+    },
+    async ({ templateId, adapterId, primaryKey, params, workspaceId }) => {
+      let tmpl = templateId ? store.getFlowTemplate(templateId) : undefined;
+      if (!tmpl && adapterId && primaryKey) {
+        tmpl = store.getFlowTemplateByPrimary(adapterId, primaryKey);
+      }
+      if (!tmpl) {
+        return errorResult(
+          'Unknown flow template. Pass templateId from sluice_list_flows, or adapterId + primaryKey after learn-flows.',
+        );
+      }
+
+      const app = getApp(tmpl.adapterId) ?? enabledApps().find((a) => a.id === tmpl!.adapterId);
+      if (!app) {
+        return errorResult(`No installed app for adapter "${tmpl.adapterId}".`);
+      }
+
+      let session: Session;
+      if (app.credentials) {
+        let sessions: Session[];
+        try {
+          sessions = await app.credentials.extractSessions();
+        } catch (e) {
+          return errorResult(`Could not acquire a session: ${errText(e)}`);
+        }
+        const picked = workspaceId
+          ? sessions.find((s) => s.workspaceId === workspaceId)
+          : sessions.length === 1
+            ? sessions[0]
+            : undefined;
+        if (!picked) {
+          const have = sessions
+            .map((s) => `${s.workspaceId ?? '(unknown)'} (${s.label})`)
+            .join(', ');
+          if (workspaceId) {
+            return errorResult(
+              `No signed-in workspace matched "${workspaceId}". Have: ${have || '(none)'}.`,
+            );
+          }
+          if (sessions.length === 0) return errorResult('No signed-in workspace found.');
+          return errorResult(
+            `${sessions.length} ${app.displayName} workspaces are signed in. Pass workspaceId. Have: ${have}.`,
+          );
+        }
+        session = picked;
+      } else {
+        session = { ...SYNTHETIC_SESSION, adapterId: app.id };
+      }
+
+      try {
+        const result = await runFlowReplay({
+          template: tmpl,
+          params: params ?? {},
+          session,
+          io: {
+            build: (step, s, ctx) =>
+              buildFlowStepRequest(tmpl!, step, s, {
+                params: ctx.params,
+                priorResponses: ctx.priorResponses,
+                resolvePath: resolveJsonPath,
+                allowedHosts: app.hosts,
+              }),
+            run: (req) => runReplay(req),
+            record: (c) => {
+              c.adapterId = app.id;
+              store.insertCapture(c);
+              store.applyParseResult(app.parse(c), c.ts || Date.now());
+            },
+            refresh: app.credentials
+              ? async () => {
+                  const again = await app.credentials?.extractSessions();
+                  const ws = workspaceId;
+                  return ws ? again?.find((s) => s.workspaceId === ws) : again?.[0];
+                }
+              : undefined,
+          },
+        });
+
+        if (result.flow) {
+          try {
+            store.upsertFlow(result.flow);
+          } catch {
+            /* parent flow persist is best-effort */
+          }
+        }
+
+        return jsonResult({
+          note: 'This tool made live network request(s) for each reproducible step.',
+          ok: result.ok,
+          error: result.error,
+          refreshed: result.refreshed || undefined,
+          flowId: result.flow?.id,
+          templateId: tmpl.id,
+          primaryKey: tmpl.primaryKey,
+          steps: result.steps.map((s) => ({
+            seq: s.seq,
+            role: s.role,
+            operation: s.operation,
+            method: s.method,
+            path: s.path,
+            status: s.status,
+            captureId: s.captureId,
+            httpStatus: s.httpStatus,
+            detail: s.detail,
+            durationMs: s.durationMs,
+          })),
+        });
+      } catch (e) {
+        return errorResult(`Flow replay failed: ${errText(e)}`);
+      }
+    },
+  );
+
   // auth_flow() -> how the service issues/refreshes the credential you hold.
   server.registerTool(
     'auth_flow',
@@ -464,6 +862,65 @@ export function buildServer(store: SqliteStore): McpServer {
           record,
         });
         return capture;
+      },
+      replayFlow: async (templateId, flowParams, flowOpts) => {
+        const tmpl = store.getFlowTemplate(templateId)
+          ?? store.getFlowTemplateByPrimary(app.id, templateId);
+        if (!tmpl) throw new Error(`Unknown flow template "${templateId}"`);
+        let session: Session = { ...SYNTHETIC_SESSION, adapterId: app.id };
+        if (app.credentials) {
+          const sessions = await app.credentials.extractSessions();
+          const ws = flowOpts?.workspaceId;
+          const picked = ws
+            ? sessions.find((s) => s.workspaceId === ws)
+            : sessions[0];
+          if (!picked) throw new Error('No session available for flow replay');
+          session = picked;
+        }
+        const result = await runFlowReplay({
+          template: tmpl,
+          params: flowParams ?? {},
+          session,
+          io: {
+            build: (step, s, ctxB) =>
+              buildFlowStepRequest(tmpl, step, s, {
+                params: ctxB.params,
+                priorResponses: ctxB.priorResponses,
+                resolvePath: resolveJsonPath,
+                allowedHosts: app.hosts,
+              }),
+            run: (req) => runReplay(req),
+            record: (c, _step) => {
+              record(c);
+            },
+            refresh: app.credentials
+              ? async () => {
+                  const again = await app.credentials?.extractSessions();
+                  const ws = flowOpts?.workspaceId;
+                  return ws ? again?.find((s) => s.workspaceId === ws) : again?.[0];
+                }
+              : undefined,
+          },
+        });
+        if (result.flow) {
+          try {
+            store.upsertFlow(result.flow);
+          } catch {
+            /* best-effort */
+          }
+        }
+        return {
+          ok: result.ok,
+          error: result.error,
+          flowId: result.flow?.id,
+          steps: result.steps.map((s) => ({
+            seq: s.seq,
+            status: s.status,
+            operation: s.operation,
+            captureId: s.captureId,
+            httpStatus: s.httpStatus,
+          })),
+        };
       },
     };
 

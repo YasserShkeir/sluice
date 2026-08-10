@@ -3,7 +3,7 @@
   "version": "0.0.0",
   "private": true,
   "type": "module",
-  "description": "Sluice capture engines: mockttp MITM proxy, passive CDP capture, replay, and the auth-reconstructor seed. App-agnostic.",
+  "description": "MITM + CDP capture engines, read-only replay and multi-step flow replay, safety rails.",
   "exports": {
     ".": "./src/index.ts"
   },

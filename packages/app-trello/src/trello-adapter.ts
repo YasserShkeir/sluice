@@ -83,6 +83,12 @@ const P = {
   cardActions: /^\/1\/cards?\/([^/]+)\/actions$/,
   /** Any collection-of-cards endpoint, whichever parent it hangs off. */
   anyCards: /\/cards$/,
+  /**
+   * Atlassian gateway (GraphQL, session, gasv3, …). These are real API surface
+   * on trello.com — not SPA bundles. Must win over `notApi` so flow learning
+   * does not treat `gateway/api/graphql` as a generic `asset`.
+   */
+  gateway: /^\/gateway\/api(\/|$)/,
   /** Not the REST API at all — the SPA shell, its bundles, its images. */
   notApi: /^(?!\/1\/)/,
 } as const;
@@ -236,6 +242,13 @@ const CLASSIFY_RULES: readonly ClassifyRule[] = [
   { re: P.cardActions, class: 'messages', operation: 'cards/:id/actions' },
   { re: P.card, class: 'messages', operation: 'cards/:id' },
   { re: P.me, class: 'auth', operation: 'members/me' },
+  // Gateway before notApi. operationName collapses remaining path segments.
+  {
+    re: P.gateway,
+    class: 'unknown',
+    // Placeholder — classifyTrelloCapture overrides via operationName for stable keys.
+    operation: 'gateway/api',
+  },
   { re: P.notApi, class: 'asset', operation: 'asset' },
 ];
 
@@ -251,9 +264,12 @@ export function classifyTrelloCapture(capture: Capture): {
 } {
   const path = str(capture.path) ?? '';
   const rule = CLASSIFY_RULES.find((r) => r.re.test(path));
-  // An unrecognized /1/ path is still worth naming — "which endpoints does this
-  // service call that we do not handle yet?" is the question being asked.
-  const operation = rule?.operation ?? operationName(path);
+  // Gateway: name from path (graphql, session/heartbeat, gasv3/…) so templates
+  // merge on the real op rather than one umbrella "gateway/api".
+  const operation =
+    rule?.re === P.gateway
+      ? operationName(path)
+      : (rule?.operation ?? operationName(path));
   const status = capture.status;
   if (typeof status === 'number' && status >= 400) return { class: 'error', operation };
   return { class: rule?.class ?? 'unknown', operation };

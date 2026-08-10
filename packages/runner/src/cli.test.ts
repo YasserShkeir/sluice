@@ -379,3 +379,93 @@ test('replay refuses an action id together with --all', async () => {
   assert.equal(code, 1);
   assert.match(err, /either an action id or --all/);
 });
+
+
+test('flows list and learn-flows work against a seeded db', async () => {
+  const db = join(scratch(), 'flows.db');
+  const store = new SqliteStore(db);
+  const T0 = 1_700_000_000_000;
+  const cap = (over: Partial<import('@sluice/core').Capture>): import('@sluice/core').Capture => ({
+    id: 'x',
+    ts: T0,
+    source: 'mitm',
+    adapterId: 'slack',
+    method: 'POST',
+    url: 'https://slack.com/api/api.test',
+    host: 'slack.com',
+    path: '/api/api.test',
+    status: 200,
+    durationMs: 10,
+    reqHeaders: {},
+    reqBody: null,
+    resHeaders: {},
+    resBody: null,
+    ...over,
+  });
+  store.insertCapture(
+    cap({
+      id: 'p',
+      path: '/api/conversations.history',
+      url: 'https://slack.com/api/conversations.history',
+      classification: 'conversations.history',
+      reqBody: 'token=«redacted»&channel=C1&limit=50',
+    }),
+  );
+  store.insertCapture(
+    cap({
+      id: 'c',
+      ts: T0 + 40,
+      path: '/api/conversations.members',
+      url: 'https://slack.com/api/conversations.members',
+      classification: 'conversations.members',
+      reqBody: 'token=«redacted»&channel=C1',
+    }),
+  );
+  store.upsertFlow({
+    id: 'flow-obs',
+    adapterId: 'slack',
+    primaryCaptureId: 'p',
+    startedAt: T0,
+    endedAt: T0 + 50,
+    source: 'observed',
+    steps: [
+      { captureId: 'p', seq: 0, role: 'primary', operation: 'conversations.history', required: true },
+      { captureId: 'c', seq: 1, role: 'companion', operation: 'conversations.members', required: false },
+    ],
+  });
+  store.close();
+
+  const list = await run('flows', 'list', '--db', db);
+  assert.equal(list.code, 0, list.err);
+  assert.match(list.out, /flow-obs/);
+  assert.match(list.out, /conversations\.history/);
+
+  const pin = await run('flows', 'pin', 'flow-obs', '--db', db);
+  assert.equal(pin.code, 0, pin.err);
+  assert.match(pin.out, /pinned/);
+
+  const learn = await run('learn-flows', '--adapter', 'slack', '--no-cluster', '--db', db);
+  assert.equal(learn.code, 0, learn.err);
+  assert.match(learn.out, /learned /);
+
+  const tmpls = await run('flows', 'templates', '--adapter', 'slack', '--db', db);
+  assert.equal(tmpls.code, 0, tmpls.err);
+  assert.match(tmpls.out, /conversations\.history/);
+});
+
+test('flows help and unknown subcommand exit cleanly', async () => {
+  const help = await run('flows', '--help');
+  assert.equal(help.code, 0);
+  assert.match(help.out, /pin-captures/);
+
+  const bad = await run('flows', 'nope');
+  assert.equal(bad.code, 1);
+});
+
+test('replay --flow without a template fails before session acquire', async () => {
+  const db = join(scratch(), 'empty-flow.db');
+  new SqliteStore(db).close();
+  const { code, err } = await run('replay', '--flow', 'missing-tmpl', '--db', db);
+  assert.equal(code, 1);
+  assert.match(err, /Unknown flow template|learn-flows|flows list/);
+});

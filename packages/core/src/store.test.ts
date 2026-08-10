@@ -113,6 +113,9 @@ test('an existing database gains new columns on open', () => {
   for (const col of [
     'tab_id',
     'tab_url',
+    'loader_id',
+    'page_load_id',
+    'navigation_id',
     'direction',
     'ws_id',
     'classification',
@@ -138,6 +141,29 @@ test('tab fields round-trip and listCaptures can filter by tab', () => {
   assert.equal(onlyTab1[0]?.id, 'a');
   assert.equal(onlyTab1[0]?.tabUrl, 'https://app.slack.com/');
   assert.equal(store.listCaptures().length, 2, 'unfiltered still returns both');
+  store.close();
+});
+
+test('F0.3 correlation ids round-trip and listCaptures can fetch by ids', () => {
+  const store = new SqliteStore(':memory:');
+  store.insertCapture(
+    capture({
+      id: 'a',
+      loaderId: 'L1',
+      pageLoadId: 'P1',
+      navigationId: 'N1',
+    }),
+  );
+  store.insertCapture(capture({ id: 'b', pageLoadId: 'P2' }));
+  store.insertCapture(capture({ id: 'c' }));
+
+  const [got] = store.listCaptures({ ids: ['a'] });
+  assert.equal(got?.loaderId, 'L1');
+  assert.equal(got?.pageLoadId, 'P1');
+  assert.equal(got?.navigationId, 'N1');
+
+  const multi = store.listCaptures({ ids: ['a', 'c', 'missing'] }).map((x) => x.id).sort();
+  assert.deepEqual(multi, ['a', 'c']);
   store.close();
 });
 
@@ -576,5 +602,335 @@ test('readOnlyStore hands over the reads and nothing else', () => {
   for (const forbidden of ['db', 'insertCapture', 'upsertItem', 'applyParseResult', 'pruneCaptures', 'listSessions', 'close']) {
     assert.equal(reachable[forbidden], undefined, `${forbidden} must not be reachable`);
   }
+  store.close();
+});
+
+// ── Interaction flows ────────────────────────────────────────────────────────
+
+test('upsertFlow round-trips with steps ordered by seq', () => {
+  const store = new SqliteStore(':memory:');
+  store.insertCapture(capture({ id: 'p', classification: 'conversations.history' }));
+  store.insertCapture(capture({ id: 'c1', classification: 'users.info' }));
+  store.insertCapture(capture({ id: 'c2', classification: 'emoji.list' }));
+
+  const flow = store.upsertFlow({
+    adapterId: 'slack',
+    label: 'conversations.history',
+    primaryCaptureId: 'p',
+    startedAt: 1_000,
+    endedAt: 1_200,
+    source: 'observed',
+    steps: [
+      { captureId: 'p', seq: 0, role: 'primary', operation: 'conversations.history', required: true },
+      { captureId: 'c1', seq: 1, role: 'companion', operation: 'users.info', required: false },
+      { captureId: 'c2', seq: 2, role: 'companion', operation: 'emoji.list', required: false },
+    ],
+  });
+
+  assert.ok(flow.id.length > 0);
+  assert.equal(flow.primaryCaptureId, 'p');
+  assert.equal(flow.steps.length, 3);
+  assert.deepEqual(
+    flow.steps.map((s) => s.captureId),
+    ['p', 'c1', 'c2'],
+  );
+  assert.equal(flow.steps[0]?.role, 'primary');
+  assert.equal(flow.steps[0]?.required, true);
+  assert.equal(flow.steps[1]?.required, false);
+
+  const got = store.getFlow(flow.id);
+  assert.deepEqual(got, flow);
+
+  const listed = store.listFlows({ adapterId: 'slack' });
+  assert.equal(listed.length, 1);
+  assert.equal(listed[0]?.id, flow.id);
+  store.close();
+});
+
+test('upsertFlow replaces steps on conflict and forces primary required', () => {
+  const store = new SqliteStore(':memory:');
+  const first = store.upsertFlow({
+    id: 'flow-1',
+    adapterId: 'slack',
+    primaryCaptureId: 'p',
+    startedAt: 1,
+    endedAt: 2,
+    source: 'observed',
+    steps: [
+      { captureId: 'p', seq: 0, role: 'companion', required: false },
+      { captureId: 'old', seq: 1, role: 'companion', required: false },
+    ],
+  });
+  assert.equal(first.steps[0]?.role, 'primary', 'primaryCaptureId forces role');
+  assert.equal(first.steps[0]?.required, true);
+
+  store.upsertFlow({
+    id: 'flow-1',
+    adapterId: 'slack',
+    label: 'pinned',
+    primaryCaptureId: 'p',
+    startedAt: 10,
+    endedAt: 20,
+    source: 'pinned',
+    steps: [
+      { captureId: 'p', seq: 0, role: 'primary', required: true },
+      { captureId: 'new', seq: 1, role: 'companion', required: false },
+    ],
+  });
+
+  const got = store.getFlow('flow-1');
+  assert.equal(got?.source, 'pinned');
+  assert.equal(got?.label, 'pinned');
+  assert.deepEqual(
+    got?.steps.map((s) => s.captureId),
+    ['p', 'new'],
+    'old companion must be gone',
+  );
+  store.close();
+});
+
+test('upsertFlow rejects an empty step list', () => {
+  const store = new SqliteStore(':memory:');
+  assert.throws(
+    () =>
+      store.upsertFlow({
+        adapterId: 'slack',
+        primaryCaptureId: 'p',
+        startedAt: 1,
+        endedAt: 1,
+        source: 'observed',
+        steps: [],
+      }),
+    /at least one step/,
+  );
+  store.close();
+});
+
+test('listFlows filters by source, q, and sinceTs', () => {
+  const store = new SqliteStore(':memory:');
+  store.upsertFlow({
+    id: 'a',
+    adapterId: 'slack',
+    label: 'open channel',
+    primaryCaptureId: 'p1',
+    startedAt: 1_000,
+    endedAt: 1_100,
+    source: 'observed',
+    steps: [
+      {
+        captureId: 'p1',
+        seq: 0,
+        role: 'primary',
+        operation: 'conversations.history',
+        required: true,
+      },
+    ],
+  });
+  store.upsertFlow({
+    id: 'b',
+    adapterId: 'slack',
+    label: 'manual pin',
+    primaryCaptureId: 'p2',
+    startedAt: 5_000,
+    endedAt: 5_100,
+    source: 'pinned',
+    steps: [
+      {
+        captureId: 'p2',
+        seq: 0,
+        role: 'primary',
+        operation: 'conversations.info',
+        required: true,
+      },
+    ],
+  });
+  store.upsertFlow({
+    id: 'c',
+    adapterId: 'gmail',
+    primaryCaptureId: 'g1',
+    startedAt: 9_000,
+    endedAt: 9_100,
+    source: 'observed',
+    steps: [{ captureId: 'g1', seq: 0, role: 'primary', operation: 'threads.get', required: true }],
+  });
+
+  assert.equal(store.listFlows({ adapterId: 'slack' }).length, 2);
+  assert.equal(store.listFlows({ source: 'pinned' }).length, 1);
+  assert.equal(store.listFlows({ sinceTs: 4_000 }).length, 2);
+  assert.equal(store.listFlows({ q: 'history' }).map((f) => f.id).join(), 'a');
+  assert.equal(store.listFlows({ q: 'open' }).map((f) => f.id).join(), 'a');
+  store.close();
+});
+
+test('deleteFlow removes the flow and its steps, not captures', () => {
+  const store = new SqliteStore(':memory:');
+  store.insertCapture(capture({ id: 'p' }));
+  store.upsertFlow({
+    id: 'f',
+    adapterId: 'slack',
+    primaryCaptureId: 'p',
+    startedAt: 1,
+    endedAt: 2,
+    source: 'observed',
+    steps: [
+      { captureId: 'p', seq: 0, role: 'primary', required: true },
+      { captureId: 'c', seq: 1, role: 'companion', required: false },
+    ],
+  });
+  assert.equal(store.deleteFlow('f'), true);
+  assert.equal(store.getFlow('f'), undefined);
+  assert.equal(store.listFlows().length, 0);
+  // Steps table empty.
+  const stepN = (
+    store.db.prepare(`SELECT COUNT(*) AS n FROM interaction_flow_steps`).get() as { n: number }
+  ).n;
+  assert.equal(stepN, 0);
+  // Capture still there.
+  assert.equal(store.getCapture('p')?.id, 'p');
+  assert.equal(store.deleteFlow('missing'), false);
+  store.close();
+});
+
+test('pinFlow and unpinFlow toggle source without rewriting steps', () => {
+  const store = new SqliteStore(':memory:');
+  store.insertCapture(capture({ id: 'p' }));
+  store.upsertFlow({
+    id: 'f',
+    adapterId: 'slack',
+    primaryCaptureId: 'p',
+    startedAt: 1,
+    endedAt: 2,
+    source: 'observed',
+    steps: [
+      { captureId: 'p', seq: 0, role: 'primary', required: true },
+      { captureId: 'c', seq: 1, role: 'companion', required: false },
+    ],
+  });
+  const pinned = store.pinFlow('f');
+  assert.equal(pinned?.source, 'pinned');
+  assert.equal(pinned?.steps.length, 2);
+  const unpinned = store.unpinFlow('f');
+  assert.equal(unpinned?.source, 'observed');
+  assert.equal(store.pinFlow('missing'), undefined);
+  store.close();
+});
+
+test('createPinnedFlow builds a pinned flow from capture ids', () => {
+  const store = new SqliteStore(':memory:');
+  store.insertCapture(capture({ id: 'p', classification: 'conversations.history', ts: 100 }));
+  store.insertCapture(capture({ id: 'c1', classification: 'users.info', ts: 140 }));
+  store.insertCapture(capture({ id: 'c2', classification: 'emoji.list', ts: 180 }));
+  const flow = store.createPinnedFlow({
+    primaryCaptureId: 'p',
+    captureIds: ['p', 'c1', 'c2'],
+    label: 'manual open',
+  });
+  assert.equal(flow.source, 'pinned');
+  assert.equal(flow.adapterId, 'slack');
+  assert.equal(flow.label, 'manual open');
+  assert.deepEqual(
+    flow.steps.map((s) => s.captureId),
+    ['p', 'c1', 'c2'],
+  );
+  assert.equal(flow.steps[0]?.role, 'primary');
+  assert.equal(flow.steps[0]?.operation, 'conversations.history');
+  assert.throws(
+    () => store.createPinnedFlow({ primaryCaptureId: 'p', captureIds: ['nope'] }),
+    /unknown capture/,
+  );
+  store.close();
+});
+
+test('flow tables exist on a brand-new store', () => {
+  const store = new SqliteStore(':memory:');
+  const tables = (
+    store.db
+      .prepare(`SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name`)
+      .all() as Array<{ name: string }>
+  ).map((r) => r.name);
+  assert.ok(tables.includes('interaction_flows'));
+  assert.ok(tables.includes('interaction_flow_steps'));
+  store.close();
+});
+
+test('flow templates round-trip and upsert by primary key', () => {
+  const store = new SqliteStore(':memory:');
+  const step = {
+    seq: 0,
+    role: 'primary' as const,
+    method: 'POST',
+    path: '/api/conversations.history',
+    operation: 'conversations.history',
+    required: true,
+    support: 1,
+    delayMsP50: 0,
+  };
+  const a = store.upsertFlowTemplate({
+    adapterId: 'slack',
+    primaryKey: 'conversations.history',
+    label: 'history',
+    sampleCount: 3,
+    version: 1,
+    learnedAt: 1_000,
+    steps: [step],
+    flowParams: [{ name: 'channel', required: true }],
+  });
+  assert.ok(a.id);
+  assert.equal(a.steps[0]?.operation, 'conversations.history');
+  assert.equal(a.flowParams[0]?.name, 'channel');
+
+  const b = store.upsertFlowTemplate({
+    adapterId: 'slack',
+    primaryKey: 'conversations.history',
+    sampleCount: 5,
+    version: 1,
+    learnedAt: 2_000,
+    steps: [step, { ...step, seq: 1, role: 'companion', path: '/api/emoji.list', required: false }],
+    flowParams: [{ name: 'channel', required: true }],
+  });
+  assert.equal(a.id, b.id, 'same primary overwrites');
+  assert.equal(b.sampleCount, 5);
+  assert.equal(b.steps.length, 2);
+  assert.equal(store.listFlowTemplates({ adapterId: 'slack' }).length, 1);
+  assert.equal(store.getFlowTemplateByPrimary('slack', 'conversations.history')?.id, a.id);
+
+  assert.equal(store.deleteFlowTemplate(a.id), true);
+  assert.equal(store.listFlowTemplates().length, 0);
+  store.close();
+});
+
+test('wipe clears flows and flow templates', () => {
+  const store = new SqliteStore(':memory:');
+  store.upsertFlow({
+    id: 'f',
+    adapterId: 'slack',
+    primaryCaptureId: 'p',
+    startedAt: 1,
+    endedAt: 2,
+    source: 'observed',
+    steps: [{ captureId: 'p', seq: 0, role: 'primary', required: true }],
+  });
+  store.upsertFlowTemplate({
+    adapterId: 'slack',
+    primaryKey: 'x',
+    sampleCount: 1,
+    version: 1,
+    learnedAt: 1,
+    steps: [
+      {
+        seq: 0,
+        role: 'primary',
+        method: 'GET',
+        path: '/',
+        required: true,
+        support: 1,
+        delayMsP50: 0,
+      },
+    ],
+    flowParams: [],
+  });
+  store.wipe();
+  assert.equal(store.listFlows().length, 0);
+  assert.equal(store.listFlowTemplates().length, 0);
   store.close();
 });

@@ -38,9 +38,9 @@
  *
  * The conformance harness, at load. It is a CORRECTNESS check and not a security
  * boundary, and must not be sold as one — it proves an adapter does not throw on
- * hostile input and does not claim lookalike hosts. It cannot prove the adapter
- * is not malicious. What actually protects you is that you named it yourself,
- * and that the hosts it adds are printed rather than assumed.
+ * hostile input and does not claim lookalike hosts. Trust still comes from naming
+ * the adapter yourself, and from the hosts it adds being printed rather than
+ * assumed.
  */
 import { existsSync, readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
