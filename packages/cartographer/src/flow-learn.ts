@@ -130,6 +130,7 @@ export function learnFlowTemplates(
  * Learn (and optionally persist) the template for one primary key from the
  * flows already stored for that adapter. Convenience for "refresh this action".
  */
+/** Convenience wrapper: learn templates whose primary matches one key. */
 export function learnFlowTemplateForPrimary(
   store: SqliteStore,
   adapterId: string,

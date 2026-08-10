@@ -80,7 +80,11 @@ export interface SluiceConfig {
   retentionDays?: number;
   /** Keep at most this many captures. */
   maxCaptures?: number;
-  /** Cap a single stored request/response body, in bytes. */
+  /**
+   * Reserved: intended cap for a single stored request/response body, in bytes.
+   * Engines currently hard-cap at 5_000_000 chars in interceptor; this config
+   * key is accepted for forward compatibility and is not yet threaded through.
+   */
   maxBodyBytes?: number;
   /**
    * Extra hostnames Engine A may decrypt, beyond the installed adapters' own.
