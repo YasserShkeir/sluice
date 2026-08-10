@@ -261,10 +261,11 @@ const SESSION: Session = {
       sidValue: 'g.a000REAL_SID_VALUE',
       hsidValue: 'REAL_HSID_VALUE',
       ssidValue: 'REAL_SSID_VALUE',
+      xsrfValue: 'synthetic-xsrf:1700000000000',
     },
     injection: {
       cookies: { SID: 'sidValue', HSID: 'hsidValue', SSID: 'ssidValue' },
-      headers: { 'x-framework-xsrf-token': 'synthetic-xsrf:1700000000000' },
+      headers: { 'x-framework-xsrf-token': 'xsrfValue' },
     },
   },
   discoveredAt: 0,

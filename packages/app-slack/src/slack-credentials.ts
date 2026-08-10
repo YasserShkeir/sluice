@@ -211,12 +211,26 @@ function readSlackCookies(cookiesPath: string): Record<string, string> {
     const db = new Database(dst, { readonly: true, fileMustExist: true });
     try {
       const rows = db
-        .prepare(`SELECT name, encrypted_value FROM cookies WHERE host_key LIKE '%slack.com'`)
-        .all() as Array<{ name: string; encrypted_value: Buffer }>;
-      const jar: Record<string, string> = {};
+        .prepare(
+          `SELECT name, host_key, encrypted_value FROM cookies
+            WHERE host_key = 'slack.com' OR host_key = '.slack.com' OR host_key LIKE '%.slack.com'`,
+        )
+        .all() as Array<{ name: string; host_key: string; encrypted_value: Buffer }>;
+      // Prefer apex / leading-dot over workspace subdomains when names collide
+      // (especially `d` / `d-s`). Rank: slack.com > .slack.com > *.slack.com.
+      const rank = (host: string): number =>
+        host === 'slack.com' ? 0 : host === '.slack.com' ? 1 : 2;
+      const best = new Map<string, { host: string; value: Buffer }>();
       for (const r of rows) {
+        const prev = best.get(r.name);
+        if (!prev || rank(r.host_key) < rank(prev.host)) {
+          best.set(r.name, { host: r.host_key, value: r.encrypted_value });
+        }
+      }
+      const jar: Record<string, string> = {};
+      for (const [name, ent] of best) {
         try {
-          jar[r.name] = decryptCookie(r.encrypted_value, pass);
+          jar[name] = decryptCookie(ent.value, pass);
         } catch {
           // Skip cookies we can't decrypt (non-v10 / unrelated); `d` is what matters.
         }

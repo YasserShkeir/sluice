@@ -21,7 +21,7 @@ import type {
   ReplayRequest,
   Session,
 } from '@sluice/core';
-import { looksLikeDeniedOperation } from '@sluice/core';
+import { looksLikeDeniedOperation, MASK } from '@sluice/core';
 import { makeFaithful } from './faithful.js';
 import type { RequestTemplate } from './faithful.js';
 
@@ -42,7 +42,6 @@ export interface FlowStepBuildContext {
   allowedHosts?: readonly string[];
 }
 
-const MASK = '«redacted»';
 
 /** Verbs that can only mutate — mirror of interceptor ALLOWED_METHODS. */
 const ALLOWED_METHODS = new Set(['GET', 'HEAD', 'POST']);
@@ -288,16 +287,7 @@ export function buildFlowRequests(
     .slice()
     .sort((a, b) => a.seq - b.seq)
     .map((step) => {
-      try {
-        return { step, request: buildFlowStepRequest(template, step, session, ctx) };
-      } catch (e) {
-        if (e instanceof FlowBuildError) {
-          // Surface as null + leave the error on the step path via throw at run.
-          // Callers that want fail-fast should use buildFlowStepRequest directly.
-          throw e;
-        }
-        throw e;
-      }
+      return { step, request: buildFlowStepRequest(template, step, session, ctx) };
     });
 }
 

@@ -180,3 +180,83 @@ runConformance(loomApp, {
     makeCapture({ host: 'cdn.loom.com', path: '/assets/js/app.js', resBody: '(function(){})()' }),
   ],
 });
+
+
+test('nextCursors seeds library page when hasNextPage', () => {
+  const reqBody = JSON.stringify({
+    operationName: 'GetLoomsForLibrary',
+    query: 'query GetLoomsForLibrary',
+    variables: { limit: 12, cursor: null },
+  });
+  const resBody = JSON.stringify({
+    data: {
+      getLoomsForLibrary: {
+        videos: {
+          edges: [{ cursor: 'c0', node: { id: 'v1', name: 'n', visibility: 'owner', createdAt: '2024-01-01' } }],
+          pageInfo: { endCursor: 'cNEXT', hasNextPage: true },
+        },
+      },
+    },
+  });
+  const cap = {
+    id: 'c1',
+    ts: 1,
+    source: 'mitm' as const,
+    adapterId: 'loom',
+    method: 'POST',
+    url: 'https://www.loom.com/graphql',
+    host: 'www.loom.com',
+    path: '/graphql',
+    status: 200,
+    durationMs: 1,
+    reqHeaders: {},
+    reqBody,
+    resHeaders: {},
+    resBody,
+    pid: null,
+    processName: null,
+  };
+  const seeds = loomApp.nextCursors?.(cap) ?? [];
+  assert.equal(seeds.length, 1);
+  assert.equal(seeds[0]!.actionId, 'loom.videos.library');
+  assert.equal(seeds[0]!.cursor, 'cNEXT');
+  assert.equal(seeds[0]!.params?.cursor, 'cNEXT');
+});
+
+test('nextCursors empty when hasNextPage is false', () => {
+  const reqBody = JSON.stringify({
+    operationName: 'GetLoomsForLibrary',
+    query: 'query GetLoomsForLibrary',
+    variables: { limit: 12 },
+  });
+  const resBody = JSON.stringify({
+    data: {
+      getLoomsForLibrary: {
+        videos: {
+          edges: [],
+          pageInfo: { endCursor: null, hasNextPage: false },
+        },
+      },
+    },
+  });
+  const cap = {
+    id: 'c2',
+    ts: 1,
+    source: 'mitm' as const,
+    adapterId: 'loom',
+    method: 'POST',
+    url: 'https://www.loom.com/graphql',
+    host: 'www.loom.com',
+    path: '/graphql',
+    status: 200,
+    durationMs: 1,
+    reqHeaders: {},
+    reqBody,
+    resHeaders: {},
+    resBody,
+    pid: null,
+    processName: null,
+  };
+  assert.deepEqual(loomApp.nextCursors?.(cap) ?? [], []);
+});
+

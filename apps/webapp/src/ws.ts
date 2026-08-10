@@ -609,7 +609,7 @@ export function sendSync(): void {
 }
 
 /** How a fresh requestId is minted for a control op the activity surface tracks. */
-function newRequestId(): string {
+export function newRequestId(): string {
   return typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
     ? crypto.randomUUID()
     : `r${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
@@ -671,10 +671,7 @@ export function sendReplayRun(
   label: string,
   params: Record<string, string>,
 ): string {
-  const requestId =
-    typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
-      ? crypto.randomUUID()
-      : `r${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+  const requestId = newRequestId();
   const record: ReplayRecord = {
     requestId,
     actionId,

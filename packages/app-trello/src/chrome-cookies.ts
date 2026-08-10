@@ -87,7 +87,7 @@ export function locateTrelloProfile(): { profile: string; cookiesPath: string } 
     if (!existsSync(cookiesPath)) continue;
     const hasTrello = withCopiedDb(cookiesPath, (db) => {
       const row = db
-        .prepare(`SELECT COUNT(*) AS n FROM cookies WHERE host_key LIKE '%trello.com'`)
+        .prepare(`SELECT COUNT(*) AS n FROM cookies WHERE (host_key = 'trello.com' OR host_key = '.trello.com' OR host_key LIKE '%.trello.com')`)
         .get() as { n: number } | undefined;
       return (row?.n ?? 0) > 0;
     });
@@ -115,7 +115,7 @@ function readChromeTrelloCookies(cookiesPath: string): RawCookie[] {
     return withCopiedDb(cookiesPath, (db) => {
       const rows = db
         .prepare(
-          `SELECT name, host_key, encrypted_value FROM cookies WHERE host_key LIKE '%trello.com'`,
+          `SELECT name, host_key, encrypted_value FROM cookies WHERE (host_key = 'trello.com' OR host_key = '.trello.com' OR host_key LIKE '%.trello.com')`,
         )
         .all() as Array<{ name: string; host_key: string; encrypted_value: Buffer }>;
       const out: RawCookie[] = [];

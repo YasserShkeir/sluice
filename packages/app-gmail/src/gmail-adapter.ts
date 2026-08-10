@@ -1512,7 +1512,12 @@ function buildReplayRequest(
     Origin: 'https://mail.google.com',
     Referer: `https://mail.google.com/mail/u/${account}/`,
   };
-  for (const [k, v] of Object.entries(session.credentials.injection.headers ?? {})) headers[k] = v;
+  // Same map semantics as cookies / flow-build: NAME → values KEY, with
+  // literal fallback so a pre-baked token still works.
+  for (const [k, ref] of Object.entries(session.credentials.injection.headers ?? {})) {
+    const v = session.credentials.values[ref] ?? ref;
+    if (v) headers[k] = v;
+  }
   const cookie = cookieHeader(session);
   if (cookie) headers.Cookie = cookie;
 

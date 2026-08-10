@@ -427,6 +427,7 @@ export {
   graphqlOperationOf,
   matchesLoom,
   ADAPTER_ID,
+  loomNextCursors,
 } from './loom-adapter.js';
 export { parseVtt } from './transcript.js';
 export type { Transcript, TranscriptSegment } from './transcript.js';
