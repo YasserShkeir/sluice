@@ -14,6 +14,9 @@ adding a service should touch exactly two files outside its own package.
 credential-free). `packages/app-trello` is the smallest example *with*
 credentials. Read whichever matches the service before writing code.
 
+
+Workspace build: root `pnpm` scripts / `scripts/build.mjs` produce package `dist/`. Prefer adapter ids from `PLANNED_APPS` by name, not file line numbers.
+
 ## File layout
 
 Four files. Nothing else is required.

@@ -4,9 +4,13 @@ Local MCP server that exposes this machine’s Sluice store to agents: workspace
 containers, items, captures, **single-request replay**, and **multi-step
 interaction flows**.
 
-Binary: `sluice-mcp` (stdio). Until packaging lands, run via tsx:
+Binary: `sluice-mcp` (stdio). Prefer the built entry after `pnpm -r build` (or the package `dist/`):
 
 ```bash
+# preferred once built
+claude mcp add sluice -- node /path/to/sluice/packages/mcp/dist/cli.js
+
+# dev fallback (tsx on TypeScript source)
 claude mcp add sluice -- pnpm --dir /path/to/sluice exec tsx packages/mcp/src/cli.ts
 ```
 

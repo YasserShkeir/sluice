@@ -2,7 +2,7 @@
 
 > Capture and explore the API traffic your own Slack (and other SaaS) clients make — 100% locally, no app registration, no admin approval.
 
-**Status: 🚧 Working MVP (Phase B).** The `@sluice/core` spine, three app plugins (Slack, Trello, fast.com), the `sluice` CLI + loopback web server, the API Cartographer, an MCP server, and the React dashboard are built and typecheck clean. All three capture engines are implemented: the MITM proxy (A), token-extract + replay (B), and passive browser capture via Chrome DevTools (C). Observed multi-step **interaction flows** can be clustered, learned, and replayed read-only (CLI `flows` / `learn-flows` / `replay --flow`, MCP `sluice_*_flow`, dashboard Group flows + Flow inspector). Lint, typecheck and 102 tests run green in CI, covering the redactor, the store, the replay rails, the cartographer, the runner's server and the MCP handlers.
+**Status: 🚧 Working MVP (Phase B).** The `@sluice/core` spine, five app plugins (Slack, Trello, Gmail, Loom, fast.com), the `sluice` CLI + loopback web server, the API Cartographer, an MCP server, and the React dashboard are built and typecheck clean. All three capture engines are implemented: the MITM proxy (A), token-extract + replay (B), and passive browser capture via Chrome DevTools (C). Observed multi-step **interaction flows** can be clustered, learned, and replayed read-only (CLI `flows` / `learn-flows` / `replay --flow`, MCP `sluice_*_flow`, dashboard Group flows + Flow inspector). Lint, typecheck and 102 tests run green in CI, covering the redactor, the store, the replay rails, the cartographer, the runner's server and the MCP handlers.
 
 ## Install
 
@@ -131,16 +131,19 @@ ca-uninstall    Remove trust for Sluice's local CA.
 sync            Reconstruct structure for ALL (or one) workspace via the Web API.
 build-db        Materialize per-app tables from captures.
 apidoc          Render a Markdown API catalog from captured traffic (scope it with --host).
-replay          Run one replay action by id, or `--flow <templateId>` for multi-step.
-flows           List / show / pin / unpin interaction flows; `templates` lists learned plans.
-learn-flows     Cluster observed bursts and refresh flow templates from the store.
-export          Dump a container's items to JSON.
+replay          Run one replay action by id, --flow <template>, or --all to drain cursors.
+flows           List / show / pin interaction flows and learned templates.
+learn-flows     Cluster captures into flows and refresh multi-step templates.
+export          Dump a container's items: json | ndjson | markdown | sqlite.
+record          Dump captures as NDJSON for the mock runner (credential-free replay).
+mock            Replay a recorded NDJSON fixture through the real ingest path.
+auth            Map how a service authenticates you, from captured traffic. No secrets.
+app             App-specific helpers (subcommands per installed adapter).
 adapters        List installed apps: hosts, credential source, replay actions, MCP tools.
 status          Is a runner serving? Report pid/port/uptime and store size.
 stop            Ask a running runner to shut down (--force to SIGKILL).
-prune           Delete old captures: --days N and/or --max-rows N.
+prune           Delete old captures: --days N and/or --max-rows N [--vacuum].
 wipe            THE PANIC BUTTON: delete the capture DB; --all also removes the CA + Chrome profile.
-```
 
 Run `pnpm sluice <command> --help` for per-command options.
 

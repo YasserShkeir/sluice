@@ -3092,6 +3092,7 @@ Commands:
   record          Dump captures as NDJSON for the mock runner (credential-free replay).
   mock            Replay a recorded NDJSON fixture through the real ingest path.
   auth            Map how a service authenticates you, from captured traffic. No secrets.
+  app             App-specific helpers (subcommands per installed adapter).
   adapters        List installed apps: hosts, credential source, replay actions, MCP tools.
   status          Is a runner serving? Report pid/port/uptime and store size.
   stop            Ask a running runner to shut down (--force to SIGKILL).

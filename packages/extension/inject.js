@@ -75,7 +75,7 @@
                 durationMs: Date.now() - started,
                 reqHeaders: headersToObj(req.headers),
                 resHeaders: headersToObj(res.headers),
-                reqBody,
+                reqBody: clip(reqBody),
                 resBody: clip(text),
                 ts: started,
               });
@@ -128,7 +128,7 @@
             durationMs: Date.now() - meta.started,
             reqHeaders: meta.reqHeaders,
             resHeaders: parseRawHeaders(this.getAllResponseHeaders()),
-            reqBody: meta.reqBody,
+            reqBody: clip(meta.reqBody),
             resBody: clip(resBody),
             ts: meta.started,
           });

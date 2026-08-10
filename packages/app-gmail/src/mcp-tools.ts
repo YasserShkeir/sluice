@@ -600,36 +600,41 @@ const search: AppMcpTool = {
     // scoped search reads down the ranked hits and drops the other accounts',
     // exactly as the thread list reads down its two streams. Unscoped search
     // keeps the `limit`/`offset` the store can apply itself.
+    // Fetch one extra row so hasMore matches gmail_list_threads (exact page
+    // boundary, not "page looked full").
+    const wanted = offset + limit + 1;
     const matched =
       workspaceId === undefined
-        ? store.searchItems(query, { adapterId: ADAPTER_ID, limit, offset })
+        ? store.searchItems(query, { adapterId: ADAPTER_ID, limit: wanted, offset: 0 }).slice(offset)
         : scanRows(
             (rowLimit) => store.searchItems(query, { adapterId: ADAPTER_ID, limit: rowLimit }),
             (rows) => rows.filter((i) => i.workspaceId === workspaceId).length,
-            offset + limit + 1,
+            wanted,
           )
             .filter((i) => i.workspaceId === workspaceId)
-            .slice(offset, offset + limit);
+            .slice(offset);
 
-    const hits = matched
-      .map((item) => {
-        // A message sets `threadId` and a batch-view thread row does not — the
-        // same distinction `gmail_sync_status` counts by. They are told apart
-        // because their `raw` records have entirely different layouts.
-        const isMessage = item.threadId !== undefined;
-        const view = isMessage ? undefined : gmailThreadView(item.raw);
-        const parts = isMessage ? messageParts(item) : undefined;
-        return {
-          id: item.id,
-          kind: isMessage ? 'message' : 'thread',
-          threadId: item.threadId ?? item.id,
-          ts: item.ts,
-          date: isoOf(item.ts),
-          subject: parts?.subject ?? view?.subject ?? '',
-          from: parts?.from ?? view?.from ?? null,
-          snippet: preview(parts?.body ?? item.text),
-        };
-      });
+    const hasMore = matched.length > limit;
+    const pageRows = matched.slice(0, limit);
+
+    const hits = pageRows.map((item) => {
+      // A message sets `threadId` and a batch-view thread row does not — the
+      // same distinction `gmail_sync_status` counts by. They are told apart
+      // because their `raw` records have entirely different layouts.
+      const isMessage = item.threadId !== undefined;
+      const view = isMessage ? undefined : gmailThreadView(item.raw);
+      const parts = isMessage ? messageParts(item) : undefined;
+      return {
+        id: item.id,
+        kind: isMessage ? 'message' : 'thread',
+        threadId: item.threadId ?? item.id,
+        ts: item.ts,
+        date: isoOf(item.ts),
+        subject: parts?.subject ?? view?.subject ?? '',
+        from: parts?.from ?? view?.from ?? null,
+        snippet: preview(parts?.body ?? item.text),
+      };
+    });
 
     return {
       query,
@@ -637,7 +642,7 @@ const search: AppMcpTool = {
       offset,
       limit,
       count: hits.length,
-      hasMore: hits.length >= limit,
+      hasMore,
       hits,
     };
   },

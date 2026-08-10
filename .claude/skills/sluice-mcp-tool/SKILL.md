@@ -77,7 +77,6 @@ one flat namespace on the same server, so unprefixed names will collide.
 
 ## Two known traps
 
-These are live defects in the current code. Don't reproduce them in new tools,
 and fix them if you're touching the surrounding code.
 
 ### 1. App tools can't receive arguments
@@ -138,7 +137,7 @@ shebang, which crashes with `ERR_UNKNOWN_FILE_EXTENSION` if a client spawns it
 directly. Until the packaging task lands, run it through tsx:
 
 ```bash
-claude mcp add sluice -- pnpm --dir /path/to/sluice exec tsx packages/mcp/src/cli.ts
+claude mcp add sluice -- pnpm --dir /path/to/sluice exec node packages/mcp/dist/cli.js  # or tsx packages/mcp/src/cli.ts in dev
 ```
 
 Verify a new tool end to end rather than trusting registration: start the server,

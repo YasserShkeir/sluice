@@ -808,7 +808,7 @@ export function buildServer(store: SqliteStore): McpServer {
         'Derive from captured traffic which endpoints issue credentials, which refresh them, and what later requests depend on them. Never returns a secret — names, endpoints, counts and redacted previews only.',
       inputSchema: { app: z.string().optional() },
     },
-    async ({ app }) => jsonResult(mapAuthFlow(store.listCaptures({ limit: 1_000_000, adapterId: app }), app ?? null)),
+    async ({ app }) => jsonResult(mapAuthFlow(store.listCaptures({ limit: 5_000, adapterId: app }), app ?? null)),
   );
 
   // App-contributed MCP tools (e.g. fast.com's speed test, Gmail's mailbox

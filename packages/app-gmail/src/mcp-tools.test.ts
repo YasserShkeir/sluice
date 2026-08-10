@@ -503,8 +503,12 @@ test("both accounts' inboxes survive as separate containers", async () => {
   const labels = (await call(store, 'gmail_list_labels', { limit: 500 })).labels as LabelRow[];
   const inboxes = labels.filter((l) => l.id === '^i');
   assert.equal(inboxes.length, 2, 'one Inbox per account');
-  assert.deepEqual(inboxes.map((l) => l.containerId), [`${FIRST_WS}/^i`, `${SECOND_WS}/^i`]);
-  assert.deepEqual(inboxes.map((l) => l.workspaceId), [FIRST_WS, SECOND_WS]);
+  // Order is not part of the contract — only that both account inboxes exist.
+  assert.deepEqual(
+    inboxes.map((l) => l.containerId).sort(),
+    [`${FIRST_WS}/^i`, `${SECOND_WS}/^i`].sort(),
+  );
+  assert.deepEqual(inboxes.map((l) => l.workspaceId).sort(), [FIRST_WS, SECOND_WS].sort());
   assert.deepEqual(inboxes.map((l) => l.name), ['Inbox', 'Inbox']);
   // Every label in the recording repeats, and none of them lost a row.
   assert.equal(new Set(labels.map((l) => l.containerId)).size, labels.length);
