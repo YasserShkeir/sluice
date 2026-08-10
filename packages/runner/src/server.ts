@@ -349,9 +349,14 @@ export async function startServer(opts: StartServerOpts): Promise<StartServerRes
    * token, so the stale tab's socket fails the upgrade gate rather than resuming
    * against a counter that has been rewound.
    */
+  /** Seq floor after wipe/delete — clients with sinceSeq below this must full-backfill. */
+  let resumeFloorSeq = 0;
+
   function canResume(sinceSeq: unknown): sinceSeq is number {
     if (typeof sinceSeq !== 'number' || !Number.isInteger(sinceSeq) || sinceSeq < 0) return false;
     if (sinceSeq > seq) return false;
+    // Post-wipe/delete: client held a pre-deletion watermark — force full backfill.
+    if (sinceSeq < resumeFloorSeq) return false;
     const oldest = ring[0]?.seq;
     if (oldest === undefined) return sinceSeq === seq; // nothing broadcast yet
     return sinceSeq >= oldest - 1; // the next frame it needs is still held
@@ -854,9 +859,13 @@ export async function startServer(opts: StartServerOpts): Promise<StartServerRes
     return tables.length;
   }
 
-  /** Called after any capture delete: reconcile every app's derived tables. */
+  /** Called after any capture delete: reconcile derived tables + drop zombie flows. */
   function afterCaptureDelete(): void {
+    // Flows/templates whose captures vanished — prune/delete already GCs orphans
+    // inside the store; this is the belt for adapter-scoped clear paths.
+    store.gcOrphanFlows();
     rebuildDerived(adapters.map((a) => a.id));
+    invalidateRing();
   }
 
   /**
@@ -900,6 +909,9 @@ export async function startServer(opts: StartServerOpts): Promise<StartServerRes
    */
   function invalidateRing(): void {
     ring.length = 0;
+    // Anything issued before this moment is untrusted for resume. seq itself is
+    // monotonic for the process, so the next broadcast will be > resumeFloorSeq.
+    resumeFloorSeq = seq;
   }
 
   // ── passive-capture ingest (Engine C / MV3 extension) ────────────────────────
@@ -1355,8 +1367,15 @@ export async function startServer(opts: StartServerOpts): Promise<StartServerRes
             for (const w of store.listWorkspaces().filter((x) => x.adapterId === app)) {
               store.deleteWorkspace(w.id);
             }
-            if (parsed.includeCaptures) removed = store.deleteCaptures({ adapterId: app });
-            rebuildDerived([app]);
+            // Derived flow rows must not outlive the app that owns them.
+            store.deleteFlows({ adapterId: app });
+            store.deleteFlowTemplates({ adapterId: app });
+            if (parsed.includeCaptures) {
+              removed = store.deleteCaptures({ adapterId: app });
+              afterCaptureDelete();
+            } else {
+              rebuildDerived([app]);
+            }
             return {
               detail: `Cleared ${app}${parsed.includeCaptures ? ` and ${removed} capture(s)` : ' (derived only)'}.`,
             };

@@ -22,3 +22,10 @@ test('looksLikeDeniedOperation catches Trello write-shaped tokens', () => {
 test('looksLikeDeniedOperation ignores empty haystacks', () => {
   assert.equal(looksLikeDeniedOperation(undefined, null, ''), false);
 });
+
+test('looksLikeDeniedOperation catches GraphQL mutations', () => {
+  assert.equal(looksLikeDeniedOperation('mutation { updateCard(id: "x") { id } }'), true);
+  assert.equal(looksLikeDeniedOperation('query=mutation%20{'), true);
+  assert.equal(looksLikeDeniedOperation('query { card(id: "x") { name } }'), false);
+});
+

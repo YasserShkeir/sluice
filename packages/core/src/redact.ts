@@ -19,6 +19,14 @@
 /** Header names whose values are always masked (compared case-insensitively). */
 const SECRET_HEADER_EXACT = new Set(['authorization', 'cookie', 'set-cookie', 'proxy-authorization']);
 
+/**
+ * Header names that look credential-shaped even when not in the exact set.
+ * Covers `x-api-key`, `x-auth-token`, `x-amz-security-token`, `x-csrf-token`, etc.
+ * Avoids eating benign names (`content-type`, `accept`, `user-agent`).
+ */
+const SECRET_HEADER_NAME =
+  /(?:^|[-_])(api[-_]?key|auth(?:orization|enticat(?:e|ion))?|token|secret|session|signature|csrf|xsrf|password|passwd|credential)(?:$|[-_])/i;
+
 export const MASK = '«redacted»';
 
 /** Generic value patterns masked anywhere in text (bodies, logs, errors). */
@@ -87,7 +95,7 @@ export function resetAppRedaction(): void {
 
 function isSecretHeader(name: string): boolean {
   const lower = name.toLowerCase();
-  return SECRET_HEADER_EXACT.has(lower) || extraHeaders.has(lower);
+  return SECRET_HEADER_EXACT.has(lower) || extraHeaders.has(lower) || SECRET_HEADER_NAME.test(lower);
 }
 
 /** The union of params declared public for this host by any installed app. */

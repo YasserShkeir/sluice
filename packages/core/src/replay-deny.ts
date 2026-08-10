@@ -31,6 +31,8 @@ export const REPLAY_DENIED_OPERATION_PATTERNS: readonly RegExp[] = [
   /(?:^|[./_-])(messages\.send|mail\.send|cards?\.create|cards?\.update|boards?\.create)(?:$|[./_?&#-])/i,
   // Path-style write fragments (oauth token endpoints, etc.)
   /\b(chat\.(post|update|delete)|admin\.|files\.(upload|delete)|conversations\.(create|invite|kick|leave|archive)|oauth\.(revoke|token|access))\b/i,
+  // GraphQL write ops (body or query= form field)
+  /\bmutation\b/i,
 ];
 
 /** True when any haystack matches a denied operation pattern. */

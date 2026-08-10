@@ -32,6 +32,7 @@ import type {
 import {
   apps,
   describeDiscovery,
+  enabledApps,
   externalConfigPath,
   installExternalAdapters,
   readEnabledAdapterIds,
@@ -198,21 +199,15 @@ function parsePort(v: string | undefined, fallback: number): number {
 }
 
 /**
- * Restrict the installed apps to the config's allow-list, if it has one.
- * An unknown id is an error rather than a silent no-op: a typo'd adapter name
- * that quietly captured everything would be the opposite of what was asked for.
+ * Restrict the installed apps to the home-config allow-list.
+ *
+ * Delegates to `enabledApps` so CLI and MCP share one source of truth
+ * (`~/.sluice/config.json` adapters[] via `readEnabledAdapterIds`). A
+ * project-local `sluice.config.json` must not widen TLS intercept hosts.
+ * `configPath` is accepted for call-site compatibility and ignored for allow-list.
  */
-function selectApps(configPath?: string): typeof apps {
-  const allow = fileConfig(configPath).adapters;
-  if (!allow || allow.length === 0) return apps;
-  const known = new Set(apps.map((a) => a.id));
-  const unknown = allow.filter((id) => !known.has(id));
-  if (unknown.length > 0) {
-    throw new Error(
-      `Unknown adapter id(s) in config: ${unknown.join(', ')}. Installed: ${[...known].join(', ')}`,
-    );
-  }
-  return apps.filter((a) => allow.includes(a.id));
+function selectApps(_configPath?: string): typeof apps {
+  return enabledApps(readEnabledAdapterIds());
 }
 
 /** Apply the config's retention bounds, if any. Reports what it removed. */

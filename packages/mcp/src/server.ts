@@ -24,7 +24,7 @@ import type { ZodRawShape } from 'zod';
 
 import { decodeBody, readOnlyStore, redactText, SqliteStore } from '@sluice/core';
 import type { App, AppToolContext, Capture, ReplayAction, Session } from '@sluice/core';
-import { enabledApps, getApp, installExternalAdapters } from '@sluice/apps';
+import { enabledApps, installExternalAdapters } from '@sluice/apps';
 import { buildFlowStepRequest, faithfulReplayRequest } from '@sluice/cartographer';
 import { mapAuthFlow, replayWithRefresh, runFlowReplay, runReplay, resolveJsonPath } from '@sluice/interceptor';
 
@@ -73,6 +73,36 @@ export function workspaceOfParams(
     if (owner !== undefined) return owner;
   }
   return undefined;
+}
+
+/**
+ * Pick exactly one session: explicit/inferred workspace, or the sole session.
+ * Multi-session without a workspace is an error — never silent sessions[0].
+ */
+export function pickSession(
+  sessions: Session[],
+  workspaceId: string | undefined,
+  appLabel = 'app',
+): { ok: true; session: Session } | { ok: false; error: string } {
+  const inferred = workspaceId;
+  const picked = inferred
+    ? sessions.find((s) => s.workspaceId === inferred)
+    : sessions.length === 1
+      ? sessions[0]
+      : undefined;
+  if (picked) return { ok: true, session: picked };
+  const have = sessions.map((s) => `${s.workspaceId ?? '(unknown)'} (${s.label})`).join(', ');
+  if (inferred) {
+    return {
+      ok: false,
+      error: `No signed-in workspace matched "${inferred}". Have: ${have || '(none)'}.`,
+    };
+  }
+  if (sessions.length === 0) return { ok: false, error: 'No signed-in workspace found.' };
+  return {
+    ok: false,
+    error: `${sessions.length} ${appLabel} workspaces are signed in. Pass workspaceId. Have: ${have}.`,
+  };
 }
 
 // ── Raw SQLite access (structural, to stay off better-sqlite3's type surface) ────
@@ -442,7 +472,12 @@ export function buildServer(store: SqliteStore): McpServer {
       // Resolve the owning app + action: prefer the pinned (or first) app, then
       // fall back to scanning every installed app for the action id.
       const installed = enabledApps();
-      const preferred = adapterId ? getApp(adapterId) : installed[0];
+      const preferred = adapterId ? installed.find((a) => a.id === adapterId) : installed[0];
+      if (adapterId && !preferred) {
+        return errorResult(
+          `Adapter "${adapterId}" is not enabled. Enable it in ~/.sluice/config.json or omit adapterId.`,
+        );
+      }
       let match: { app: App; action: ReplayAction } | undefined;
       const tryApp = (app: App): void => {
         if (match) return;
@@ -458,6 +493,9 @@ export function buildServer(store: SqliteStore): McpServer {
 
       const app = match.app;
       const action = match.action;
+      // Workspace for first pick AND 401-refresh — one value for both paths.
+      const inferred =
+        workspaceId ?? workspaceOfParams(store, action, params);
 
       // Resolve a Session. Apps WITH a credential provider cold-start-extract a
       // live in-memory session; credential-free apps (e.g. fast.com) replay with
@@ -472,38 +510,9 @@ export function buildServer(store: SqliteStore): McpServer {
           return errorResult(`Could not acquire a session: ${errText(e)}`);
         }
 
-        // Which workspace: the one asked for, or the one the ARGUMENTS belong to.
-        //
-        // Falling straight through to `sessions[0]` was a trap with four Slack
-        // workspaces signed in. A `conversations.history` for a GreenTomato
-        // channel, replayed with Atlagene's session, comes back HTTP 200 with
-        // `{"ok":false,"error":"channel_not_found"}` — which reads as "that
-        // channel does not exist" and is really "you asked the wrong workspace".
-        // The store already knows which workspace owns the container, so the
-        // answer is available and was simply not being looked up.
-        const inferred = workspaceId ?? workspaceOfParams(store, match.action, params);
-        const picked = inferred
-          ? sessions.find((s) => s.workspaceId === inferred)
-          : sessions.length === 1
-            ? sessions[0]
-            : undefined;
-        if (!picked) {
-          const have = sessions.map((s) => `${s.workspaceId ?? '(unknown)'} (${s.label})`).join(', ');
-          if (inferred) {
-            return errorResult(
-              `No signed-in workspace matched "${inferred}". Have: ${have || '(none)'}.`,
-            );
-          }
-          if (sessions.length === 0) return errorResult('No signed-in workspace found.');
-          // Ambiguous, and saying so beats guessing: the guess is wrong
-          // (sessions.length - 1)/sessions.length of the time, and its symptom
-          // is an error message about the wrong thing entirely.
-          return errorResult(
-            `${sessions.length} ${app.displayName} workspaces are signed in and nothing in the ` +
-              `arguments says which to use. Pass workspaceId. Have: ${have}.`,
-          );
-        }
-        session = picked;
+        const choice = pickSession(sessions, inferred, app.displayName);
+        if (!choice.ok) return errorResult(choice.error);
+        session = choice.session;
       } else {
         session = { ...SYNTHETIC_SESSION, adapterId: app.id };
       }
@@ -534,8 +543,10 @@ export function buildServer(store: SqliteStore): McpServer {
           // to a Keychain prompt they have no use for.
           refresh: app.credentials
             ? async () => {
-                const again = await app.credentials?.extractSessions();
-                return workspaceId ? again?.find((s) => s.workspaceId === workspaceId) : again?.[0];
+                const again = (await app.credentials?.extractSessions()) ?? [];
+                // Same inferred workspace as the first pick — never sessions[0] on multi.
+                const choice = pickSession(again, inferred, app.displayName);
+                return choice.ok ? choice.session : undefined;
               }
             : undefined,
           onRetry: () => {
@@ -710,9 +721,11 @@ export function buildServer(store: SqliteStore): McpServer {
         );
       }
 
-      const app = getApp(tmpl.adapterId) ?? enabledApps().find((a) => a.id === tmpl!.adapterId);
+      const app = enabledApps().find((a) => a.id === tmpl.adapterId);
       if (!app) {
-        return errorResult(`No installed app for adapter "${tmpl.adapterId}".`);
+        return errorResult(
+          `No enabled app for adapter "${tmpl.adapterId}". Enable it in ~/.sluice/config.json.`,
+        );
       }
 
       let session: Session;
@@ -723,26 +736,9 @@ export function buildServer(store: SqliteStore): McpServer {
         } catch (e) {
           return errorResult(`Could not acquire a session: ${errText(e)}`);
         }
-        const picked = workspaceId
-          ? sessions.find((s) => s.workspaceId === workspaceId)
-          : sessions.length === 1
-            ? sessions[0]
-            : undefined;
-        if (!picked) {
-          const have = sessions
-            .map((s) => `${s.workspaceId ?? '(unknown)'} (${s.label})`)
-            .join(', ');
-          if (workspaceId) {
-            return errorResult(
-              `No signed-in workspace matched "${workspaceId}". Have: ${have || '(none)'}.`,
-            );
-          }
-          if (sessions.length === 0) return errorResult('No signed-in workspace found.');
-          return errorResult(
-            `${sessions.length} ${app.displayName} workspaces are signed in. Pass workspaceId. Have: ${have}.`,
-          );
-        }
-        session = picked;
+        const choice = pickSession(sessions, workspaceId, app.displayName);
+        if (!choice.ok) return errorResult(choice.error);
+        session = choice.session;
       } else {
         session = { ...SYNTHETIC_SESSION, adapterId: app.id };
       }
@@ -768,9 +764,9 @@ export function buildServer(store: SqliteStore): McpServer {
             },
             refresh: app.credentials
               ? async () => {
-                  const again = await app.credentials?.extractSessions();
-                  const ws = workspaceId;
-                  return ws ? again?.find((s) => s.workspaceId === ws) : again?.[0];
+                  const again = (await app.credentials?.extractSessions()) ?? [];
+                  const choice = pickSession(again, workspaceId, app.displayName);
+                  return choice.ok ? choice.session : undefined;
                 }
               : undefined,
           },
@@ -868,14 +864,12 @@ export function buildServer(store: SqliteStore): McpServer {
           ?? store.getFlowTemplateByPrimary(app.id, templateId);
         if (!tmpl) throw new Error(`Unknown flow template "${templateId}"`);
         let session: Session = { ...SYNTHETIC_SESSION, adapterId: app.id };
+        const flowWs = flowOpts?.workspaceId;
         if (app.credentials) {
           const sessions = await app.credentials.extractSessions();
-          const ws = flowOpts?.workspaceId;
-          const picked = ws
-            ? sessions.find((s) => s.workspaceId === ws)
-            : sessions[0];
-          if (!picked) throw new Error('No session available for flow replay');
-          session = picked;
+          const choice = pickSession(sessions, flowWs, app.displayName);
+          if (!choice.ok) throw new Error(choice.error);
+          session = choice.session;
         }
         const result = await runFlowReplay({
           template: tmpl,
@@ -895,9 +889,9 @@ export function buildServer(store: SqliteStore): McpServer {
             },
             refresh: app.credentials
               ? async () => {
-                  const again = await app.credentials?.extractSessions();
-                  const ws = flowOpts?.workspaceId;
-                  return ws ? again?.find((s) => s.workspaceId === ws) : again?.[0];
+                  const again = (await app.credentials?.extractSessions()) ?? [];
+                  const choice = pickSession(again, flowWs, app.displayName);
+                  return choice.ok ? choice.session : undefined;
                 }
               : undefined,
           },

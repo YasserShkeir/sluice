@@ -212,6 +212,23 @@ export function TrafficDashboard({
     setVersion((v) => v + 1);
   }, [captures, recording, follow]);
 
+  // Wipe (and any full server clear) empties the ws capture ring. listRef is a
+  // separate live buffer — drop it too so the dashboard cannot keep deleted rows.
+  useEffect(() => {
+    if (captures.length > 0) return;
+    if (listRef.current.length === 0) return;
+    listRef.current = [];
+    indexRef.current = new Map();
+    seqRef.current = new Map();
+    seqCounter.current = 0;
+    flowHydrateRef.current.clear();
+    setMarks(new Set());
+    setMulti(new Set());
+    setUnseen(0);
+    setVersion((v) => v + 1);
+    onSelect(null);
+  }, [captures, onSelect]);
+
   // ── Body search: the one predicate the client cannot answer from its window ───
   const bodyQueries = useMemo(
     () => serverSideTerms(query).map((t) => t.value).join(' '),
@@ -433,6 +450,7 @@ export function TrafficDashboard({
     setVersion((v) => v + 1);
     onSelect(null);
   }
+
 
   function addTerm(term: string): void {
     setQueryText((t) => (t.includes(term) ? t : `${t ? `${t} ` : ''}${term}`));
