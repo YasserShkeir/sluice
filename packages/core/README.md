@@ -36,4 +36,4 @@ Apache-2.0.
 `InteractionFlow` / `FlowTemplate` types and store APIs (`listFlows`, `pinFlow`,
 `createPinnedFlow`, `listFlowTemplates`, …) back multi-step observation. Secrets
 never live on flow tables; MCP/HTTP summaries stay secret-free. See
-`docs/FULL-FLOW-FIDELITY.md`.
+the local flow tracker under `docs/` (gitignored when present) or `docs/AUDIT-2026-08-07.md` for the public audit trail.

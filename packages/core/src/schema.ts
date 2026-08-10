@@ -144,7 +144,9 @@ CREATE TABLE IF NOT EXISTS cursors (
   attempts     INTEGER NOT NULL DEFAULT 0,
   last_error   TEXT,
   created_ts   INTEGER NOT NULL,
-  updated_ts   INTEGER NOT NULL
+  updated_ts   INTEGER NOT NULL,
+  reason       TEXT,
+  depth        INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_cursors_state ON cursors(state, updated_ts);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_cursors_dedupe
@@ -223,22 +225,6 @@ CREATE VIRTUAL TABLE IF NOT EXISTS items_fts USING fts5(
 `;
 
 /**
- * Columns added after the initial schema, applied by `SqliteStore.migrate()`.
- *
- * `CREATE TABLE IF NOT EXISTS` is a no-op on a database that already exists, so
- * adding a column to SCHEMA_SQL alone only reaches brand-new stores — every
- * existing `~/.sluice/sluice.db` would silently never gain it, and the code
- * reading that column would break for exactly the users who have data.
- *
- * So: add a column to BOTH the CREATE TABLE above (for fresh databases) and this
- * table (for existing ones). Entries are `column → the type/default clause`, and
- * applying them is idempotent — anything already present is skipped.
- *
- * Additive only. SQLite cannot drop or retype a column without rebuilding the
- * table, and a capture store is append-only data the user may care about, so a
- * destructive migration needs a deliberate, separate mechanism.
- */
-/**
  * Indexes that reference a column from ADDITIVE_COLUMNS, applied AFTER those
  * columns exist.
  *
@@ -265,6 +251,22 @@ export const ADDITIVE_INDEXES: string[] = [
   'CREATE INDEX IF NOT EXISTS idx_captures_loader ON captures(loader_id)',
 ];
 
+/**
+ * Columns added after the initial schema, applied by `SqliteStore.migrate()`.
+ *
+ * `CREATE TABLE IF NOT EXISTS` is a no-op on a database that already exists, so
+ * adding a column to SCHEMA_SQL alone only reaches brand-new stores — every
+ * existing `~/.sluice/sluice.db` would silently never gain it, and the code
+ * reading that column would break for exactly the users who have data.
+ *
+ * So: add a column to BOTH the CREATE TABLE above (for fresh databases) and this
+ * map (for existing ones). Entries are `column → the type/default clause`, and
+ * applying them is idempotent — anything already present is skipped.
+ *
+ * Additive only. SQLite cannot drop or retype a column without rebuilding the
+ * table, and a capture store is append-only data the user may care about, so a
+ * destructive migration needs a deliberate, separate mechanism.
+ */
 export const ADDITIVE_COLUMNS: Record<string, Record<string, string>> = {
   captures: {
     // Which browser tab produced this exchange (Engine C). Lets the traffic view
@@ -297,5 +299,11 @@ export const ADDITIVE_COLUMNS: Record<string, Record<string, string>> = {
     // What makes "is my capture complete?" answerable instead of a guess.
     item_count: 'INTEGER',
     unread_count: 'INTEGER',
+  },
+  cursors: {
+    // Why the seed exists (pagination vs fan-out) and hop count from the origin
+    // capture. Optional on CursorSeed; persisted so drainers can bound fan-out.
+    reason: 'TEXT',
+    depth: 'INTEGER',
   },
 };

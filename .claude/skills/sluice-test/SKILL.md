@@ -1,6 +1,6 @@
 ---
 name: sluice-test
-description: Add or extend a test suite for a Sluice package using the repo's node:test + tsx pattern with in-memory SqliteStore fixtures. Use this whenever the user wants tests for anything under packages/* or apps/webapp — "add tests for the store", "test the redactor", "cover the MCP handlers", "write a test for this adapter", "why is there no test for X" — or when working through the untested-packages backlog. Also use when a package needs its test script wired up, since only two of ten packages currently have one.
+description: Add or extend a test suite for a Sluice package using the repo's node:test + tsx pattern with in-memory SqliteStore fixtures. Use this whenever the user wants tests for anything under packages/* or apps/webapp — "add tests for the store", "test the redactor", "cover the MCP handlers", "write a test for this adapter", "why is there no test for X" — or when working through the untested-packages backlog. Also use when a package needs its test script wired up, since most packages under `packages/*` and `apps/webapp` declare a `test` script; root `pnpm test` runs `pnpm -r --if-present test`.
 ---
 
 # Testing in Sluice

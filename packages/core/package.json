@@ -6,7 +6,10 @@
   "exports": {
     ".": "./src/index.ts"
   },
-  "files": ["dist", "README.md"],
+  "files": [
+    "dist",
+    "README.md"
+  ],
   "scripts": {
     "typecheck": "tsc --noEmit",
     "build": "tsc -p tsconfig.build.json",
@@ -18,7 +21,8 @@
     "nanoid": "^5.0.9"
   },
   "devDependencies": {
-    "@types/better-sqlite3": "^7.6.12"
+    "@types/better-sqlite3": "^7.6.12",
+    "@types/node": "^22.10.0"
   },
   "license": "Apache-2.0",
   "publishConfig": {

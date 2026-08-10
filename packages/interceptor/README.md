@@ -22,7 +22,7 @@ them):
 | **WebSocket frames** | Yes by default (`captureWebSockets`) | Yes by default | **No** (documented limitation) |
 | **Opaque / no-cors bodies** | Headers + status when visible; body may be empty | Emit capture; body null if unreadable | Skip unreadable clone |
 | **Correlation on `Capture`** | `wsId` + `direction` for frames | `tabId`, `tabUrl`, `wsId`, `direction` | Runner sets `source: 'ext'`; tab fields depend on ingest |
-| **Not yet (F0.3)** | `pageLoadId` / `navigationId` / CDP `loaderId` | same | same |
+| **F0.3 correlation** | optional (engine-dependent) | CDP emits `loaderId` / `pageLoadId` / `navigationId` when present | extension may omit |
 
 ### Design rules that matter for flows
 
@@ -35,7 +35,7 @@ them):
    extension for those clients, or accept thinner templates.
 3. **Extension does not see WebSockets.** RTM/socket companions require MITM or CDP.
 4. **Clustering today** (`cartographer/flows.ts`) uses `adapterId` + `tabId` (when
-   present) or host family, split on wall-clock gaps. F0.3 correlation ids would
+   present) or host family, split on wall-clock gaps. CDP correlation ids
    tighten this; until then, pin flows manually when heuristics miss.
 
 ### F0.2 checklist (no silent same-host drops)

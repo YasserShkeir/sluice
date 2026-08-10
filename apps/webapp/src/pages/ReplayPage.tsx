@@ -61,8 +61,14 @@ export function ReplayPage({ actionId, apps, replays, budget }: Props) {
   return (
     <ResizablePanelGroup orientation="horizontal">
       <ResizablePanel defaultSize="22" minSize="14">
-        <ActionList entries={entries} selectedId={actionId} />
-        <FlowTemplatesPanel />
+        <div className="flex h-full min-h-0 flex-col">
+          <div className="min-h-0 flex-1 overflow-auto">
+            <ActionList entries={entries} selectedId={actionId} />
+          </div>
+          <div className="max-h-[40%] shrink-0 overflow-auto border-t border-border">
+            <FlowTemplatesPanel />
+          </div>
+        </div>
       </ResizablePanel>
       <ResizableHandle orientation="horizontal" />
       <ResizablePanel defaultSize="40" minSize="24">
@@ -95,7 +101,7 @@ function ActionList({ entries, selectedId }: { entries: Entry[]; selectedId?: st
   }, [entries]);
 
   return (
-    <div className="h-full overflow-auto">
+    <div>
       {byApp.map((group) => {
         const app = group[0]?.app;
         if (app === undefined) return null;
@@ -393,7 +399,7 @@ function FlowTemplatesPanel() {
   }, []);
 
   return (
-    <section className="border-t border-border">
+    <section>
       <h2 className="sticky top-0 bg-bg-1 px-2.5 py-1.5 text-[12px] font-medium text-fg">
         Learned flows
       </h2>
@@ -404,7 +410,7 @@ function FlowTemplatesPanel() {
           None yet. Capture traffic, run <code className="font-mono">sluice learn-flows</code>, or open Traffic → Group flows.
         </p>
       ) : (
-        <ul className="max-h-48 overflow-auto">
+        <ul className="overflow-auto">
           {templates.map((t) => (
             <li
               key={t.id}

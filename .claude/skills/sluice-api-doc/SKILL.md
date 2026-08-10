@@ -121,3 +121,8 @@ The catalog is the input to the `sluice-app` skill: the host list becomes
 endpoints become `listReplayActions`, and the auth mechanism becomes
 `buildReplayRequest`. Do this pass first — writing an adapter against a real
 catalog is a different activity from writing one against a guess.
+
+## Commit policy
+
+`docs/*-api.md` catalogs may be local/gitignored depending on repo policy — do not force-commit secrets from live capture. Prefer redacted fixtures and the skill output path the user names.
+

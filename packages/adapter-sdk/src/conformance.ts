@@ -304,7 +304,7 @@ export function runConformance(app: App, opts: ConformanceOptions = {}): void {
       const req = app.buildReplayRequest(action, params, session);
 
       assert.ok(req.url.startsWith('https://'), 'replay must never downgrade to http');
-      const wire = `${JSON.stringify(req.headers)}\n${req.body ?? ''}`;
+      const wire = `${req.url}\n${JSON.stringify(req.headers)}\n${req.body ?? ''}`;
       for (const key of keyNames) {
         const value = session.credentials.values[key];
         // The key name may only appear where it is a legitimate wire name

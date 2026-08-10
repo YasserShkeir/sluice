@@ -866,8 +866,8 @@ export class SqliteStore {
     if (seeds.length === 0) return 0;
     const stmt = this.db.prepare(
       `INSERT INTO cursors
-         (id, adapter_id, action_id, container_id, cursor, params, state, attempts, created_ts, updated_ts)
-       VALUES (@id, @adapter_id, @action_id, @container_id, @cursor, @params, 'pending', 0, @ts, @ts)
+         (id, adapter_id, action_id, container_id, cursor, params, state, attempts, created_ts, updated_ts, reason, depth)
+       VALUES (@id, @adapter_id, @action_id, @container_id, @cursor, @params, 'pending', 0, @ts, @ts, @reason, @depth)
        ON CONFLICT(adapter_id, action_id, IFNULL(container_id, ''), IFNULL(cursor, ''))
          DO NOTHING`,
     );
@@ -882,6 +882,8 @@ export class SqliteStore {
           cursor: s.cursor ?? null,
           params: j(s.params),
           ts,
+          reason: s.reason ?? null,
+          depth: s.depth ?? null,
         }).changes;
       }
     });
@@ -1601,6 +1603,8 @@ interface CursorRow {
   last_error: string | null;
   created_ts: number;
   updated_ts: number;
+  reason: string | null;
+  depth: number | null;
 }
 interface FlowRow {
   id: string;
@@ -1740,6 +1744,8 @@ function rowToWorkItem(r: CursorRow): WorkItem {
     lastError: r.last_error ?? undefined,
     createdTs: r.created_ts,
     updatedTs: r.updated_ts,
+    reason: r.reason === 'cursor' || r.reason === 'fanout' ? r.reason : undefined,
+    depth: r.depth ?? undefined,
   };
 }
 function rowToFlowTemplate(r: FlowTemplateRow): FlowTemplate {
