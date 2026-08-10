@@ -34,3 +34,20 @@ test('everything latin1 passes through unchanged', () => {
 test('an empty header set is fine', () => {
   assert.deepEqual(sendableHeaders({}), {});
 });
+
+test('HTTP/2 pseudo-headers are dropped (undici cannot set them)', () => {
+  const out = sendableHeaders({
+    ':method': 'GET',
+    ':authority': 'www.linkedin.com',
+    ':scheme': 'https',
+    ':path': '/voyager/api/me',
+    'user-agent': 'Mozilla/5.0',
+    cookie: 'li_at=x',
+  });
+  assert.equal(out[':method'], undefined);
+  assert.equal(out[':authority'], undefined);
+  assert.equal(out[':scheme'], undefined);
+  assert.equal(out[':path'], undefined);
+  assert.equal(out['user-agent'], 'Mozilla/5.0');
+  assert.equal(out.cookie, 'li_at=x');
+});

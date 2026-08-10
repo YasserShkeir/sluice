@@ -27,10 +27,16 @@ const DEFAULT_TIMEOUT_MS = 20_000;
  * every path into the network, faithful or raw, which is the same reason the
  * safety rails live at this layer. A dropped header degrades fidelity; a thrown
  * replay returns nothing.
+ *
+ * HTTP/2 pseudo-headers (`:method`, `:authority`, `:scheme`, `:path`) also
+ * cannot be set on `fetch`. Faithful templates learned from MITM captures often
+ * include them; leaving them in produced a opaque `fetch failed` on every
+ * `sluice replay` that went through `faithfulReplayRequest`.
  */
 export function sendableHeaders(headers: Record<string, string>): Record<string, string> {
   const out: Record<string, string> = {};
   for (const [k, v] of Object.entries(headers)) {
+    if (k.startsWith(':')) continue;
     let ok = true;
     for (let i = 0; i < v.length; i++) {
       if (v.charCodeAt(i) > 255) {

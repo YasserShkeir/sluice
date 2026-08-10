@@ -66,7 +66,7 @@ Every engine converges on **one ingest funnel**, so redaction, attribution and p
 
 <br>
 
-**Capture engines — how each one decides what it is allowed to see.** Interception is *scoped, not filtered*: a host outside the intercept list is CONNECT-tunnelled as raw bytes, so no row is ever written for it. A service with no adapter and no `--host` entry looks "not captured" rather than captured-but-empty.
+**Capture engines — how each one decides what it is allowed to see.** Engine A (MITM) **decrypts every host by default** while capture is running. Pass `--host` / `interceptHosts` (or `interceptAllHosts: false`) to scope TLS termination; hosts outside that list are CONNECT-tunnelled as raw bytes with no row written. Adapter `matchRequest` still attributes captures — unknown services land as unclassified until an adapter exists.
 
 ![Engine A's scope decision, Engine C's XHR/Fetch-only filter and extension host allowlist, and Engine B's credential extraction.](assets/architecture/02-capture-engines.png)
 
@@ -110,6 +110,7 @@ packages/app-slack     @sluice/app-slack     Slack: adapter · parser · macOS c
 packages/app-trello    @sluice/app-trello    Trello: adapter · Chrome-cookie credentials · MCP tool
 packages/app-gmail     @sluice/app-gmail     Gmail: positional-array sync API · thread/label MCP tools
 packages/app-loom      @sluice/app-loom      Loom: adapter · Chrome-cookie credentials · transcript MCP tool
+packages/app-linkedin  @sluice/app-linkedin  LinkedIn: Voyager adapter · jobs/messaging · cookie MCP tools
 packages/app-fast      @sluice/app-fast      fast.com: credential-free adapter · speed-test MCP tool
 packages/mcp           @sluice/mcp           the `sluice-mcp` stdio MCP server
 packages/runner        @sluice/runner        the `sluice` CLI + loopback HTTP/WS server
