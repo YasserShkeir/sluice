@@ -123,25 +123,25 @@ are. A local `capture()` fixture helper with a **fixed** timestamp keeps orderin
 deterministic. Guard macOS-only tests with `{ skip: process.platform !== 'darwin' }`
 so CI stays green on Linux.
 
-9 of 11 packages have suites (95 tests), including the runner's loopback auth
-boundary, the MCP tool registration, the redactor and the replay rails.
+Most packages under `packages/*` and `apps/webapp` declare a `test` script; root `pnpm test` runs them via `pnpm -r --if-present test` (node:test + tsx), covering the runner's loopback auth boundary, the MCP tool registration, the redactor and the replay rails.
 
 Still uncovered and worth contributing:
 - the **cookie/Keychain decryptors** (`app-slack/src/slack-credentials.ts`,
   `app-trello/src/chrome-cookies.ts`) — testable with a fixture Cookies SQLite and
   an injected passphrase, no Keychain needed;
-- the **capture engines** — realistically these need a mock runner (scrubbed
-  NDJSON replay) that does not exist yet;
+- the **capture engines** — use `sluice record` + `sluice mock` for scrubbed
+  NDJSON fixture replay through the real ingest path;
 - the **React components** (`analytics.ts` is pure and covered; the rest would need
   a browser test runner, which the repo deliberately does not have yet).
 
 ## Platform support
 
 Credential extraction is macOS-only today (Keychain + the macOS OSCrypt v10
-scheme). Windows (DPAPI + AES-256-GCM) and Linux (libsecret/kwallet) are wanted;
-the credential-provider seam already exists, but `slack-credentials.ts` and
-`chrome-cookies.ts` currently duplicate the same crypto — de-duplicate that into a
-shared per-platform module first, or the two copies will diverge.
+scheme). There are **three** OSCrypt-related copies across Slack/Trello/Loom cookie
+helpers — keep them in sync when touching decrypt. Windows (DPAPI + AES-256-GCM)
+and Linux (libsecret/kwallet) are wanted; the credential-provider seam already
+exists, but those helpers currently duplicate the same crypto — de-duplicate into a
+shared per-platform module first, or the copies will diverge.
 
 Everywhere else, non-macOS users fall back to `--token`/`--cookie` paste-in.
 

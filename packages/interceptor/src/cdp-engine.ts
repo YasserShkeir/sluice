@@ -432,6 +432,10 @@ export class CdpEngine {
   }
 
   /** Navigate a tab (defaults to the first attached one). */
+  /**
+   * Drive the attached tab (debug / scripted capture). Not on the hot ingest
+   * path — kept for `sluice capture` helpers and manual CDP control.
+   */
   async navigate(url: string, tabId?: string): Promise<void> {
     const tab = tabId ? this.attached.get(tabId) : [...this.attached.values()][0];
     if (!tab) throw new Error('CdpEngine has no attached tab');
@@ -439,6 +443,7 @@ export class CdpEngine {
   }
 
   /** Run JS in a tab (defaults to the first attached one). */
+  /** Evaluate JS in the attached tab — same non-hot-path use as navigate. */
   async evaluate(expression: string, tabId?: string): Promise<void> {
     const tab = tabId ? this.attached.get(tabId) : [...this.attached.values()][0];
     if (!tab) throw new Error('CdpEngine has no attached tab');

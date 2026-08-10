@@ -1097,8 +1097,9 @@ async function cmdCapture(args: string[]): Promise<number> {
     return 0;
   }
 
-  const port = parsePort(values.port, config.DEFAULT_HTTP_PORT);
-  const cdpPort = parsePort(values['cdp-port'], config.DEFAULT_CDP_PORT);
+  const cfg = fileConfig((values as { config?: string }).config);
+  const port = parsePort(values.port, cfg.port ?? config.DEFAULT_HTTP_PORT);
+  const cdpPort = parsePort(values['cdp-port'], cfg.cdpPort ?? config.DEFAULT_CDP_PORT);
   const startUrl = values.url ?? defaultCaptureUrl();
   const profileDir = values['chrome-profile'] ?? defaultChromeProfileDir();
   const store = openStore(resolveDb(values.db, (values as { config?: string }).config));
