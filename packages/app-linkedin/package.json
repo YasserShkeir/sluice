@@ -1,0 +1,24 @@
+{
+  "name": "@sluice/app-linkedin",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Sluice LinkedIn app: Voyager adapter, parser for me/jobs/messaging, macOS Chrome cookie credentials, store-backed MCP tools, and safe GET replay.",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "node --import tsx --test src/*.test.ts"
+  },
+  "dependencies": {
+    "@sluice/adapter-sdk": "workspace:*",
+    "@sluice/core": "workspace:*",
+    "better-sqlite3": "^11.7.0",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.12",
+    "@types/node": "^20.10.0"
+  }
+}

@@ -152,6 +152,17 @@ test('stopping the engine takes the system proxy down with it', async () => {
   assert.equal(proxy.off, 1);
 });
 
+test('stop clears a proxy pointing at us even when set outside the controller', async () => {
+  // `sluice proxy on` mutates the OS without going through proxyOn(), so
+  // proxyOurs stays false — stop/shutdown must still restore the network.
+  const { ctrl, proxy } = harness();
+  await ctrl.startEngine();
+  proxy.enabled = true; // external set; state().ours follows enabled in the harness
+  await ctrl.stopEngine();
+  assert.equal(proxy.enabled, false, 'externally-set ours-proxy cleared on stop');
+  assert.equal(proxy.off, 1);
+});
+
 test('shutdown restores the proxy even without an explicit stop', async () => {
   const { ctrl, proxy, engines } = harness();
   await ctrl.startEngine();
@@ -159,6 +170,15 @@ test('shutdown restores the proxy even without an explicit stop', async () => {
   await ctrl.shutdown();
   assert.equal(proxy.enabled, false, 'process exit must not strand the proxy');
   assert.equal(engines[0]?.stops, 1);
+});
+
+test('shutdown clears an externally-set proxy pointing at us', async () => {
+  const { ctrl, proxy } = harness();
+  await ctrl.startEngine();
+  proxy.enabled = true;
+  await ctrl.shutdown();
+  assert.equal(proxy.enabled, false);
+  assert.equal(proxy.off, 1);
 });
 
 test('the supervisor giving up (terminal error) clears the proxy', async () => {

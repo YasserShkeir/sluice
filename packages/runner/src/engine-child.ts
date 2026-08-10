@@ -16,9 +16,10 @@
  *     data channel.
  *
  * It needs no adapter objects: MitmEngine uses adapters only to build its TLS
- * intercept list, so the parent flattens their hostnames into SLUICE_CHILD_HOSTS
- * and this runs with `adapters: []`. Attribution and parsing happen in the parent
- * on ingest, exactly as they did for the in-process engine.
+ * intercept list when scoping is on, so the parent flattens hostnames into
+ * SLUICE_CHILD_HOSTS and this runs with `adapters: []`. Attribution and parsing
+ * happen in the parent on ingest, exactly as they did for the in-process engine.
+ * SLUICE_CHILD_ALL_HOSTS defaults on when the env var is unset (matches MitmEngine).
  */
 import { createInterface } from 'node:readline';
 import { writeSync } from 'node:fs';
@@ -47,7 +48,8 @@ const hosts = (process.env.SLUICE_CHILD_HOSTS ?? '')
   .split(',')
   .map((s) => s.trim())
   .filter(Boolean);
-const allHosts = process.env.SLUICE_CHILD_ALL_HOSTS === '1';
+// Unset → all hosts (product default). Explicit '0' → scoped to SLUICE_CHILD_HOSTS.
+const allHosts = process.env.SLUICE_CHILD_ALL_HOSTS !== '0';
 const captureWebSockets = process.env.SLUICE_CHILD_WS !== '0';
 
 const engine = new MitmEngine({

@@ -31,7 +31,7 @@ Being straight about these matters more than the marketing value of omitting the
 
 - **Secrets are not reliably zeroed.** Credentials are held as ordinary JavaScript strings, which cannot be wiped: V8 copies them during GC and we cannot `mlock` the heap. Only the macOS Keychain passphrase `Buffer` is explicitly zeroed after use — and even that is preceded by an unzeroable string copy. Treat "in memory only" as "never persisted", not as "unrecoverable from process memory". A memory dump of a running Sluice can yield your session.
 - **Redaction is best-effort pattern matching.** It masks known header names, credential-shaped values, and each app's registered token shapes. A novel secret format under an unrecognised field name can still reach the local store. The store is local and unshared, so the impact is limited to your own disk — but review before exporting or sharing anything.
-- **The MITM engine decrypts every host** while it is running, not only the hosts an adapter claims. Keep proxy sessions short, and prefer `sluice capture` (browser CDP, no proxy and no CA) when it is sufficient.
+- **The MITM engine decrypts every host by default** while it is running, not only the hosts an adapter claims. Unrelated tabs and apps on the same proxy path are redacted and stored unless you scope with `--host` / `interceptHosts` or set `interceptAllHosts: false`. Keep proxy sessions short, and prefer `sluice capture` (browser CDP, no proxy and no CA) when it is sufficient.
 - **Capture is retained until you remove it.** Nothing expires on its own; run `sluice prune --days N` or `sluice wipe`.
 
 ## Reporting a vulnerability

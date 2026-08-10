@@ -10,9 +10,10 @@
  * Secrets never leave this file un-redacted: reqHeaders/resHeaders go through
  * redactHeaders, bodies + url through redactText, before a Capture is emitted.
  *
- * "Every request" means every request it is allowed to DECRYPT. TLS termination
- * is scoped to the installed adapters' hosts plus anything `--host` adds — see
- * `tlsInterceptList`. Everything else is tunnelled through as opaque bytes.
+ * Default: decrypt every host the routed client talks to (recon / unknown
+ * services work without an adapter). Pass `interceptHosts` / adapter-only
+ * scoping, or set `interceptAllHosts: false`, to narrow TLS termination — see
+ * `tlsInterceptList`. Non-matching connections are then tunnelled as opaque bytes.
  */
 import { readFileSync } from 'node:fs';
 import type { CompletedRequest, CompletedResponse, Mockttp } from 'mockttp';
@@ -48,42 +49,37 @@ export interface MitmEngineOptions {
   /** Capture WebSocket frames as well as HTTP. Default true. */
   captureWebSockets?: boolean;
   /**
-   * Extra hostname patterns to decrypt, on top of the installed adapters' own
-   * hosts. This is how you reconnoitre a service Sluice has no adapter for yet:
-   * `sluice start --host app.notion.so`. Wildcards follow URLPattern, e.g.
-   * `*.notion.so`.
+   * Hostname patterns to decrypt when scoping is on (see `interceptAllHosts`).
+   * Combined with installed adapters' own hosts via `tlsInterceptList`.
+   * Wildcards follow URLPattern, e.g. `*.notion.so`.
    */
   interceptHosts?: string[];
   /**
-   * Decrypt EVERY host. Off by default, and it should stay off — see
-   * `tlsInterceptList`. Exposed as `sluice start --all-hosts` for the rare case
-   * where you genuinely do not know which hostnames a client talks to.
+   * Decrypt EVERY host. **On by default** so unknown services (no adapter yet)
+   * are still captured. Set false — or pass an explicit host list from the CLI /
+   * config — to limit TLS termination to `tlsInterceptList`.
    */
   interceptAllHosts?: boolean;
 }
 
 /**
- * The hostnames whose TLS this proxy is allowed to terminate.
+ * The hostnames whose TLS this proxy is allowed to terminate when scoping is on.
  *
- * Engine A used to hand mockttp no `tlsInterceptOnly` list at all, which meant it
- * decrypted every TLS connection the routed client made — your bank, your email,
- * every unrelated tab — not just the hosts the installed adapters care about.
- * Everything it saw was stored, so the same omission was also the root cause of
- * unbounded store growth: `pruneCaptures` was trimming a firehose instead of the
- * traffic anyone asked for.
+ * When `MitmEngine` runs with `interceptAllHosts: true` (the default), this list
+ * is not applied and mockttp terminates every TLS connection.
  *
- * Scoping it means non-matching connections are tunnelled through as raw bytes:
- * Sluice cannot read them, so it cannot store them, so they cannot leak from
- * `~/.sluice/sluice.db`. That is a stronger guarantee than redaction, because it
- * holds even for hosts whose secret shapes the redactor has never seen.
+ * When scoping is on, non-matching connections are tunnelled through as raw
+ * bytes: Sluice cannot read them, so it cannot store them. That is a stronger
+ * guarantee than redaction for hosts whose secret shapes the redactor has never
+ * seen — use it when you want a tight privacy boundary.
  *
  * Each declared host also contributes a `*.host` pattern: an app's own subdomains
  * (files.slack.com, cdn.trello.com) are part of that app's traffic, and adapters
  * declare only the handful they match on today.
  *
  * An EMPTY list is meaningful and safe — mockttp reads it as "intercept nothing"
- * rather than "no restriction" — so filtering down to zero adapters captures
- * nothing rather than everything.
+ * rather than "no restriction" — so filtering down to zero adapters/hosts
+ * captures nothing rather than everything.
  */
 export function tlsInterceptList(
   adapters: Adapter[],
@@ -139,14 +135,15 @@ export class MitmEngine {
     this.onStatus = opts.onStatus ?? (() => {});
     this.captureWebSockets = opts.captureWebSockets ?? true;
     this.interceptHosts = opts.interceptHosts ?? [];
-    this.interceptAllHosts = opts.interceptAllHosts ?? false;
+    // Default ON: no host list means do not limit TLS termination.
+    this.interceptAllHosts = opts.interceptAllHosts ?? true;
   }
 
   /**
-   * The hostnames this engine will decrypt, or `undefined` when scoping is off.
-   * Exposed so `sluice start` can print it — which hosts get decrypted is a
-   * privacy-relevant fact, and the user should not have to read the source to
-   * learn it.
+   * The hostnames this engine will decrypt, or `undefined` when scoping is off
+   * (all hosts). Exposed so `sluice start` can print it — which hosts get
+   * decrypted is a privacy-relevant fact, and the user should not have to read
+   * the source to learn it.
    */
   interceptedHosts(): string[] | undefined {
     if (this.interceptAllHosts) return undefined;
@@ -184,9 +181,9 @@ export class MitmEngine {
         https: {
           key: ca.key,
           cert: ca.cert,
-          // Omitted entirely under --all-hosts: mockttp treats the option's
-          // ABSENCE as "no restriction" and an empty ARRAY as "intercept
-          // nothing", so the two are not interchangeable.
+          // Omitted when intercepting all hosts (the default): mockttp treats
+          // the option's ABSENCE as "no restriction" and an empty ARRAY as
+          // "intercept nothing", so the two are not interchangeable.
           ...(scoped ? { tlsInterceptOnly: scoped.map((hostname) => ({ hostname })) } : {}),
         },
         // Clients that only speak h2 (and modern desktop apps increasingly do)

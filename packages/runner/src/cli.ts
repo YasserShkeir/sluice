@@ -689,26 +689,33 @@ async function cmdExtractToken(args: string[]): Promise<number> {
  * A SystemProxyOps over the macOS proxy helpers, for the EngineController.
  *
  * The network service is detected once and cached. `ours` compares the enabled
- * proxy against OUR loopback port, so the controller only ever clears a proxy it
- * actually set — never one the user configured for something else.
+ * proxy against OUR loopback port. `off()` only clears when the proxy currently
+ * points at us — never a proxy the user configured for something else — so the
+ * controller can safely call it on every stop/shutdown.
  */
 function makeProxyOps(ourPort: number): import('./engine-controller.js').SystemProxyOps {
   let service: string | undefined;
   const svc = async (): Promise<string> => (service ??= await detectNetworkService());
+  const isOurs = (st: { enabled: boolean; host?: string; port?: number }): boolean =>
+    Boolean(
+      st.enabled &&
+        (st.host === config.LOOPBACK_HOST || st.host === 'localhost') &&
+        st.port === ourPort,
+    );
   return {
     async on(port) {
       await setProxy(await svc(), config.LOOPBACK_HOST, port);
     },
     async off() {
-      await clearProxy(await svc());
+      // Only disable when the live proxy is ours. A bare clearProxy here would
+      // clobber an unrelated corporate proxy if state().ours were wrong.
+      const st = await getProxyState(await svc());
+      if (isOurs(st)) await clearProxy(await svc());
     },
     async state() {
       try {
         const st = await getProxyState(await svc());
-        const ours =
-          st.enabled &&
-          (st.host === config.LOOPBACK_HOST || st.host === 'localhost') &&
-          st.port === ourPort;
+        const ours = isOurs(st);
         return { supported: true, enabled: st.enabled, host: st.host, port: st.port, ours };
       } catch (e) {
         return { supported: false, enabled: false, ours: false, detail: errMsg(e) };
@@ -845,6 +852,9 @@ async function cmdServe(args: string[]): Promise<number> {
         '  Serves the dashboard. The engine starts IDLE — start/stop capture and the\n' +
         '  system proxy from the dashboard (or use `sluice start` to bring both up now).\n' +
         '\n' +
+        '  --host H                 Limit TLS decrypt to adapter hosts plus H (repeatable).\n' +
+        '                           Without any --host / interceptHosts, every host is decrypted.\n' +
+        '  --all-hosts              Force decrypt everything (default when no hosts are set).\n' +
         '  --isolated               Run the capture engine in a separate process, so a\n' +
         '                           crash in the proxy cannot take the runner down; the\n' +
         '                           supervisor respawns it. Off by default (in-process).\n' +
@@ -875,20 +885,22 @@ async function cmdServe(args: string[]): Promise<number> {
   applyRetention(store, values.config);
   await seedWorkspaces(store, values['app-support']);
   materializeQuiet(store);
-  // BEFORE `selectApps`, because an external adapter's hosts widen the proxy's
-  // TLS-intercept list — the single most privacy-relevant thing loading one
-  // does. `describeDiscovery` prints those hosts, so the widening is stated
-  // every time rather than left in a config file someone edited months ago.
+  // External adapters can widen the scoped TLS list; print discovery either way.
   for (const line of describeDiscovery(await installExternalAdapters())) console.error(line);
   const adapters = selectApps(values.config);
   const sessions = await bestEffortSessions(values);
   for (const s of sessions) store.upsertSession(redactSession(s));
 
+  const scope = config.resolveInterceptScope({
+    config: cfg,
+    cliHosts: values.host,
+    cliAllHosts: values['all-hosts'],
+  });
   const { controller, wire } = makeController({
     proxyPort,
     adapters,
-    interceptHosts: [...(cfg.interceptHosts ?? []), ...(values.host ?? [])],
-    interceptAllHosts: values['all-hosts'] ?? cfg.interceptAllHosts ?? false,
+    interceptHosts: scope.interceptHosts,
+    interceptAllHosts: scope.interceptAllHosts,
     isolated: Boolean(values.isolated),
   });
 
@@ -979,8 +991,8 @@ async function cmdStart(args: string[]): Promise<number> {
   });
   if (values.help) {
     console.log('sluice start [--port N] [--proxy-port N] [--db PATH] [--token X --cookie Y]');
-    console.log('             [--host HOSTNAME]…   also decrypt these hosts (repeatable, wildcards ok)');
-    console.log('             [--all-hosts]        decrypt everything, not just the adapters\' hosts');
+    console.log('             [--host HOSTNAME]…   limit TLS decrypt to adapter hosts + these (repeatable)');
+    console.log('             [--all-hosts]        decrypt everything (default when no --host is set)');
     return 0;
   }
 
@@ -991,18 +1003,22 @@ async function cmdStart(args: string[]): Promise<number> {
   applyRetention(store, values.config);
   await seedWorkspaces(store, values['app-support']);
   materializeQuiet(store);
-  // Same order as serve: external adapters widen TLS intercept hosts — print them.
+  // External adapters can widen the scoped TLS list; print discovery either way.
   for (const line of describeDiscovery(await installExternalAdapters())) console.error(line);
   const adapters = selectApps(values.config);
   const sessions = await bestEffortSessions(values);
   for (const s of sessions) store.upsertSession(redactSession(s));
 
-  // EngineController owns lifecycle (same path as serve + dashboard control).
+  const scope = config.resolveInterceptScope({
+    config: cfg,
+    cliHosts: values.host,
+    cliAllHosts: values['all-hosts'],
+  });
   const { controller, wire } = makeController({
     proxyPort,
     adapters,
-    interceptHosts: [...(cfg.interceptHosts ?? []), ...(values.host ?? [])],
-    interceptAllHosts: values['all-hosts'] ?? cfg.interceptAllHosts ?? false,
+    interceptHosts: scope.interceptHosts,
+    interceptAllHosts: scope.interceptAllHosts,
     isolated: false,
   });
 

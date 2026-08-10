@@ -14,7 +14,7 @@ them):
 
 | Class | Engine A — MITM (`mitm-engine.ts`) | Engine C — CDP (`cdp-engine.ts`) | Engine C — extension (`packages/extension`) |
 |---|---|---|---|
-| **Scope gate** | TLS intercept list from adapter `hosts[]` + `--host`; non-matching CONNECT is opaque tunnel (no row) | Attaches to Chrome page targets; no host filter at CDP layer — adapter match sets `adapterId` or null | Default-deny host allowlist in `background.js`; unconfigured = inert |
+| **Scope gate** | **Default: all hosts** (TLS terminated for everything routed through the proxy). Optional scope via `--host` / `interceptHosts` / `interceptAllHosts: false` → adapter `hosts[]` + extras; non-matching CONNECT is opaque tunnel (no row) | Attaches to Chrome page targets; no host filter at CDP layer — adapter match sets `adapterId` or null | Default-deny host allowlist in `background.js`; unconfigured = inert |
 | **XHR / `fetch`** | Yes (full HTTP on intercepted hosts) | Yes only (`ResourceType` `XHR` \| `Fetch`) | Yes (MAIN-world patch of `fetch` + `XMLHttpRequest`) |
 | **Document / HTML navigations** | Yes if on intercepted host | **Dropped** (not XHR/Fetch) | No (not patched) |
 | **Scripts, CSS, images, fonts, media** | Yes if on intercepted host (can be noisy) | **Dropped** | No |
@@ -26,10 +26,11 @@ them):
 
 ### Design rules that matter for flows
 
-1. **Interception is scoped, not “interesting-only” on MITM.** Once a host is on
-   the TLS list, companion paths on that host are stored — flow clustering needs
-   them. Do not add a pre-store “API-shaped only” filter on Engine A without an
-   explicit product decision.
+1. **MITM defaults to full decrypt; scoping is opt-in.** With no host flags, Engine A
+   terminates TLS for every host so unknown services are still captured (unattributed
+   until an adapter claims them). Once you pass `--host` or set `interceptHosts` /
+   `interceptAllHosts: false`, non-listed hosts are CONNECT-tunnelled. Do not add a
+   pre-store “API-shaped only” filter on Engine A without an explicit product decision.
 2. **CDP deliberately drops non-XHR/Fetch.** Companions that only appear as
    document navigations or beacons will not join CDP bursts; prefer MITM or the
    extension for those clients, or accept thinner templates.

@@ -18,6 +18,7 @@
     "@sluice/app-trello": "workspace:*",
     "@sluice/app-gmail": "workspace:*",
     "@sluice/app-loom": "workspace:*",
+    "@sluice/app-linkedin": "workspace:*",
     "@sluice/adapter-sdk": "workspace:*"
   },
   "devDependencies": {

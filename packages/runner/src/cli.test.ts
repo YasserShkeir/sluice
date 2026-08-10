@@ -169,6 +169,14 @@ test('start --help documents the host scoping flags', async () => {
   assert.equal(code, 0);
   assert.match(out, /--host/);
   assert.match(out, /--all-hosts/);
+  assert.match(out, /default when no --host/i);
+});
+
+test('serve --help documents default all-host decrypt', async () => {
+  const { code, out } = await run('serve', '--help');
+  assert.equal(code, 0);
+  assert.match(out, /--host/);
+  assert.match(out, /every host is decrypted/i);
 });
 
 // ── export formats ───────────────────────────────────────────────────────────

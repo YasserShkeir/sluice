@@ -87,17 +87,47 @@ export interface SluiceConfig {
    */
   maxBodyBytes?: number;
   /**
-   * Extra hostnames Engine A may decrypt, beyond the installed adapters' own.
-   * Wildcards follow URLPattern (`*.notion.so`). This is how you reconnoitre a
-   * service that has no adapter yet.
+   * Extra hostnames to decrypt when TLS scoping is on (see `interceptAllHosts`).
+   * Wildcards follow URLPattern (`*.notion.so`). Combined with installed
+   * adapters' hosts. A non-empty list implies scoped intercept unless
+   * `interceptAllHosts` is explicitly true.
    */
   interceptHosts?: string[];
   /**
-   * Decrypt every host rather than the scoped list. Off by default and best left
-   * off: it puts unrelated traffic — other tabs, other apps — through the
-   * redactor and into `~/.sluice/sluice.db`.
+   * Decrypt every host rather than the adapter/extra list.
+   * **Default when omitted: true** — unknown services are captured without an
+   * adapter. Set `false` (or pass `--host` / `interceptHosts` without forcing
+   * all-hosts) to limit TLS termination and leave other traffic opaque.
    */
   interceptAllHosts?: boolean;
+}
+
+/**
+ * Resolve MITM TLS scope: CLI → config → default (all hosts).
+ *
+ * - Default / explicit all-hosts → decrypt everything.
+ * - Any `--host` / `interceptHosts` entry → scoped to adapters + those hosts
+ *   (unless all-hosts is forced on).
+ * - `interceptAllHosts: false` → scoped even with an empty host list.
+ */
+export function resolveInterceptScope(input: {
+  config: SluiceConfig;
+  /** Repeatable `--host` values from the CLI. */
+  cliHosts?: string[];
+  /** `--all-hosts` when the user passed the flag; omit when absent. */
+  cliAllHosts?: boolean;
+}): { interceptHosts: string[]; interceptAllHosts: boolean } {
+  const interceptHosts = [...(input.config.interceptHosts ?? []), ...(input.cliHosts ?? [])];
+  if (input.cliAllHosts === true || input.config.interceptAllHosts === true) {
+    return { interceptHosts, interceptAllHosts: true };
+  }
+  if (input.config.interceptAllHosts === false) {
+    return { interceptHosts, interceptAllHosts: false };
+  }
+  if (interceptHosts.length > 0) {
+    return { interceptHosts, interceptAllHosts: false };
+  }
+  return { interceptHosts, interceptAllHosts: true };
 }
 
 /** Identity helper so a config author gets type-checking and completion. */

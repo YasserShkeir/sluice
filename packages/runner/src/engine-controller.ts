@@ -164,7 +164,9 @@ export class EngineController {
         await this.supervisor.stop();
         this.supervisor = undefined;
       }
-      if (this.proxyOurs) await this.clearProxyInternal();
+      // Clear whether we set it via proxyOn() OR something else did (e.g.
+      // `sluice proxy on`) while still pointing at our loopback port.
+      await this.clearProxyIfPointingAtUs();
       if (this.engine) {
         await this.engine.stop();
         this.deps.onStatus(this.engine.status());
@@ -190,17 +192,34 @@ export class EngineController {
 
   proxyOff(): Promise<void> {
     return this.serialize(async () => {
-      await this.clearProxyInternal();
+      await this.clearProxyIfPointingAtUs();
       await this.emitEnvironment();
     });
   }
 
-  private async clearProxyInternal(): Promise<void> {
+  /**
+   * Drop the OS proxy when it routes at our MITM port.
+   *
+   * `proxyOurs` alone is not enough: `sluice proxy on` mutates the OS outside
+   * this controller, so a dashboard Stop / process exit would leave HTTPS
+   * black-holed on a dead loopback port. Also clear when `state().ours` is true.
+   */
+  private async clearProxyIfPointingAtUs(): Promise<void> {
+    let shouldClear = this.proxyOurs;
+    if (!shouldClear) {
+      try {
+        shouldClear = (await this.deps.proxy.state()).ours;
+      } catch {
+        shouldClear = false;
+      }
+    }
+    if (!shouldClear) {
+      this.proxyOurs = false;
+      return;
+    }
     try {
       await this.deps.proxy.off();
     } finally {
-      // Cleared regardless: if `off()` failed because it was not ours to clear,
-      // we still stop claiming it.
       this.proxyOurs = false;
     }
   }
@@ -210,10 +229,8 @@ export class EngineController {
    * system proxy cannot be allowed to keep pointing at it.
    */
   private async onTerminalFailure(): Promise<void> {
-    if (this.proxyOurs) {
-      await this.clearProxyInternal().catch(() => {});
-      void this.emitEnvironment();
-    }
+    await this.clearProxyIfPointingAtUs().catch(() => {});
+    void this.emitEnvironment();
   }
 
   private async emitEnvironment(): Promise<void> {
@@ -232,7 +249,7 @@ export class EngineController {
    */
   async shutdown(): Promise<void> {
     await this.supervisor?.stop().catch(() => {});
-    if (this.proxyOurs) await this.clearProxyInternal().catch(() => {});
+    await this.clearProxyIfPointingAtUs().catch(() => {});
     await this.engine?.stop().catch(() => {});
     this.engine = undefined;
     this.supervisor = undefined;

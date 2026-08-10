@@ -14,12 +14,13 @@ import { fastApp } from '@sluice/app-fast';
 import { trelloApp } from '@sluice/app-trello';
 import { gmailApp } from '@sluice/app-gmail';
 import { loomApp } from '@sluice/app-loom';
+import { linkedinApp } from '@sluice/app-linkedin';
 import { checkConformance } from '@sluice/adapter-sdk';
 import { discoverAdapters, readEnabledAdapterIds } from './discover.js';
 import type { DiscoverOptions, DiscoveryResult } from './discover.js';
 
 /** Every installed app, in registration order. `apps[0]` is the default. */
-export const apps: App[] = [slackApp, fastApp, trelloApp, gmailApp, loomApp];
+export const apps: App[] = [slackApp, fastApp, trelloApp, gmailApp, loomApp, linkedinApp];
 
 /**
  * Load every installed app's redaction contributions into the global policy, at
