@@ -33,7 +33,7 @@ import type {
   InteractionFlow,
   SqliteStore,
 } from '@sluice/core';
-import { looksLikeDeniedOperation } from '@sluice/core';
+import { looksLikeDeniedOperation, MASK } from '@sluice/core';
 import { learnRequestTemplate } from './faithful.js';
 import { isAssetCapture } from './flows.js';
 
@@ -59,7 +59,6 @@ const SESSION_KEYS = new Set([
   'cookie',
 ]);
 
-const MASK = '«redacted»';
 
 export interface LearnFlowTemplatesOptions {
   adapterId?: string;
@@ -569,11 +568,7 @@ function alignsWithPrimary(
     if (!primary) continue;
     const p = parseParams(primary)[key];
     if (p === undefined) continue;
-    const stepCap = obsList.find((o) => flow.steps.some((s) => s.captureId === o.capture.id));
-    // Fallback: any obs whose capture is in this flow
-    const inFlow =
-      stepCap ??
-      obsList.find((o) => flow.steps.some((s) => s.captureId === o.capture.id));
+    const inFlow = obsList.find((o) => flow.steps.some((s) => s.captureId === o.capture.id));
     if (!inFlow) continue;
     const s = parseParams(inFlow.capture)[key];
     if (s === undefined) continue;

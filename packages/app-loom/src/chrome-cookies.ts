@@ -93,7 +93,7 @@ export function locateLoomProfile(): { profile: string; cookiesPath: string } | 
     if (!existsSync(cookiesPath)) continue;
     const hasLoom = withCopiedDb(cookiesPath, (db) => {
       const row = db
-        .prepare(`SELECT COUNT(*) AS n FROM cookies WHERE host_key LIKE '%loom.com'`)
+        .prepare(`SELECT COUNT(*) AS n FROM cookies WHERE (host_key = 'loom.com' OR host_key = '.loom.com' OR host_key LIKE '%.loom.com')`)
         .get() as { n: number } | undefined;
       return (row?.n ?? 0) > 0;
     });
@@ -120,7 +120,7 @@ function readChromeLoomCookies(cookiesPath: string): RawCookie[] {
   try {
     return withCopiedDb(cookiesPath, (db) => {
       const rows = db
-        .prepare(`SELECT name, host_key, encrypted_value FROM cookies WHERE host_key LIKE '%loom.com'`)
+        .prepare(`SELECT name, host_key, encrypted_value FROM cookies WHERE (host_key = 'loom.com' OR host_key = '.loom.com' OR host_key LIKE '%.loom.com')`)
         .all() as Array<{ name: string; host_key: string; encrypted_value: Buffer }>;
       const out: RawCookie[] = [];
       for (const r of rows) {

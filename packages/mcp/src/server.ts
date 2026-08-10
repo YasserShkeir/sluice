@@ -142,14 +142,6 @@ const SYNTHETIC_SESSION: Session = {
   source: 'manual',
 };
 
-// ── Server construction ─────────────────────────────────────────────────────────
-
-/**
- * Build (but do not start) the MCP server bound to an already-open store.
- * Every tool is a thin, typed wrapper over `@sluice/core` store reads, except
- * `replay` / `sluice_replay_flow`, which are the network-touching tools.
- */
-
 /** Secret-free template summary for MCP describe/list. */
 function summarizeTemplate(t: {
   id: string;

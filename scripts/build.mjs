@@ -29,7 +29,7 @@
  * other command still parses only the ~130 KB entry.
  */
 import { build } from 'esbuild';
-import { chmodSync, cpSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { chmodSync, cpSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -71,6 +71,10 @@ const targets = [
 for (const target of targets) {
   const outdir = resolve(root, target.outdir);
   mkdirSync(outdir, { recursive: true });
+  // Drop stale code-split chunks so a renamed entry does not leave orphans that
+  // confuse size diffs and can be accidentally required by an old import map.
+  const chunksDir = resolve(outdir, 'chunks');
+  if (existsSync(chunksDir)) rmSync(chunksDir, { recursive: true, force: true });
   await build({
     entryPoints: [resolve(root, target.entry)],
     outdir,

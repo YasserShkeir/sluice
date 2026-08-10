@@ -29,6 +29,8 @@ import type {
   Adapter,
   Capture,
   CaptureClass,
+  CursorSeed,
+  ParseContext,
   Container,
   Item,
   ParseResult,
@@ -455,6 +457,73 @@ function buildReplayRequest(
 
 // ── The adapter ────────────────────────────────────────────────────────────────────
 
+
+/**
+ * Relay library / notifications pages → one more seed when hasNextPage.
+ * Depth-bounded by the runner; we only emit the opaque endCursor.
+ */
+export function loomNextCursors(capture: Capture, _ctx?: ParseContext): CursorSeed[] {
+  if (capture.host !== 'www.loom.com' || !capture.path.startsWith('/graphql')) return [];
+  if (typeof capture.status === 'number' && capture.status >= 400) return [];
+  if (!capture.resBody || !capture.reqBody) return [];
+  const root = obj(safeJsonObject(capture.resBody));
+  const data = root ? obj(root.data) : undefined;
+  if (!data) return [];
+
+  // Detect which op from the request body operationName / query prefix.
+  const req = obj(safeJsonObject(capture.reqBody));
+  const q = str(req?.query) ?? '';
+  const opName = str(req?.operationName) ?? '';
+  const isLibrary = opName.includes('LoomsForLibrary') || q.includes('GetLoomsForLibrary');
+  const isNotif = opName.includes('Notifications') || q.includes('GetCurrentUserNotifications');
+  if (!isLibrary && !isNotif) return [];
+
+  // Walk for first pageInfo with hasNextPage
+  function findPageInfo(node: unknown): { endCursor: string; hasNextPage: boolean } | undefined {
+    const o = obj(node);
+    if (!o) return undefined;
+    const pi = obj(o.pageInfo);
+    if (pi && pi.hasNextPage === true) {
+      const end = str(pi.endCursor);
+      if (end) return { endCursor: end, hasNextPage: true };
+    }
+    for (const v of Object.values(o)) {
+      if (v && typeof v === 'object') {
+        const hit = findPageInfo(v);
+        if (hit) return hit;
+      }
+    }
+    return undefined;
+  }
+  const page = findPageInfo(data);
+  if (!page) return [];
+
+  if (isLibrary) {
+    const vars = obj(req?.variables);
+    const limit = str(vars?.limit) ?? '12';
+    return [
+      {
+        adapterId: ADAPTER_ID,
+        actionId: 'loom.videos.library',
+        cursor: page.endCursor,
+        params: { limit, cursor: page.endCursor },
+        reason: 'cursor',
+      },
+    ];
+  }
+  const vars = obj(req?.variables);
+  const first = str(vars?.first) ?? '20';
+  return [
+    {
+      adapterId: ADAPTER_ID,
+      actionId: 'loom.notifications.list',
+      cursor: page.endCursor,
+      params: { first, cursor: page.endCursor },
+      reason: 'cursor',
+    },
+  ];
+}
+
 export const loomAdapter: Adapter = {
   id: ADAPTER_ID,
   displayName: 'Loom',
@@ -464,6 +533,9 @@ export const loomAdapter: Adapter = {
   },
   parse(capture) {
     return parseLoomCapture(capture);
+  },
+  nextCursors(capture, ctx) {
+    return loomNextCursors(capture, ctx);
   },
   classify(capture) {
     return classifyLoomCapture(capture);

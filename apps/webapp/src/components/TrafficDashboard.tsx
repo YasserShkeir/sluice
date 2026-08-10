@@ -361,12 +361,13 @@ export function TrafficDashboard({
         ? mergeLiveAndHydrated(listRef.current, flowHydrateRef.current)
         : listRef.current;
     const out: Capture[] = [];
+    const lq = localQuery(query);
     for (const c of pool) {
       // `body:` was answered by the server; skip it locally so a row the server
       // matched is not then rejected by a substring test over a body the client
       // may not even hold.
       if (bodyHits !== null && !bodyHits.has(c.id)) continue;
-      if (!matchesFilter(c, localQuery(query))) continue;
+      if (!matchesFilter(c, lq)) continue;
       out.push(c);
     }
     return out;
