@@ -57,6 +57,33 @@ Slack is just the **first adapter**. The architecture generalizes to Notion, Lin
 
 All three normalize into one data model and stream into a local web app that's part traffic inspector (à la Charles/mitmweb/Proxyman), part data explorer.
 
+![Sluice pipeline: sources feed three capture engines, which converge on a single ingest funnel that redacts, attributes, classifies and parses every exchange into a local SQLite store, read back by the dashboard, the MCP server and the CLI.](assets/architecture/01-pipeline.png)
+
+Every engine converges on **one ingest funnel**, so redaction, attribution and parsing happen in exactly one place no matter how a capture arrived.
+
+<details>
+<summary><b>Architecture in detail</b> — four more diagrams</summary>
+
+<br>
+
+**Capture engines — how each one decides what it is allowed to see.** Interception is *scoped, not filtered*: a host outside the intercept list is CONNECT-tunnelled as raw bytes, so no row is ever written for it. A service with no adapter and no `--host` entry looks "not captured" rather than captured-but-empty.
+
+![Engine A's scope decision, Engine C's XHR/Fetch-only filter and extension host allowlist, and Engine B's credential extraction.](assets/architecture/02-capture-engines.png)
+
+**Ingest and normalization.** Redaction runs *before* attribution, which is why each app registers its own token shapes into one global policy applied to all traffic.
+
+![The five ingest steps, the normalized model, and the cartographer's per-app table materialization.](assets/architecture/03-ingest-normalization.png)
+
+**Replay.** Three independent limits — method, operation, budget — sit below every caller, so a modified frontend or a creative tool argument cannot route around them.
+
+![Replay callers, the three safety gates, and the build-and-send chain from request template to stored capture.](assets/architecture/04-replay.png)
+
+**Control plane and consumers.** The engine lifecycle, the three per-session capability secrets, and the full MCP tool surface.
+
+![Engine lifecycle from serve to system proxy, the dashboard's token model, and the core plus app-contributed MCP tools.](assets/architecture/05-control-plane.png)
+
+</details>
+
 - 📄 **[Contributing →](./CONTRIBUTING.md)** — setup, the rules that matter, and how to add a service
 - 📄 **[Security & privacy →](./SECURITY.md)** — read this one
 
@@ -81,6 +108,8 @@ packages/cartographer  @sluice/cartographer  API map · per-app table materializ
 packages/apps          @sluice/apps          the installed-apps registry (the one place apps are named)
 packages/app-slack     @sluice/app-slack     Slack: adapter · parser · macOS credential provider
 packages/app-trello    @sluice/app-trello    Trello: adapter · Chrome-cookie credentials · MCP tool
+packages/app-gmail     @sluice/app-gmail     Gmail: positional-array sync API · thread/label MCP tools
+packages/app-loom      @sluice/app-loom      Loom: adapter · Chrome-cookie credentials · transcript MCP tool
 packages/app-fast      @sluice/app-fast      fast.com: credential-free adapter · speed-test MCP tool
 packages/mcp           @sluice/mcp           the `sluice-mcp` stdio MCP server
 packages/runner        @sluice/runner        the `sluice` CLI + loopback HTTP/WS server
