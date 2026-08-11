@@ -1,0 +1,82 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Sluice — ingest and normalization</title>
+<link rel="stylesheet" href="diagram.css">
+</head>
+<body>
+<h1>Ingest &amp; normalization</h1>
+<p class="subtitle">One funnel, one redactor, one shape for every service</p>
+<div class="rule"></div>
+
+<div class="body">
+
+  <div class="panel">
+    <header><h2>The funnel<small>live capture, extension POST, replay and sync all enter here</small></h2><span class="meta">runner/src/server.ts · ingestCapture()</span></header>
+    <div class="row">
+      <div class="card red"><h3>1 · sanitize</h3><p>Redact headers and both bodies <b>again</b>, before SQLite or the wire.</p></div>
+      <div class="arrow"><svg width="22" height="9" viewBox="0 0 22 9"><path d="M0 4.5h16" stroke="currentColor" stroke-width="1.5"/><path d="M15 0.5 21 4.5 15 8.5z" fill="currentColor"/></svg></div>
+      <div class="card blue"><h3>2 · attribute</h3><p>The capture's own <span class="mono">adapterId</span>, else the first app whose <span class="mono">matchRequest</span> claims it.</p></div>
+      <div class="arrow"><svg width="22" height="9" viewBox="0 0 22 9"><path d="M0 4.5h16" stroke="currentColor" stroke-width="1.5"/><path d="M15 0.5 21 4.5 15 8.5z" fill="currentColor"/></svg></div>
+      <div class="card blue"><h3>3 · classify</h3><p>The adapter's semantic operation, or <span class="mono">operationName(path)</span> as the fallback.</p></div>
+      <div class="arrow"><svg width="22" height="9" viewBox="0 0 22 9"><path d="M0 4.5h16" stroke="currentColor" stroke-width="1.5"/><path d="M15 0.5 21 4.5 15 8.5z" fill="currentColor"/></svg></div>
+      <div class="card blue"><h3>4 · store &amp; parse</h3><p>Insert the row, then <span class="mono">parse()</span> → <span class="mono">applyParseResult()</span>. Neither may throw.</p></div>
+      <div class="arrow"><svg width="22" height="9" viewBox="0 0 22 9"><path d="M0 4.5h16" stroke="currentColor" stroke-width="1.5"/><path d="M15 0.5 21 4.5 15 8.5z" fill="currentColor"/></svg></div>
+      <div class="card blue"><h3>5 · seed &amp; broadcast</h3><p>Enqueue <span class="mono">nextCursors()</span> seeds, push <span class="mono">capture.new</span>, debounce the catalog and materialize.</p></div>
+    </div>
+    <p class="note tight">Redaction runs <b>before</b> attribution — which is why each app's token shapes are folded into one global policy at import time rather than applied per adapter. Pause stops live ingest only; replay and sync still write.</p>
+  </div>
+
+  <div class="cols">
+    <div class="col">
+      <div class="panel grow">
+        <header><h2>Redaction policy<small>core/src/redact.ts</small></h2></header>
+        <div class="stack even">
+          <div class="card red"><h3>Generic rules</h3><p>Masks <span class="mono">authorization · cookie · set-cookie · proxy-authorization</span>, any credential-shaped header name, <span class="mono">Bearer …</span> values, and <span class="mono">token=</span>-style fields.</p></div>
+          <div class="card red"><h3>App-registered shapes</h3><p>Slack adds <span class="mono">xox*-</span> and two headers; Gmail adds its XSRF header. Registered for <i>all</i> traffic, not just that app's.</p></div>
+          <div class="card amber"><h3>publicParams</h3><p>The one rule that <b>preserves</b> a value: fast.com's <span class="mono">token</span> is public, and masking it would make the capture unreplayable.</p></div>
+        </div>
+      </div>
+    </div>
+
+    <div class="col">
+      <div class="panel grow">
+        <header><h2>Normalized model<small>five types every app maps onto</small></h2></header>
+        <div class="stack even">
+          <div class="card purple"><h3>Workspace → Container → Item</h3><p>A workspace holds containers (channel · dm · group · board · project · thread · other) which hold items (message · page · issue · other).</p></div>
+          <div class="card purple"><h3>Actor · Edge</h3><p>People, and the relationships between any two entities — <span class="mono">authored</span>, <span class="mono">member-of</span>, <span class="mono">in-label</span>, <span class="mono">mentions</span>.</p></div>
+          <div class="card purple"><h3>Provenance</h3><p>Items carry the capture ids they came from, so every row can be traced back to the bytes that produced it.</p></div>
+        </div>
+      </div>
+    </div>
+
+    <div class="col">
+      <div class="panel grow">
+        <header><h2>The store<small>~/.sluice/sluice.db · WAL</small></h2><span class="meta">core/src/schema.ts</span></header>
+        <div class="stack even">
+          <div class="card purple"><h3>11 tables + 2 FTS</h3><p><span class="mono">captures · workspaces · actors · containers · items · edges · sessions · cursors · interaction_flows(+_steps) · flow_templates</span></p></div>
+          <div class="card purple"><h3>Contentless FTS</h3><p><span class="mono">captures_fts</span> and <span class="mono">items_fts</span> index the plaintext but store no second copy; results join back on rowid.</p></div>
+          <div class="card red"><h3>Nowhere to put a secret</h3><p>There is no credentials table. Only a redacted session descriptor — kinds, never values — is persisted.</p></div>
+        </div>
+      </div>
+    </div>
+
+    <div class="col">
+      <div class="panel grow">
+        <header><h2>Cartographer<small>what the store makes of it</small></h2><span class="meta">packages/cartographer</span></header>
+        <div class="stack even">
+          <div class="card"><h3>API catalog</h3><p><span class="mono">sluice apidoc</span> groups captures by method + host + path into a Markdown endpoint reference. Scope it with <span class="mono">--host</span>.</p></div>
+          <div class="card"><h3>Per-app tables</h3><p><span class="mono">materialize()</span> mines <b>top-level response arrays</b> — not parsed entities — into typed <span class="mono">&lt;app&gt;_*</span> tables, rebuilt as traffic arrives.</p></div>
+          <div class="card"><h3>Flows &amp; templates</h3><p><span class="mono">learn-flows</span> clusters bursts into flows and distils multi-step templates with per-step timing and parameter bindings.</p></div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <p class="note">Schema changes are additive by construction: <span class="mono">CREATE TABLE IF NOT EXISTS</span> does nothing to an existing database, so a new column goes in both the create statement and the additive-column map, and its index runs only after the <span class="mono">ALTER</span>s.</p>
+</div>
+
+<footer><span>Sluice — architecture reference · generated from source</span><span>3 / 5</span></footer>
+</body>
+</html>

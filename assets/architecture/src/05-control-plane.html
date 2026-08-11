@@ -1,0 +1,86 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Sluice — control plane and consumers</title>
+<link rel="stylesheet" href="diagram.css">
+</head>
+<body>
+<h1>Control plane &amp; consumers</h1>
+<p class="subtitle">What the runner exposes, to whom, and behind which secret</p>
+<div class="rule"></div>
+
+<div class="body">
+
+  <div class="panel">
+    <header><h2>Three ways to run it<small>same server, different capabilities</small></h2><span class="meta">packages/runner/src/cli.ts</span></header>
+    <div class="row">
+      <div class="card"><h3>sluice serve</h3><p>Dashboard + API. The engine starts <b>idle</b> — you start it from the UI. Adds <span class="mono">--isolated</span>, <span class="mono">--ingest</span> and <span class="mono">--terminal</span>.</p></div>
+      <div class="card green"><h3>sluice start</h3><p>serve, plus the MITM engine immediately. Prints the <span class="mono">--proxy-server</span> line to route a desktop app; it never sets the system proxy for you.</p></div>
+      <div class="card green"><h3>sluice capture</h3><p>Passive CDP capture in a dedicated Chrome. No proxy, no CA, no Keychain — and no engine controls in the UI.</p></div>
+      <div class="card"><h3>sluice mock</h3><p>Replays a recorded NDJSON fixture through the real ingest path, credential-free.</p></div>
+    </div>
+  </div>
+
+  <div class="cols">
+    <div class="col">
+      <div class="panel grow">
+        <header><h2>Engine lifecycle<small>one controller</small></h2></header>
+        <div class="stack even">
+          <div class="card blue"><h3>Serialized by design</h3><p>Every start, stop and proxy change queues on one promise, so a double-click cannot start two engines.</p></div>
+          <div class="card blue"><h3>Supervised</h3><p>A fresh supervisor per start: probe the proxy port every 5s, at most 5 restarts, backing off 1 → 16s.</p></div>
+          <div class="card red"><h3>Ordered teardown</h3><p>Supervisor first, then the system proxy — cleared <b>only if it still points at us</b> — then the engine.</p></div>
+        </div>
+      </div>
+    </div>
+
+    <div class="col">
+      <div class="panel grow">
+        <header><h2>Capability secrets<small>three doors, three keys</small></h2></header>
+        <div class="stack even">
+          <div class="card amber"><h3>read token</h3><p>Gates <span class="mono">/ws</span> and every <span class="mono">GET /api/*</span>. Travels in the URL fragment, never in the served page.</p></div>
+          <div class="card amber"><h3>pty token</h3><p>Only with <span class="mono">--terminal</span>. Gates <span class="mono">/pty</span> alone — the read token cannot open a terminal.</p></div>
+          <div class="card amber"><h3>ingest token</h3><p>Only with <span class="mono">--ingest</span>. Gates the single <span class="mono">POST /api/ingest</span> the extension uses.</p></div>
+        </div>
+      </div>
+    </div>
+
+    <div class="col">
+      <div class="panel grow">
+        <header><h2>Dashboard channel<small>apps/webapp</small></h2></header>
+        <div class="stack even">
+          <div class="card"><h3>One socket</h3><p>Subscribe, then a primed backfill followed by live frames. A 500-frame ring lets a reconnect resume instead of re-priming.</p></div>
+          <div class="card"><h3>Validated inwards only</h3><p>Client frames are schema-checked and refused out loud; server frames are built in-process.</p></div>
+          <div class="card"><h3>Seven routes</h3><p>Overview · Traffic · Apps · Explore · Replay · Data, plus a per-app detail page.</p></div>
+        </div>
+      </div>
+    </div>
+
+    <div class="col">
+      <div class="panel grow">
+        <header><h2>MCP surface<small>29 tools over stdio</small></h2></header>
+        <div class="stack even">
+          <div class="card purple"><h3>11 core</h3><p>Nine read straight from the store; only <span class="mono">replay</span> and <span class="mono">sluice_replay_flow</span> touch the network.</p></div>
+          <div class="card purple"><h3>18 app-contributed</h3><p>gmail 5 · linkedin 7 · loom 4 · trello 1 · fast 1 · slack 0, each prefixed with its app id.</p></div>
+          <div class="card red"><h3>Narrowed store</h3><p>App tools get a nine-method read-only projection — no writers, no raw handle, no capture bodies.</p></div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="panel">
+    <header><h2>Read-only HTTP API<small>same origin, same token, GET only — every mutation goes over the socket</small></h2><span class="meta">runner/src/api.ts</span></header>
+    <div class="row">
+      <div class="card"><h3>Traffic</h3><p><span class="mono">/api/captures</span> · <span class="mono">/captures/search</span> · <span class="mono">/captures/:id/body</span> · <span class="mono">/captures/:id/entities</span></p></div>
+      <div class="card"><h3>Entities</h3><p><span class="mono">/api/workspaces</span> · <span class="mono">/containers</span> · <span class="mono">/actors</span> · <span class="mono">/items</span> · <span class="mono">/sessions</span></p></div>
+      <div class="card"><h3>Derived</h3><p><span class="mono">/api/tables</span> · <span class="mono">/tables/:name</span> · <span class="mono">/apidoc</span> · <span class="mono">/flows</span> · <span class="mono">/flow-templates</span></p></div>
+      <div class="card"><h3>Runtime</h3><p><span class="mono">/api/status</span> · <span class="mono">/storage</span> · <span class="mono">/adapters</span></p></div>
+    </div>
+  </div>
+
+  <p class="note">Every listener binds <span class="mono">127.0.0.1</span>, checks the Host and Origin headers, compares its token in constant time, and serves pages under a CSP that permits no external origin. Table names reaching SQL are matched against the live schema first, so only materialized <span class="mono">&lt;app&gt;_*</span> tables are reachable.</p>
+</div>
+
+<footer><span>Sluice — architecture reference · generated from source</span><span>5 / 5</span></footer>
+</body>
+</html>
