@@ -1,0 +1,169 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Sluice — the whole pipeline</title>
+<link rel="stylesheet" href="diagram.css">
+</head>
+<body>
+<h1>The whole pipeline</h1>
+<p class="subtitle">Where traffic comes from, what records it, and what reads it back</p>
+<div class="rule"></div>
+
+<div class="body">
+  <div class="cols">
+
+    <div class="col">
+      <div class="panel grow">
+        <header><h2>Sources<small>traffic you already make</small></h2></header>
+        <div class="stack even">
+          <div class="card">
+            <div class="kicker">Engine A</div>
+            <h3>Browser &amp; desktop app</h3>
+            <p>Routed through the local proxy on <span class="mono">127.0.0.1:8080</span>.</p>
+          </div>
+          <div class="card">
+            <div class="kicker">Engine C</div>
+            <h3>Chrome tab</h3>
+            <p>Attached over DevTools on <span class="mono">:9222</span>.</p>
+          </div>
+          <div class="card">
+            <div class="kicker">Engine C</div>
+            <h3>Page JS</h3>
+            <p><span class="mono">fetch</span>/<span class="mono">XHR</span> patched in the MAIN world.</p>
+          </div>
+          <div class="card">
+            <div class="kicker">Engine B</div>
+            <h3>Your session</h3>
+            <p>Keychain · Chrome cookie DB · Slack LevelDB.</p>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="arrow"><svg width="22" height="9" viewBox="0 0 22 9"><path d="M0 4.5h16" stroke="currentColor" stroke-width="1.5"/><path d="M15 0.5 21 4.5 15 8.5z" fill="currentColor"/></svg></div>
+
+    <div class="col">
+      <div class="panel grow">
+        <header><h2>Capture engines<small>A · B · C</small></h2></header>
+        <div class="stack even">
+          <div class="card green">
+            <h3>A — MITM proxy</h3>
+            <p>mockttp. Decrypts <b>every host by default</b>; out-of-scope hosts tunnel blind.</p>
+          </div>
+          <div class="card green">
+            <h3>C — CDP capture</h3>
+            <p>Chrome Network events, XHR/Fetch only. One client per tab.</p>
+          </div>
+          <div class="card green">
+            <h3>C — MV3 extension</h3>
+            <p>In-page patch → worker → <span class="mono">POST /api/ingest</span>.</p>
+          </div>
+          <div class="card green">
+            <h3>B — replay</h3>
+            <p>A synthetic request from a learned template plus a live session.</p>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="arrow"><svg width="22" height="9" viewBox="0 0 22 9"><path d="M0 4.5h16" stroke="currentColor" stroke-width="1.5"/><path d="M15 0.5 21 4.5 15 8.5z" fill="currentColor"/></svg></div>
+
+    <div class="col">
+      <div class="panel grow">
+        <header><h2>Ingest funnel<small>one path for every engine</small></h2></header>
+        <div class="stack even">
+          <div class="card red">
+            <div class="kicker">Always</div>
+            <h3>sanitizeCapture()</h3>
+            <p>Redacts headers and bodies again, before SQLite or the wire.</p>
+          </div>
+          <div class="card blue">
+            <h3>adapterFor() → classify()</h3>
+            <p>First app whose <span class="mono">matchRequest</span> claims it, then its operation.</p>
+          </div>
+          <div class="card blue">
+            <h3>parse() → applyParseResult()</h3>
+            <p>One capture → workspaces, actors, containers, items, edges.</p>
+          </div>
+          <div class="card blue">
+            <h3>nextCursors()</h3>
+            <p>Seeds the pagination worklist. Enqueue only — never call.</p>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="arrow"><svg width="22" height="9" viewBox="0 0 22 9"><path d="M0 4.5h16" stroke="currentColor" stroke-width="1.5"/><path d="M15 0.5 21 4.5 15 8.5z" fill="currentColor"/></svg></div>
+
+    <div class="col">
+      <div class="panel grow">
+        <header><h2>Store<small>~/.sluice/sluice.db</small></h2></header>
+        <div class="stack even">
+          <div class="card purple">
+            <h3>captures</h3>
+            <p>The raw exchange plus tab and page-load ids. FTS-searchable.</p>
+          </div>
+          <div class="card purple">
+            <h3>normalized model</h3>
+            <p><span class="mono">workspaces · actors · containers · items · edges · sessions · cursors</span></p>
+          </div>
+          <div class="card purple">
+            <h3>interaction flows</h3>
+            <p>Observed bursts, their steps, and learned templates.</p>
+          </div>
+          <div class="card purple">
+            <h3>per-app tables</h3>
+            <p>Typed <span class="mono">&lt;app&gt;_*</span> tables mined from real responses.</p>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="arrow"><svg width="22" height="9" viewBox="0 0 22 9"><path d="M0 4.5h16" stroke="currentColor" stroke-width="1.5"/><path d="M15 0.5 21 4.5 15 8.5z" fill="currentColor"/></svg></div>
+
+    <div class="col">
+      <div class="panel grow">
+        <header><h2>Consumers<small>read-only</small></h2></header>
+        <div class="stack even">
+          <div class="card">
+            <h3>Dashboard</h3>
+            <p>React SPA on <span class="mono">127.0.0.1:7788</span>, live over WebSocket.</p>
+          </div>
+          <div class="card">
+            <h3>MCP server</h3>
+            <p>stdio. 11 core tools + 18 contributed by the six apps.</p>
+          </div>
+          <div class="card">
+            <h3>HTTP API</h3>
+            <p>17 read-only GET routes on the same origin and token.</p>
+          </div>
+          <div class="card">
+            <h3>CLI</h3>
+            <p>24 commands — <span class="mono">doctor · start · capture · apidoc · flows · replay · wipe</span> …</p>
+          </div>
+        </div>
+      </div>
+    </div>
+
+  </div>
+
+  <p class="note">Interception is scoped, not filtered: a host outside the scope is CONNECT-tunnelled as raw bytes, so no row is ever written for it. Because the default is to decrypt everything, a service with no adapter still lands in <span class="mono">captures</span> — unattributed, redacted and visible — rather than silently missing.</p>
+
+  <div class="panel">
+    <header><h2>Control plane</h2><span class="meta">packages/runner</span></header>
+    <div class="row">
+      <div class="card"><h3>sluice serve</h3><p>HTTP + WS on <span class="mono">:7788</span>, loopback only</p></div>
+      <div class="arrow"><svg width="22" height="9" viewBox="0 0 22 9"><path d="M0 4.5h16" stroke="currentColor" stroke-width="1.5"/><path d="M15 0.5 21 4.5 15 8.5z" fill="currentColor"/></svg></div>
+      <div class="card blue"><h3>EngineController</h3><p>serialized start / stop / proxy</p></div>
+      <div class="arrow"><svg width="22" height="9" viewBox="0 0 22 9"><path d="M0 4.5h16" stroke="currentColor" stroke-width="1.5"/><path d="M15 0.5 21 4.5 15 8.5z" fill="currentColor"/></svg></div>
+      <div class="card blue"><h3>Supervisor</h3><p>port probe every 5s, ≤5 restarts</p></div>
+      <div class="arrow"><svg width="22" height="9" viewBox="0 0 22 9"><path d="M0 4.5h16" stroke="currentColor" stroke-width="1.5"/><path d="M15 0.5 21 4.5 15 8.5z" fill="currentColor"/></svg></div>
+      <div class="card red"><h3>system proxy</h3><p><span class="mono">networksetup</span>, cleared only if it still points at us</p></div>
+    </div>
+  </div>
+</div>
+
+<footer><span>Sluice — architecture reference · generated from source</span><span>1 / 5</span></footer>
+</body>
+</html>

@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Sluice — replay</title>
+<link rel="stylesheet" href="diagram.css">
+</head>
+<body>
+<h1>Replay</h1>
+<p class="subtitle">Reading your session without being able to act as you</p>
+<div class="rule"></div>
+
+<div class="body">
+
+  <div class="panel">
+    <header><h2>Callers</h2><span class="meta">the rails sit below all of them, so a modified frontend cannot route around them</span></header>
+    <div class="row">
+      <div class="card"><h3>CLI</h3><p><span class="mono">sluice replay</span> · <span class="mono">--flow</span> · <span class="mono">--all</span> · <span class="mono">sync</span></p></div>
+      <div class="card"><h3>Dashboard</h3><p><span class="mono">replay.run</span> over the WebSocket</p></div>
+      <div class="card"><h3>MCP tools</h3><p><span class="mono">replay</span> · <span class="mono">sluice_replay_flow</span></p></div>
+      <div class="card"><h3>App tools</h3><p><span class="mono">ctx.replay</span> — never a bare fetch</p></div>
+    </div>
+  </div>
+
+  <div class="panel">
+    <header><h2>Replay safety rails<small>three independent limits; a request must clear all three</small></h2><span class="meta">interceptor/src/replay-policy.ts · core/src/replay-deny.ts</span></header>
+    <div class="row">
+      <div class="card red"><h3>1 · Method</h3><p>GET, HEAD and POST only. PUT / PATCH / DELETE are refused outright — they can only mutate.<br><span class="mono">→ method_not_allowed</span></p></div>
+      <div class="card red"><h3>2 · Operation</h3><p>Matched against the path, query <b>and</b> body, because a service can POST for an ordinary read — <span class="mono">chat.post* · admin.* · files.upload|delete · conversations.create|invite · reactions · oauth|auth.token · GraphQL mutation</span>.<br><span class="mono">→ operation_not_allowed</span></p></div>
+      <div class="card red"><h3>3 · Budget</h3><p>A process-global token bucket — 60 requests per 60s — plus single-flight serialization, shared by the CLI, the dashboard, sync and every MCP tool.<br><span class="mono">→ rate_budget_exhausted</span></p></div>
+    </div>
+    <p class="note tight">Sluice can read your session; it cannot act as you. That property is enforced here rather than in the UI, and the same three gates apply to every step of a multi-step flow.</p>
+  </div>
+
+  <div class="panel">
+    <header><h2>Build and send</h2><span class="meta">cartographer/src/faithful.ts · interceptor/src/replay.ts</span></header>
+    <div class="row">
+      <div class="card blue"><h3>buildReplayRequest()</h3><p>The app turns a replay action plus params into a request, reading secrets from the in-memory session.</p></div>
+      <div class="arrow"><svg width="22" height="9" viewBox="0 0 22 9"><path d="M0 4.5h16" stroke="currentColor" stroke-width="1.5"/><path d="M15 0.5 21 4.5 15 8.5z" fill="currentColor"/></svg></div>
+      <div class="card blue"><h3>faithful fingerprint</h3><p>Headers and stable params learned by diffing the eight most recent real captures of that endpoint.</p></div>
+      <div class="arrow"><svg width="22" height="9" viewBox="0 0 22 9"><path d="M0 4.5h16" stroke="currentColor" stroke-width="1.5"/><path d="M15 0.5 21 4.5 15 8.5z" fill="currentColor"/></svg></div>
+      <div class="card amber"><h3>sendable headers</h3><p>HTTP/2 pseudo-headers (<span class="mono">:method</span>, <span class="mono">:authority</span>) and non-byte values are dropped — undici rejects both.</p></div>
+      <div class="arrow"><svg width="22" height="9" viewBox="0 0 22 9"><path d="M0 4.5h16" stroke="currentColor" stroke-width="1.5"/><path d="M15 0.5 21 4.5 15 8.5z" fill="currentColor"/></svg></div>
+      <div class="card"><h3>fetch</h3><p>20s abort covering the body read. Any HTTP status comes back as a capture; only a network failure throws.</p></div>
+      <div class="arrow"><svg width="22" height="9" viewBox="0 0 22 9"><path d="M0 4.5h16" stroke="currentColor" stroke-width="1.5"/><path d="M15 0.5 21 4.5 15 8.5z" fill="currentColor"/></svg></div>
+      <div class="card purple"><h3>stored as source='replay'</h3><p>Redacted, ingested and parsed like live traffic, so a replay is visible in the same table.</p></div>
+    </div>
+  </div>
+
+  <div class="panel">
+    <header><h2>Multi-step flows<small>sluice replay --flow · sluice_replay_flow</small></h2></header>
+    <div class="row">
+      <div class="card blue"><h3>Learned offline</h3><p><span class="mono">learn-flows</span> clusters observed bursts into templates. MCP only reads and replays them, and templates never train on replay traffic.</p></div>
+      <div class="card blue"><h3>Paced, not chained</h3><p>Each step waits the median offset measured <i>from the primary</i>, capped at 2s; skipping a soft companion cannot desync the rest. Whole flow: 120s.</p></div>
+      <div class="card red"><h3>One extra rail</h3><p>Each step is also checked against the owning adapter's host list, and an unresolvable path id fails the build rather than guessing.</p></div>
+    </div>
+  </div>
+
+  <p class="note">Credential refresh sits <b>above</b> the rails, never inside them: on an auth failure the session is re-extracted once and the request rebuilt from the fresh one — both attempts recorded. A flow restarts from the top rather than resuming, because earlier steps may already have bound the stale session.</p>
+</div>
+
+<footer><span>Sluice — architecture reference · generated from source</span><span>4 / 5</span></footer>
+</body>
+</html>

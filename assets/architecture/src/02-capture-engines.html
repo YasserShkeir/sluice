@@ -1,0 +1,73 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Sluice — capture engines</title>
+<link rel="stylesheet" href="diagram.css">
+</head>
+<body>
+<h1>Capture engines</h1>
+<p class="subtitle">How each engine decides what it is allowed to see</p>
+<div class="rule"></div>
+
+<div class="body">
+
+  <div class="panel grow">
+    <header><h2>Engine A — MITM proxy<small>a local HTTPS proxy you route a client through</small></h2><span class="meta">interceptor/src/mitm-engine.ts</span></header>
+    <div class="row grow">
+      <div class="card"><h3>Routed client</h3><p>Browser via the macOS system proxy, or a desktop app launched with <span class="mono">--proxy-server=127.0.0.1:8080</span>.</p></div>
+      <div class="arrow"><svg width="22" height="9" viewBox="0 0 22 9"><path d="M0 4.5h16" stroke="currentColor" stroke-width="1.5"/><path d="M15 0.5 21 4.5 15 8.5z" fill="currentColor"/></svg></div>
+      <div class="card amber"><h3>TLS scope decision</h3><p><b>Default: decrypt every host.</b> Any <span class="mono">--host</span> / <span class="mono">interceptHosts</span> entry — or <span class="mono">interceptAllHosts: false</span> — narrows it to the adapters' hosts plus those, each with a <span class="mono">*.host</span> wildcard.</p></div>
+      <div class="arrow"><svg width="22" height="9" viewBox="0 0 22 9"><path d="M0 4.5h16" stroke="currentColor" stroke-width="1.5"/><path d="M15 0.5 21 4.5 15 8.5z" fill="currentColor"/></svg></div>
+      <div class="card green"><h3>In scope → decrypted</h3><p>Passed straight through, never rewritten. Text bodies only, capped at 5 MB. WebSocket text frames become their own captures.</p></div>
+      <div class="card red"><h3>Out of scope → tunnelled</h3><p>CONNECT'd as raw bytes. Sluice cannot read it, so it cannot store it — a stronger guarantee than redacting it afterwards.</p></div>
+    </div>
+  </div>
+
+  <div class="cols">
+    <div class="col">
+      <div class="panel grow">
+        <header><h2>Engine C — CDP<small>sluice capture</small></h2><span class="meta">cdp-engine.ts</span></header>
+        <div class="stack even">
+          <div class="card green"><h3>Attach, don't proxy</h3><p>Chrome runs with <span class="mono">--remote-debugging-port=9222</span> and its own profile. The engine issues no requests of its own — no CA, no proxy.</p></div>
+          <div class="card green"><h3>XHR / Fetch only</h3><p>One CDP client per page target, re-scanned every 2s. Documents, scripts, images, media and beacons are dropped before a row exists.</p></div>
+        </div>
+      </div>
+    </div>
+
+    <div class="col">
+      <div class="panel grow">
+        <header><h2>Engine C — extension<small>serve --ingest</small></h2><span class="meta">packages/extension</span></header>
+        <div class="stack even">
+          <div class="card green"><h3>Two worlds, one bridge</h3><p>MAIN-world patch of <span class="mono">fetch</span>/<span class="mono">XHR</span> → <span class="mono">postMessage</span> → ISOLATED-world bridge that re-validates and re-clips at 512 KiB.</p></div>
+          <div class="card green"><h3>Default-deny hosts</h3><p>The MV3 worker sends nothing until an endpoint, an ingest token and an explicit host list are set. Batches of ≤500, flushed at 50 or 2s.</p></div>
+        </div>
+      </div>
+    </div>
+
+    <div class="col">
+      <div class="panel grow">
+        <header><h2>Engine B — your session<small>read on demand, never stored</small></h2><span class="meta">app-*/src</span></header>
+        <div class="stack even">
+          <div class="card blue"><h3>Slack</h3><p>The <span class="mono">xoxc</span> token from Slack desktop's LevelDB plus the <span class="mono">d</span> cookie, decrypted with the <i>Slack Safe Storage</i> Keychain item.</p></div>
+          <div class="card blue"><h3>Trello · Loom · LinkedIn</h3><p>Chrome's per-profile cookie DB via <i>Chrome Safe Storage</i>; LinkedIn also derives a <span class="mono">csrf-token</span> from JSESSIONID. Gmail and fast.com need none.</p></div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="panel">
+    <header><h2>What Engine A keeps separate<small>each step is its own deliberate command</small></h2></header>
+    <div class="row">
+      <div class="card"><h3>Generating the CA</h3><p><span class="mono">sluice start</span> mints <span class="mono">sluice-ca.key</span>/<span class="mono">.cert</span> under Application Support if they are missing. That alone decrypts nothing.</p></div>
+      <div class="card red"><h3>Trusting the CA</h3><p><span class="mono">sluice ca-install</span> adds it to the login keychain — a separate, deliberate step, reversed by <span class="mono">ca-uninstall</span>.</p></div>
+      <div class="card blue"><h3>Isolating the engine</h3><p><span class="mono">serve --isolated</span> runs the proxy in its own process, speaking NDJSON over fd 3. It carries no adapters: attribution and parsing stay in the parent.</p></div>
+    </div>
+  </div>
+
+  <p class="note">Every engine redacts at its own boundary — <span class="mono">redactUrl</span>, <span class="mono">redactHeaders</span>, <span class="mono">redactText</span> — before the capture leaves the module, and the runner redacts again on ingest. Attribution is separate: an unrecognised service is stored with <span class="mono">adapter_id NULL</span> rather than dropped.</p>
+</div>
+
+<footer><span>Sluice — architecture reference · generated from source</span><span>2 / 5</span></footer>
+</body>
+</html>
