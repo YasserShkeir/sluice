@@ -26,7 +26,7 @@
  * supported Node. But mockttp is ~12 MB once inlined, and only `sluice start`
  * ever touches it — so `splitting: true` keeps it in its own chunk that the
  * existing `await import('mockttp')` in mitm-engine.ts loads on demand. Every
- * other command still parses only the ~130 KB entry.
+ * other command still parses only the entry plus its shared chunk (~0.5 MB).
  */
 import { build } from 'esbuild';
 import { chmodSync, cpSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
@@ -68,13 +68,20 @@ const targets = [
   },
 ];
 
-for (const target of targets) {
-  const outdir = resolve(root, target.outdir);
+// Drop stale code-split chunks so a renamed entry does not leave orphans that
+// confuse size diffs and can be accidentally required by an old import map.
+// Once per OUTDIR, before any target builds: the runner CLI and the engine child
+// share `packages/runner/dist`, so clearing inside the loop deleted the chunks the
+// previous target had just emitted and left `cli.js` importing files that no longer
+// existed (ERR_MODULE_NOT_FOUND on every invocation).
+for (const outdir of new Set(targets.map((t) => resolve(root, t.outdir)))) {
   mkdirSync(outdir, { recursive: true });
-  // Drop stale code-split chunks so a renamed entry does not leave orphans that
-  // confuse size diffs and can be accidentally required by an old import map.
   const chunksDir = resolve(outdir, 'chunks');
   if (existsSync(chunksDir)) rmSync(chunksDir, { recursive: true, force: true });
+}
+
+for (const target of targets) {
+  const outdir = resolve(root, target.outdir);
   await build({
     entryPoints: [resolve(root, target.entry)],
     outdir,
