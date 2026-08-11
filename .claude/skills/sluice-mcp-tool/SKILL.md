@@ -5,31 +5,68 @@ description: Add or change an MCP tool in Sluice — either an app-contributed t
 
 # Adding an MCP tool to Sluice
 
-Sluice exposes one MCP server (`packages/mcp`, binary name `sluice-mcp`) built by
-`buildServer(store)` in `packages/mcp/src/server.ts`. There are two places a tool
-can live, and picking the wrong one is the main thing to get right.
+Sluice exposes one MCP stdio server (`packages/mcp`, binary `sluice-mcp`) built by
+`buildServer(store)` in `packages/mcp/src/server.ts`. It advertises 11 core tools
+plus every tool contributed by the machine's *enabled* apps — 18 today (fast 1,
+trello 1, gmail 5, loom 4, linkedin 7; Slack contributes none), for 29 total on a
+machine with no `adapters` allow-list.
+
+There are two places a tool can live, and picking the wrong one is the main thing
+to get right.
 
 ## Which seam?
 
-**Core tool** — put it directly in `buildServer` when the tool is generic over
-every app and reads the normalized store: workspaces, containers, items,
-captures, replay. These are thin, typed wrappers over `SqliteStore` reads and are
-service-agnostic (`list_workspaces`, `list_channels`, `get_messages`).
+Two questions decide it. The second one is the harder constraint.
 
-**App-contributed tool** — put it in the app's `mcpTools()` when it is specific to
-one service (`fast_speed_test`, `trello_my_cards`). The server discovers these
-generically:
+**Does `packages/mcp` have to name a specific app?** If yes, it belongs in the
+app. The spine never imports an app package.
+
+**What store access does it need?**
+
+| | Core tool | App tool |
+| --- | --- | --- |
+| Store | the full read-write `SqliteStore`, closed over | `ctx.store = readOnlyStore(store)` |
+| Raw SQL | yes — `rawDb(store)` backs `list_endpoints`, `search_captures`, `describe_endpoint` | no `db` handle at all |
+| Writes | `insertCapture`, `applyParseResult`, `upsertFlow` | none |
+| Network | `runReplay` directly | `ctx.replay` / `ctx.replayFlow` |
+
+`readOnlyStore` is a narrowing **by value**, not merely by type: it returns a
+fresh object of nine bound reads — `listWorkspaces`, `listContainers`, `listItems`,
+`queryItems`, `countItems`, `searchItems`, `listEdges`, `countCaptures`,
+`newestCaptureTs`. A test asserts `db`, `insertCapture`, `applyParseResult`,
+`upsertItem`, `upsertSession`, `listSessions`, `pruneCaptures` and `close` are all
+absent. It also returns no `Capture` at all — coverage questions are answered by
+`countCaptures` and `newestCaptureTs` so capture bodies (up to 5 MB) never reach
+an app tool.
+
+**So a tool that needs to write, or needs raw SQL, cannot be an app tool.** If
+that is what your service-specific tool needs, either reshape it to a read, or
+argue for a new read on `ReadOnlyStore` in `packages/core/src/store.ts` — do not
+widen the projection ad hoc.
+
+The core tools today: `list_workspaces`, `list_channels`, `get_messages`,
+`list_endpoints`, `search_captures`, `describe_endpoint`, `replay`,
+`sluice_list_flows`, `sluice_describe_flow`, `sluice_replay_flow`, `auth_flow`.
+Note the single-request replay tool is registered as plain **`replay`** — there is
+no tool named `sluice_replay`, and only the three flow tools carry the `sluice_`
+prefix.
+
+App tools are discovered generically, over the **enabled** apps:
 
 ```ts
-for (const app of apps) {
+for (const app of enabledApps()) {
+  const ctx: AppToolContext = { store: readOnlyStore(store), replay, replayFlow };
   for (const t of app.mcpTools?.() ?? []) {
-    server.registerTool(t.name, { title: t.name, description: t.description, inputSchema: … }, handler);
+    const inputSchema = (t.inputSchema ?? {}) as ZodRawShape;
+    server.registerTool(t.name, { title: t.name, description: t.description, inputSchema }, handler);
   }
 }
 ```
 
-Rule of thumb: if writing it would require `packages/mcp` to import a specific
-app package, it belongs in the app instead. The spine never names concrete apps.
+`enabledApps()`, not `apps`: the `adapters` allow-list in `~/.sluice/config.json`
+narrows the advertised tool surface per machine (an unknown id in that array
+throws at startup). A client that installed Sluice only for Gmail should not be
+spending its tool budget on Slack's and Trello's.
 
 ## Core tool shape
 
@@ -60,111 +97,142 @@ content blocks.
 
 ## App-contributed tool shape
 
+Prefix the name with the app id — a test enforces that every app tool name starts
+with `${app.id}_`, because all apps land in one flat namespace on one server.
+
 ```ts
-const fastMcpTools: AppMcpTool[] = [
+const loomMcpTools: AppMcpTool[] = [
   {
-    name: 'fast_speed_test',
-    description: 'Run an internet speed test via fast.com (Netflix Open Connect): fetch the config, download a range from a CDN target, report Mbps.',
-    run: () => runSpeedTest(),
+    name: 'loom_get_video',
+    description:
+      'Fetch one Loom video by its id (name, owner, privacy, view/comment/reaction counts, thumbnail, shareUrl). The id is the 32-char token in a share URL (loom.com/share/<id>).',
+    inputSchema: { videoId: z.string() },       // a zod RAW SHAPE, not z.object(...)
+    run: (args, ctx) => getVideo(args, ctx),
   },
 ];
 
-export const fastApp: App = { /* …adapter… */, mcpTools() { return fastMcpTools; } };
+export const loomApp: App = { /* …adapter… */, mcpTools() { return loomMcpTools; } };
 ```
 
-Prefix the name with the app id (`trello_`, `fast_`) — every app's tools land in
-one flat namespace on the same server, so unprefixed names will collide.
+### App tools take arguments
 
-## Two known traps
+`AppMcpTool.inputSchema?: Record<string, unknown>` is a zod raw shape, kept
+structurally typed so `@sluice/core` stays zod-free, and the registration loop
+passes it straight through to `registerTool`. Twelve app tools ship declared
+schemas today (gmail 4, loom 4, linkedin 4).
 
-and fix them if you're touching the surrounding code.
+Declare it as `{ videoId: z.string() }`, **not** `z.object({ videoId: z.string() })`.
+Omit it only for a genuinely argument-less tool (`fast_speed_test`,
+`trello_my_cards`, `gmail_sync_status`) — a tool that declares nothing is
+advertised as taking no parameters, so `run` never receives any.
 
-### 1. App tools can't receive arguments
+Add zod to the app package's `dependencies` when you declare a schema; app-gmail,
+app-loom and app-linkedin already do.
 
-`AppMcpTool.run` is typed `run(args: Record<string, unknown>)`, but the
-registration loop passes `inputSchema: {}` — so every MCP client is told the tool
-takes no parameters and `args` always arrives empty. Any app tool that needs
-input is currently unimplementable.
+### Network-touching app tools must use `ctx.replay`
 
-The fix is to add an optional `inputSchema` to the `AppMcpTool` interface in
-`packages/core/src/types.ts` and thread it through the loop. If the tool you're
-adding needs arguments, do that first — otherwise the tool will look like it
-works and silently ignore everything it's given.
+`AppToolContext` is `{ store?: ReadOnlyStore, replay(req), replayFlow?(templateId, params, opts) }`,
+built fresh per app and passed as `run(args, ctx)`. `ctx.replay` is the same
+pipeline the `replay` core tool uses:
 
-### 2. App tools bypass the capture store
-
-`sluice_replay` does the full pipeline — build the request, overlay the real
-client's learned fingerprint, issue it, then record it:
-
-```ts
-const base = app.buildReplayRequest(match.action, params ?? {}, session);
-const req = faithfulReplayRequest(store, base);   // headers/params learned from real captures
-const capture = await runReplay(req);             // returns a secret-redacted Capture
-capture.adapterId = match.app.id;
-store.insertCapture(capture);
-store.applyParseResult(match.app.parse(capture), capture.ts || Date.now());
+```
+faithfulReplayRequest(store, base)   // overlay the real client's learned fingerprint
+  → runReplay(req)                   // method allowlist → write-op denylist → 60/60s budget → single-flight
+  → record(capture)                  // adapterId stamped, insertCapture, applyParseResult
 ```
 
-App tools do none of this. `fetchMyCards` and `runSpeedTest` call bare `fetch`
-with hand-written headers, so their traffic is more anomalous to the service
-(it doesn't match the browser's real fingerprint) and never enters the store — so
-it's invisible to the cartographer, the dashboard and the audit trail, while
-`sluice_replay` calls are fully recorded.
+with a 401 → re-extract → retry-once refresh wrapped around it, both attempts
+recorded. A bare `fetch` gets none of that: it is *more* anomalous to the service
+(it does not match the browser's real fingerprint), it skips the rails and the
+process-global budget shared with the CLI and the dashboard, and it never enters
+the store, so it is invisible to the cartographer, the dashboard and the audit
+trail.
 
-If your tool touches the network, prefer routing it through
-`buildReplayRequest` → `faithfulReplayRequest` → `runReplay` → `insertCapture`.
-That currently requires giving `run` access to the store (widen the signature to
-take a context `{ store }` or a `replay(req)` callback). If you deliberately keep
-a bare fetch — e.g. the call needs no credentials and no fingerprint matching —
-say so in a comment so the divergence is a decision rather than an oversight.
+Every shipped network tool routes through the context: `runSpeedTest(ctx)` issues
+its config call via `ctx.replay`, `trello_my_cards` passes `ctx` into
+`trelloGet(…, ctx)`, Loom's four tools go through `replayOrFetch(ctx)`, and
+`linkedin_fetch_me` throws if `ctx.replay` is absent.
+
+The **one** deliberate bare fetch left is fast.com's multi-megabyte range
+download, which stays outside the pipeline so a ~25 MiB body never enters SQLite.
+If you keep a bare fetch, say why in a comment so the divergence is a decision.
+
+For multiple hops, prefer `ctx.replayFlow(templateId, params)` over chaining
+`ctx.replay` — and never nest: `ctx.replay` funnels into a single-slot mutex that
+self-deadlocks on re-entry. Loom's cookie refresh issues its second attempt
+sequentially for exactly this reason.
+
+`ctx.store` is optional in the type and must be treated as such. Gmail's and
+LinkedIn's store-backed tools throw a named error when it is absent — "This tool
+reads the Sluice capture store, and the host did not provide one. Run it through
+`sluice-mcp`." — rather than assuming a host provides it.
 
 ## Error handling
 
-The registration loop already wraps `run` so a throw becomes a tool error rather
-than a crashed handler, and the message is redacted on the way out. So **throw a
-descriptive error** rather than returning an error-shaped object — returning
-`{ error: 'HTTP 401' }` (as `trello_my_cards` does) makes a failure look like a
-successful result to the client.
+The registration loop wraps `run` so a throw becomes a tool error rather than a
+crashed handler, and the message goes through `redactText` on the way out. So
+**throw a descriptive error** rather than returning an error-shaped object —
+returning `{ error: 'HTTP 401' }` (as `trello_my_cards` does) makes a failure look
+like a successful result to the client.
 
 Never put a secret in a message, a description, or a returned field. Tool output
 crosses the process boundary to the MCP client.
 
 ## Registering the server with a client
 
-The binary is declared as `sluice-mcp` in `packages/mcp/package.json`. Note it
-points at `src/cli.ts` — a raw TypeScript file with a `#!/usr/bin/env node`
-shebang, which crashes with `ERR_UNKNOWN_FILE_EXTENSION` if a client spawns it
-directly. Until the packaging task lands, run it through tsx:
+`packages/mcp/package.json` declares `"bin": { "sluice-mcp": "./dist/cli.js" }` —
+the bundle, not the source. `scripts/build.mjs` emits it, strips esbuild's
+inherited shebang, prepends one `#!/usr/bin/env node` and chmods 0o755, so the
+built file runs directly under plain `node`.
 
 ```bash
-claude mcp add sluice -- pnpm --dir /path/to/sluice exec node packages/mcp/dist/cli.js  # or tsx packages/mcp/src/cli.ts in dev
+pnpm build                                                    # emits packages/mcp/dist/cli.js
+claude mcp add sluice -- node /path/to/sluice/packages/mcp/dist/cli.js
 ```
 
-Verify a new tool end to end rather than trusting registration: start the server,
-confirm the tool is listed with the parameters you expect (not an empty schema),
-and call it once with real arguments.
+That is the same command both `packages/mcp/README.md` and the root README use;
+keep all three identical. In dev, before a build:
+`claude mcp add sluice -- pnpm --dir /path/to/sluice exec tsx packages/mcp/src/cli.ts`.
 
+The server opens the real read-write store at `$SLUICE_DB` or `~/.sluice/sluice.db`,
+runs `installExternalAdapters()` and then `app.reconcile(store)` for every enabled
+app before the first tool call — both are startup side effects, and reconcile is a
+write. stdout carries only MCP protocol frames; every diagnostic goes to stderr.
+
+Verify a new tool end to end rather than trusting registration: start the server,
+confirm it is listed with the parameters you expect (not an empty schema), and
+call it once with real arguments.
 
 ## Multi-step flows
 
 Core tools (not app tools) for observation-learned bursts:
 
-- `sluice_list_flows` — observed/pinned flows + learned templates (ids, step counts, params, **qualityNotes**, **apiStepCount**). No secrets. Includes a short `guidance` object for agents.
-- `sluice_describe_flow` — step roles, bindings, `offsetFromPrimaryMsP50` / `offsetSpreadMs`, unreproducible flags, qualityNotes. No secrets.
-- `sluice_replay_flow` — sequential read-only run via `buildFlowStepRequest` (**must pass `allowedHosts: app.hosts`**) + `runFlowReplay` + `runReplay`.
+- `sluice_list_flows` — observed/pinned flows + learned templates (ids, step
+  counts, params, **qualityNotes**, **apiStepCount**). No secrets. Includes a
+  short `guidance` object for agents.
+- `sluice_describe_flow` — step roles, binding **kinds only**,
+  `offsetFromPrimaryMsP50` / `offsetSpreadMs`, unreproducible flags, qualityNotes.
+  No secrets, no token values.
+- `sluice_replay_flow` — sequential read-only run via `buildFlowStepRequest`
+  (**must pass `allowedHosts: app.hosts`**) + `runFlowReplay` + `runReplay`.
 
-App tools that need multiple hops should call `ctx.replayFlow(templateId, params)` rather than chaining bare `fetch`. Single hops still use `ctx.replay(req)`.
+Note the asymmetry worth preserving: flow replay enforces a host allowlist per
+step; single-request `replay` does not.
 
 ### Operational contract (do not omit from tool descriptions)
 
-From live Trello/Slack capture review — keep these in descriptions when editing flow tools:
-
-1. MCP does **not** cluster or learn; operators run `sluice learn-flows --adapter <id>` after capture.
-2. Prefer templates with `sampleCount ≥ 2` and API primaries (`cards/:id`, `boards/:id`, …) — **not** `assets/*`.
-3. MITM/WS → no page-load correlation; CDP → `loaderId`/`pageLoadId`. WS excluded from HTTP bursts.
-4. Sibling pacing is **primary-anchored** (`offsetFromPrimaryMsP50`, 2s cap); negative offsets = pre-primary, fire immediately if late.
-5. Soft unreproducible companions skip; required failures stop; no write ops; hosts must match adapter allowlist.
-6. List/describe expose `qualityNotes` so agents can reject asset-primary or single-sample junk without re-deriving heuristics.
+1. MCP does **not** cluster or learn; operators run
+   `sluice learn-flows --adapter <id>` after capture.
+2. Prefer templates with `sampleCount ≥ 2` and API primaries (`cards/:id`,
+   `boards/:id`, …) — **not** `assets/*`.
+3. MITM/WS captures carry no page-load correlation; CDP fills
+   `loaderId`/`pageLoadId`. WS is excluded from HTTP bursts.
+4. Sibling pacing is **primary-anchored** (`offsetFromPrimaryMsP50`, 2 s cap);
+   negative offsets mean pre-primary, fire immediately if late.
+5. Soft unreproducible companions skip; required failures stop the flow; no write
+   ops; hosts must match the adapter allowlist. Whole-flow timeout 120 s.
+6. List/describe expose `qualityNotes` so agents can reject asset-primary or
+   single-sample junk without re-deriving heuristics.
 
 ### Checklist (flow-related)
 
@@ -175,11 +243,15 @@ From live Trello/Slack capture review — keep these in descriptions when editin
 
 ## Checklist
 
-- Right seam: does `packages/mcp` need to know a specific app? Then it belongs in the app.
-- Name prefixed with the app id, for app tools.
+- Right seam: does `packages/mcp` need to know a specific app (→ app tool), and
+  does the tool need to write or reach raw SQL (→ core tool, since the app
+  context is read-only)?
+- Name prefixed with the app id, for app tools — a test enforces it.
 - Description states what it returns and what the parameters scope.
-- `inputSchema` declared — and for app tools, confirm it's actually threaded through.
+- `inputSchema` declared as a zod raw shape, or deliberately omitted.
 - Bounds on any limit/count parameter.
-- Network-touching tools go through faithful replay and land in the store, or carry a comment explaining why not.
+- Network-touching tools go through `ctx.replay` / `ctx.replayFlow` and land in
+  the store, or carry a comment explaining why not.
+- `ctx.store` treated as optional — throw a named error when it is absent.
 - Errors thrown, not returned as data. No secrets in output.
-- `pnpm typecheck`, then call the tool for real.
+- `pnpm typecheck`, `pnpm --filter @sluice/mcp test`, then call the tool for real.

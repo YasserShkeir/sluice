@@ -2,37 +2,45 @@
 
 > Capture and explore the API traffic your own Slack (and other SaaS) clients make — 100% locally, no app registration, no admin approval.
 
-**Status: 🚧 Working MVP (Phase B).** The `@sluice/core` spine, five app plugins (Slack, Trello, Gmail, Loom, fast.com), the `sluice` CLI + loopback web server, the API Cartographer, an MCP server, and the React dashboard are built and typecheck clean. All three capture engines are implemented: the MITM proxy (A), token-extract + replay (B), and passive browser capture via Chrome DevTools (C). Observed multi-step **interaction flows** can be clustered, learned, and replayed read-only (CLI `flows` / `learn-flows` / `replay --flow`, MCP `sluice_*_flow`, dashboard Group flows + Flow inspector). Lint, typecheck and 102 tests run green in CI, covering the redactor, the store, the replay rails, the cartographer, the runner's server and the MCP handlers.
+**Status: 🚧 Working MVP.** The `@sluice/core` spine, six app plugins (Slack, Trello, Gmail, Loom, LinkedIn, fast.com), the `sluice` CLI + loopback web server, the API Cartographer, an MCP server and the React dashboard are built. Every capture engine is implemented: the MITM proxy (A), token extract + replay (B), and passive browser capture via Chrome DevTools or an MV3 extension (C). Observed multi-step **interaction flows** can be clustered, learned and replayed read-only. Lint, typecheck, ~770 tests and the packaging build run green in CI.
 
-## Install
+**Not on npm yet.** Nothing is published — install from a clone. The `npx sluicejs` path in older notes does not work today.
+
+## Quickstart (macOS)
 
 ```bash
-npx sluicejs doctor          # no install; check the environment
-npm i -g sluicejs            # or install once — the binary is called `sluice`
-sluice doctor
+git clone https://github.com/YasserShkeir/sluice && cd sluice
+pnpm install                 # builds better-sqlite3, classic-level, node-pty, esbuild
+pnpm sluice doctor           # check your environment — reads no secrets
+                             # (`pnpm doctor` is pnpm's own builtin — use `pnpm sluice doctor`)
+pnpm webapp:build            # build the dashboard (or: pnpm webapp:dev for hot reload on :5273)
 ```
 
-`sluicejs` is a bare-name launcher for `@sluice/runner`, which you can equally
-run directly as `npx @sluice/runner`. (The plain `sluice` name on npm has
-belonged to an unrelated package since 2013.)
-
-macOS is the only platform with local credential extraction today; capture and
-the dashboard work anywhere Node does.
-
-## Quickstart from a clone (macOS)
+Then pick a capture path:
 
 ```bash
-pnpm install                 # native deps (better-sqlite3, classic-level, esbuild) build automatically
-pnpm sluice doctor           # check your environment — reads no secrets
-                             # (note: `pnpm doctor` is pnpm's own builtin — use `pnpm sluice doctor`)
-pnpm webapp:build            # build the web UI (or: pnpm webapp:dev for hot-reload on :5273)
+# Passive browser capture — no CA, no Keychain, no system proxy.
+pnpm sluice capture          # launches a dedicated Chrome under DevTools Protocol
 
-# read YOUR OWN Slack session (pops a macOS Keychain prompt — that is the consent boundary):
-pnpm sluice extract-token    # prints a REDACTED summary only; token/cookie never touch disk
-pnpm sluice serve            # then open the printed http://127.0.0.1:7788 URL to browse
+# …or live capture through the local proxy (Engine A):
+pnpm sluice ca-install       # one-time: trust the local CA (prompts for your password)
+pnpm sluice start            # starts the proxy, prints how to route a desktop app
+pnpm sluice proxy on         # …or point the whole system at it (macOS; may print a sudo command to run)
 
-# optional live capture (Engine A): starts a local MITM proxy you route Slack through
-pnpm sluice start
+# …or just browse what you already captured:
+pnpm sluice serve
+```
+
+Every mode prints a URL with the session token in its fragment —
+`http://127.0.0.1:7788/#k=<token>`. That banner is the only place the token is
+shown: it is never embedded in a served page, so opening the bare origin loads
+the UI but every request is refused.
+
+To read your own Slack session directly (pops a macOS Keychain prompt — that is the
+consent boundary):
+
+```bash
+pnpm sluice extract-token    # prints a REDACTED summary only; the token never touches disk
 ```
 
 No admin approval, no Slack app, no bot token — and everything stays on your machine.
@@ -41,46 +49,69 @@ No admin approval, no Slack app, no bot token — and everything stays on your m
 
 ## What is this?
 
-Sluice is a **local-only** developer tool that intercepts the API calls made by your *own, already-authenticated* Slack client, reconstructs your workspace's structure (channels, DMs, users), and lets you read and export message history — all through an interactive web UI.
+Sluice is a **local-only** developer tool that intercepts the API calls made by your
+*own, already-authenticated* clients, reconstructs a service's structure (channels,
+DMs, users, boards, threads), and lets you read and export it — through a web UI, a
+CLI, or an MCP server your agent can call.
 
-It exists for a specific, common situation: you work somewhere that **won't let you create a Slack app or issue a bot/user token**, but you still need programmatic access to *your own* data. The official paths (a registered Slack app, or a `xoxb`/`xoxp` token) are gated behind workspace-admin approval. Sluice needs neither — it reads the session you already have.
+It exists for a specific, common situation: you work somewhere that **won't let you
+create a Slack app or issue a bot/user token**, but you still need programmatic
+access to *your own* data. The official paths are gated behind workspace-admin
+approval. Sluice needs neither — it reads the session you already have.
 
-Slack is just the **first adapter**. The architecture generalizes to Notion, Linear, Jira, Discord, and other SaaS via pluggable adapters.
+Slack was the first adapter. Six ship today, and the architecture generalizes to
+Notion, Linear, Jira, Discord and anything else through pluggable app packages.
 
 ## How it works (three capture engines)
 
 | Engine | Mechanism | Best for | Needs |
 |--------|-----------|----------|-------|
-| **A — MITM proxy** *(primary)* | Local HTTPS proxy + trusted local CA | Desktop app **and** browser; live traffic | One-time CA trust |
-| **B — Token extract + replay** | Read your own `xoxc` token + `d` cookie from the local Slack store, call the Web API directly | Fast backfill, on-demand fetch, powering interactive replay | Keychain access |
-| **C — Browser CDP / extension** | Observe `app.slack.com` traffic via Chrome DevTools Protocol or an injected fetch/WebSocket patch | Browser-only Slack users, zero cert install | Chrome |
+| **A — MITM proxy** *(primary)* | Local HTTPS proxy + a local CA you trust | Desktop app **and** browser; live traffic | One-time CA trust |
+| **B — Token extract + replay** | Read your own session credential from the local OS store, call the API directly | Fast backfill, on-demand fetch, powering interactive replay | Keychain / cookie DB access |
+| **C — Browser CDP or MV3 extension** | Observe XHR/Fetch via the DevTools Protocol, or via an in-page patch that posts to the runner | Browser-only users, zero cert install | Chrome |
 
-All three normalize into one data model and stream into a local web app that's part traffic inspector (à la Charles/mitmweb/Proxyman), part data explorer.
+All of them normalize into one data model and stream into a local web app that's
+part traffic inspector (à la Charles/mitmweb/Proxyman), part data explorer.
 
-![Sluice pipeline: sources feed three capture engines, which converge on a single ingest funnel that redacts, attributes, classifies and parses every exchange into a local SQLite store, read back by the dashboard, the MCP server and the CLI.](assets/architecture/01-pipeline.png)
+![Sluice pipeline: sources feed the capture engines, which converge on a single ingest funnel that redacts, attributes, classifies and parses every exchange into a local SQLite store, read back by the dashboard, the MCP server, the HTTP API and the CLI.](assets/architecture/01-pipeline.png)
 
-Every engine converges on **one ingest funnel**, so redaction, attribution and parsing happen in exactly one place no matter how a capture arrived.
+Every engine converges on **one ingest funnel**, so redaction, attribution and
+parsing happen in exactly one place no matter how a capture arrived.
 
 <details>
 <summary><b>Architecture in detail</b> — four more diagrams</summary>
 
 <br>
 
-**Capture engines — how each one decides what it is allowed to see.** Engine A (MITM) **decrypts every host by default** while capture is running. Pass `--host` / `interceptHosts` (or `interceptAllHosts: false`) to scope TLS termination; hosts outside that list are CONNECT-tunnelled as raw bytes with no row written. Adapter `matchRequest` still attributes captures — unknown services land as unclassified until an adapter exists.
+**Capture engines — how each one decides what it is allowed to see.** Engine A
+(MITM) **decrypts every host by default** while capture is running. Pass `--host`
+(repeatable) or `interceptHosts` — or set `interceptAllHosts: false` — to scope TLS
+termination; hosts outside that scope are CONNECT-tunnelled as raw bytes with no row
+written. Engine C's CDP path captures XHR/Fetch on any host; the extension is
+default-deny and captures nothing until you name hosts. Adapter `matchRequest` only
+decides *attribution* — an unknown service is still stored, unattributed.
 
-![Engine A's scope decision, Engine C's XHR/Fetch-only filter and extension host allowlist, and Engine B's credential extraction.](assets/architecture/02-capture-engines.png)
+![Engine A's TLS scope decision, Engine C's XHR/Fetch filter and extension host allowlist, and Engine B's credential sources.](assets/architecture/02-capture-engines.png)
 
-**Ingest and normalization.** Redaction runs *before* attribution, which is why each app registers its own token shapes into one global policy applied to all traffic.
+**Ingest and normalization.** Redaction runs *before* attribution, which is why each
+app registers its own token shapes into one global policy applied to all traffic.
 
-![The five ingest steps, the normalized model, and the cartographer's per-app table materialization.](assets/architecture/03-ingest-normalization.png)
+![The five ingest steps, the redaction policy, the normalized model, the store's tables and the cartographer's outputs.](assets/architecture/03-ingest-normalization.png)
 
-**Replay.** Three independent limits — method, operation, budget — sit below every caller, so a modified frontend or a creative tool argument cannot route around them.
+**Replay.** Three independent limits — method, operation, budget — sit below every
+caller, so a modified frontend or a creative tool argument cannot route around them.
 
-![Replay callers, the three safety gates, and the build-and-send chain from request template to stored capture.](assets/architecture/04-replay.png)
+![Replay callers, the three safety gates, the build-and-send chain, and multi-step flow replay.](assets/architecture/04-replay.png)
 
-**Control plane and consumers.** The engine lifecycle, the three per-session capability secrets, and the full MCP tool surface.
+**Control plane and consumers.** The three run modes, the engine lifecycle, the three
+per-run capability secrets, the MCP tool surface and the read-only HTTP API.
 
-![Engine lifecycle from serve to system proxy, the dashboard's token model, and the core plus app-contributed MCP tools.](assets/architecture/05-control-plane.png)
+![Run modes, engine lifecycle, the three capability secrets, the dashboard channel, the MCP surface and the HTTP API.](assets/architecture/05-control-plane.png)
+
+All five as one printable sheet: [`assets/architecture/sluice-architecture.pdf`](assets/architecture/sluice-architecture.pdf).
+The diagrams are generated from checked-in HTML sources — edit
+`assets/architecture/src/*.html` and run `node scripts/diagrams.mjs` to rebuild
+both the PNGs and the PDF. Chrome is the only dependency.
 
 </details>
 
@@ -93,89 +124,212 @@ Sluice is designed to be trustworthy because it's boring about data:
 
 - **100% local.** Captured traffic and credentials never leave your machine. No telemetry, no cloud.
 - **Local session only.** It reads credentials your OS already holds for you on this machine.
-- **Secrets stay in memory.** The `xoxc` token and `d` cookie are live-session credentials — Sluice keeps them in the runner process only, never writes them to disk, and `.gitignore` blocks captured data from ever being committed. (They are ordinary JS strings and cannot be reliably wiped — see [`SECURITY.md`](./SECURITY.md#known-limits-what-is-not-guaranteed).)
+- **Secrets stay in memory.** Session tokens and cookies live only in the process that extracted them and are never written to disk. The capture store lives outside the repo at `~/.sluice/sluice.db`, and `.gitignore` covers `.sluice/`, `captures/` and `*.sqlite*` for the cases where you point it somewhere else. (Credentials are ordinary JS strings and cannot be reliably wiped — see [`SECURITY.md`](./SECURITY.md#known-limits-what-is-not-guaranteed).)
+- **Broad by default.** While Engine A is running it decrypts **every host** routed through the proxy, not just the ones an adapter claims. That is deliberate — a service with no adapter is still worth capturing — but it means unrelated traffic is decrypted and stored. Scope it with `--host`, `interceptHosts`, or `interceptAllHosts: false`, and keep proxy sessions short. `sluice capture` (browser CDP) decrypts nothing.
 - **Replay is read-only.** Mutating verbs and write/admin operations are blocked below every caller, with a shared rate budget.
-- **Explicit consent.** Installing the local CA (Engine A) is a deliberate, reversible step you run yourself.
+- **Explicit consent.** Trusting the local CA is a deliberate, reversible step you run yourself.
+- **Nothing expires by default.** Set `retentionDays` / `maxCaptures`, or run `sluice prune` / `sluice wipe`.
 
-When a workspace-issued API token is available, prefer that path. Sluice is for working with data already reachable from your local session.
-
-## Repo layout
-
-```
-packages/core          @sluice/core          types · normalized model · SQLite store · WS protocol · redactor
-packages/interceptor   @sluice/interceptor   MITM engine (mockttp) · CDP engine · replay + safety rails · auth-reconstruct seed
-packages/cartographer  @sluice/cartographer  API map · per-app table materialization · faithful replay templates
-packages/apps          @sluice/apps          the installed-apps registry (the one place apps are named)
-packages/app-slack     @sluice/app-slack     Slack: adapter · parser · macOS credential provider
-packages/app-trello    @sluice/app-trello    Trello: adapter · Chrome-cookie credentials · MCP tool
-packages/app-gmail     @sluice/app-gmail     Gmail: positional-array sync API · thread/label MCP tools
-packages/app-loom      @sluice/app-loom      Loom: adapter · Chrome-cookie credentials · transcript MCP tool
-packages/app-linkedin  @sluice/app-linkedin  LinkedIn: Voyager adapter · jobs/messaging · cookie MCP tools
-packages/app-fast      @sluice/app-fast      fast.com: credential-free adapter · speed-test MCP tool
-packages/mcp           @sluice/mcp           the `sluice-mcp` stdio MCP server
-packages/runner        @sluice/runner        the `sluice` CLI + loopback HTTP/WS server
-packages/cli           sluicejs              bare-name launcher — `npx sluicejs`, no logic of its own
-apps/webapp            @sluice/webapp        Vite + React dashboard (overview · traffic table · inspector)
-```
+When a workspace-issued API token is available, prefer that path. Sluice is for
+working with data already reachable from your local session.
 
 ## Commands
 
+`sluice <command> [options]` — 24 commands. Run `pnpm sluice <command> --help` for
+per-command options.
+
+**Capture**
+
 ```
 doctor          Check the local environment (Node, app sign-in, proxy engine, DB). No secrets.
-extract-token   Read your local session token + cookie; print a REDACTED summary only.
-serve           Start the loopback web UI + WS server (no proxy).
-start           Like serve, plus the MITM proxy engine for live capture.
+serve           Start the loopback web UI + WS server. The engine starts idle; start it from the UI.
+start           Like serve, plus the MITM proxy engine running immediately.
 capture         Passively capture browser API traffic via Chrome DevTools (no proxy/CA/Keychain).
 proxy           Toggle the macOS system web proxy: sluice proxy <on|off|status>.
-ca-install      Generate + trust Sluice's local CA (for MITM capture of a desktop app).
+ca-install      Generate + trust Sluice's local CA (for MITM capture).
 ca-uninstall    Remove trust for Sluice's local CA.
-sync            Reconstruct structure for ALL (or one) workspace via the Web API.
+```
+
+**Credentials and replay**
+
+```
+extract-token   Read your local session token + cookie; print a REDACTED summary only.
+sync            Reconstruct structure for ALL (or one) workspace via the service's own API.
+replay          Run one replay action by id, --flow <template>, or --all to drain the cursor worklist.
+auth            Map how a service authenticates you, from captured traffic. No secrets.
+```
+
+**Understand what you captured**
+
+```
 build-db        Materialize per-app tables from captures.
 apidoc          Render a Markdown API catalog from captured traffic (scope it with --host).
-replay          Run one replay action by id, --flow <template>, or --all to drain cursors.
 flows           List / show / pin interaction flows and learned templates.
 learn-flows     Cluster captures into flows and refresh multi-step templates.
 export          Dump a container's items: json | ndjson | markdown | sqlite.
 record          Dump captures as NDJSON for the mock runner (credential-free replay).
 mock            Replay a recorded NDJSON fixture through the real ingest path.
-auth            Map how a service authenticates you, from captured traffic. No secrets.
-app             App-specific helpers (subcommands per installed adapter).
+```
+
+**Manage the runner and the store**
+
+```
 adapters        List installed apps: hosts, credential source, replay actions, MCP tools.
+app             Enable/disable installed apps: sluice app <list|enable ID|disable ID>.
 status          Is a runner serving? Report pid/port/uptime and store size.
 stop            Ask a running runner to shut down (--force to SIGKILL).
 prune           Delete old captures: --days N and/or --max-rows N [--vacuum].
 wipe            THE PANIC BUTTON: delete the capture DB; --all also removes the CA + Chrome profile.
-
-Run `pnpm sluice <command> --help` for per-command options.
-
-## Install
-
-```bash
-pnpm install && pnpm build     # bundles the CLI, the MCP server and the dashboard
-node packages/runner/dist/cli.js doctor
 ```
 
-`pnpm build` produces two self-contained binaries that run under plain `node` —
-no `tsx`, no workspace. The dashboard is copied in alongside the CLI bundle, so
-the published package serves it without needing the repo.
+`--db PATH` (default `~/.sluice/sluice.db`) and `-h` work almost everywhere.
+`--port N` (default 7788) applies to the four commands that bind a port — `serve`,
+`start`, `capture` and `mock`. `--config PATH` is accepted by `serve`, `start`,
+`mock`, `adapters`, `status` and `auth` only — elsewhere it is an unknown-option
+error, because each command parses its own flags strictly. Whether a command
+consults the discovered config file at all depends on whether it resolves a DB
+path or a port; `proxy`, `ca-install`, `ca-uninstall`, `stop` and `app` do not.
 
-Native modules (`better-sqlite3`, `classic-level`) and `mockttp` are deliberately
-left external and declared as runtime dependencies; bundling a native addon
-breaks its `.node` binding lookup.
+`serve` also carries the flags `start` does not: `--isolated` (run the MITM engine in
+its own process), `--ingest` (enable the extension's `POST /api/ingest` endpoint) and
+`--terminal` (an embedded Claude Code session in the dashboard, behind its own
+capability secret — see [`SECURITY.md`](./SECURITY.md)).
+
+## Configuration
+
+Optional. Sluice reads the nearest `sluice.config.json` or `.sluicerc.json`, walking
+up from the CWD, then `~/.sluice/config.json`. `--config PATH` overrides both, on the
+six commands that accept it. A malformed config is a hard error rather than a silent
+fallback — running with settings you believe you overrode is worse than not starting.
+
+```jsonc
+{
+  "db": "~/work/sluice.db",        // SQLite path
+  "port": 7788,                    // HTTP + WS port
+  "proxyPort": 8080,               // MITM proxy port (sluice start)
+  "cdpPort": 9222,                 // Chrome remote-debugging port (sluice capture)
+  "retentionDays": 14,             // drop captures older than this at serve/start
+  "maxCaptures": 50000,            // keep at most this many
+  "interceptHosts": ["slack.com"], // extra hosts to decrypt when TLS scoping is on
+  "interceptAllHosts": false,      // false = scope TLS termination; default is true
+  "maxBodyBytes": 5000000          // RESERVED — not threaded through; engines hard-cap at 5,000,000 chars
+}
+```
+
+Most settings also have a CLI flag, and where both exist the flag wins.
+`retentionDays`, `maxCaptures`, `maxBodyBytes` and `interceptHosts` are config-only,
+and `--host` values are **added to** `interceptHosts` rather than replacing them.
+
+Two settings behave differently and are worth knowing:
+
+- **`interceptAllHosts` defaults to `true`.** Any `--host`/`interceptHosts` entry, or
+  an explicit `false`, switches Engine A to scoped TLS termination.
+- **The `adapters` allow-list is read only from `~/.sluice/config.json`**, never from a
+  project-local file — a repo you clone must not be able to widen what gets decrypted.
+  Use `sluice app enable|disable <id>`, which writes that file.
+
+## HTTP API
+
+The runner exposes a read-only JSON API on the same loopback origin, gated by the read
+token (`?token=…` or `Authorization: Bearer`) plus a loopback `Host` and, when one is
+sent, a loopback `Origin`. Any non-GET request gets 405.
+
+```
+GET /api/status                      GET /api/captures?limit&app&host&tab&ids&since
+GET /api/storage                     GET /api/captures/search?q
+GET /api/adapters                    GET /api/captures/:id/body
+GET /api/sessions                    GET /api/captures/:id/entities
+GET /api/workspaces                  GET /api/containers?workspaceId
+GET /api/actors                      GET /api/items?containerId
+GET /api/apidoc[?format=markdown]    GET /api/tables
+GET /api/flows[?app&source&q]        GET /api/tables/:name?limit&offset&orderBy
+GET /api/flow-templates[?app&primaryKey&q]
+```
+
+`/api/tables` is the Cartographer's output — the typed per-app tables derived from
+real responses. Table and column names are validated against the live schema before
+use, so only materialized `<app>_*` tables are reachable.
+
+The one exception to "read-only" is `POST /api/ingest`, the MV3 extension's capture
+endpoint. It exists only under `sluice serve --ingest`, is gated by its own separate
+secret, and returns 404 `ingest_disabled` otherwise.
 
 ## MCP server
 
-Sluice exposes its captured data — and each app's tools — to Claude over MCP:
+Sluice exposes its captured data — and each app's tools — to Claude over MCP. Build
+once, then register the bundle:
 
 ```bash
+pnpm build
 claude mcp add sluice -- node /path/to/sluice/packages/mcp/dist/cli.js
 ```
 
-(after `pnpm build`; before that, `pnpm --dir /path/to/sluice exec tsx packages/mcp/src/cli.ts`)
+(In dev, before a build: `claude mcp add sluice -- pnpm --dir /path/to/sluice exec tsx packages/mcp/src/cli.ts`.)
+
+The server advertises **29 tools**: 11 core plus 18 contributed by the installed apps
+(gmail 5, linkedin 7, loom 4, trello 1, fast 1; Slack contributes none). Nine of the
+core tools read the store — workspaces, containers, items, endpoints, capture search,
+endpoint shapes, the auth map and the two flow readers. Two make live requests:
+`replay` and `sluice_replay_flow`, both through the same safety rails as every other
+caller. App-contributed tools get a nine-method read-only projection of the store, so
+a tool cannot write or reach raw SQLite.
+
+## Repo layout
+
+```
+packages/core          @sluice/core          types · normalized model · SQLite store · WS types · redactor   (Apache-2.0)
+packages/protocol      @sluice/protocol      zod validation of client WS frames, browser-safe                (Apache-2.0)
+packages/adapter-sdk   @sluice/adapter-sdk   coercion helpers · capture fixtures · scrubber · conformance     (Apache-2.0)
+packages/interceptor   @sluice/interceptor   MITM engine (mockttp) · CDP engine · replay + rails · supervisor
+packages/cartographer  @sluice/cartographer  API map · per-app tables · faithful + multi-step flow templates
+packages/apps          @sluice/apps          the installed-apps registry (the one place apps are named)
+packages/app-slack     @sluice/app-slack     Slack: adapter · parser · Keychain + LevelDB credentials
+packages/app-trello    @sluice/app-trello    Trello: adapter · Chrome-cookie credentials · MCP tool
+packages/app-gmail     @sluice/app-gmail     Gmail: positional-array sync API · thread/label MCP tools
+packages/app-loom      @sluice/app-loom      Loom: GraphQL adapter · cookie credentials · transcript MCP tool
+packages/app-linkedin  @sluice/app-linkedin  LinkedIn: Voyager adapter · jobs/messaging · cookie credentials
+packages/app-fast      @sluice/app-fast      fast.com: credential-free adapter · speed-test MCP tool
+packages/mcp           @sluice/mcp           the `sluice-mcp` stdio MCP server
+packages/runner        @sluice/runner        the `sluice` CLI + loopback HTTP/WS server
+packages/cli           sluicejs              bare-name launcher — no logic of its own
+packages/extension     @sluice/extension     Engine C's MV3 browser extension (loaded unpacked)
+apps/webapp            @sluice/webapp        Vite + React dashboard (overview · traffic · apps · explore · replay · data)
+```
+
+## Build
+
+```bash
+pnpm build     # bundles the dashboard, the CLI, the isolated engine child and the MCP server
+node packages/runner/dist/cli.js doctor
+```
+
+`pnpm build` runs the Vite build, then esbuild over three entrypoints:
+`packages/runner/dist/cli.js` (the `sluice` binary), `packages/runner/dist/engine-child.js`
+(the `serve --isolated` child process) and `packages/mcp/dist/cli.js` (the `sluice-mcp`
+binary). All three run under plain `node` — no `tsx`, no workspace. The dashboard is
+copied in alongside the CLI bundle, so a published package would serve it without the repo.
+
+Native addons (`better-sqlite3`, `classic-level`, `node-pty`) plus `chrome-remote-interface`,
+`ws`, `zod` and the MCP SDK are left external and declared as runtime dependencies —
+bundling a native addon breaks its `.node` binding lookup. **`mockttp` is the exception
+and is deliberately bundled**: its CJS build `require()`s ESM-only `get-port`, which
+throws under plain Node, and bundling resolves that at build time. It lands in its own
+lazily-loaded ~12 MB chunk, so every command except `start` pays nothing for it.
+
+## Platform support
+
+macOS is the primary target. Credential extraction, CA trust (`ca-install`) and
+system-proxy control (`sluice proxy`) are macOS-only. Everywhere else the dashboard,
+the HTTP API, the MCP server, `sluice capture` (CDP) and replay via pasted
+`--token`/`--cookie` work anywhere Node 20+ runs — though paste-in is implemented for
+Slack only today. CI runs on Linux and Node 20.
 
 ## License
 
-Split-licensed: **`packages/core` is Apache-2.0** (permissive, so anyone can build adapters on the model) and **everything else is AGPL-3.0-or-later** (a hosted derivative must publish source; running it locally carries no obligations). See [`LICENSING.md`](./LICENSING.md).
+Split-licensed: **`packages/core`, `packages/adapter-sdk` and `packages/protocol` are
+Apache-2.0** (permissive, so anyone can build adapters on the model) and **everything
+else is AGPL-3.0-or-later** (a hosted derivative must publish source; running it
+locally carries no obligations). See [`LICENSING.md`](./LICENSING.md).
 
 ## Support
 
@@ -195,43 +349,3 @@ Sponsorship buys no support contract, no roadmap influence, and no license excep
 ---
 
 *Working name; subject to change.*
-
-## Configuration
-
-Optional. Every setting also has a CLI flag, and a flag always wins.
-
-Sluice reads the nearest `sluice.config.json` walking up from the CWD, then
-`~/.sluice/config.json`; `--config PATH` overrides both.
-
-```jsonc
-{
-  "db": "~/work/sluice.db",      // SQLite path
-  "port": 7788,                  // HTTP + WS port
-  "proxyPort": 8080,             // MITM proxy port (sluice start)
-  "adapters": ["slack"],         // restrict which installed apps are active
-  "retentionDays": 14,           // drop captures older than this on startup
-  "maxCaptures": 50000           // keep at most this many
-}
-```
-
-A malformed config is a hard error rather than a silent fallback — running with
-settings you believe you overrode is worse than not starting.
-
-## HTTP API
-
-The runner exposes a read-only JSON API on the same loopback origin, gated by the
-same per-session token as the WebSocket (`?token=…` or `Authorization: Bearer`):
-
-```
-GET /api/status                     GET /api/captures?limit&app&host&tab
-GET /api/adapters                   GET /api/captures/:id/body
-GET /api/workspaces                 GET /api/containers?workspaceId
-GET /api/actors                      GET /api/items?containerId
-GET /api/apidoc[?format=markdown]    GET /api/tables
-GET /api/flows[?app&source&q]       GET /api/tables/:name?limit&offset&orderBy
-GET /api/flow-templates[?app&primaryKey&q]
-```
-
-`/api/tables` is the Cartographer's output — the typed per-app tables derived
-from real responses. Table and column names are validated against the live schema
-before use, so only materialized `<app>_*` tables are reachable.

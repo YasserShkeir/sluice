@@ -9,10 +9,20 @@ This is the reconnaissance pass that makes writing an adapter tractable: instead
 of guessing at endpoints, you drive the real client, capture what it actually
 calls, and render a catalog with real request/response shapes.
 
-Output lands in `docs/<service>-api.md`. `docs/fast.com-api.md` (203 lines, clean)
-and `docs/trello-api.md` (2610 lines, mostly noise) are the two existing
-examples — the difference between them is entirely about scoping, which is the
-main thing this skill exists to get right.
+Output lands in `docs/<service>-api.md`. Note that the whole `docs/` tree is
+gitignored (only `docs/linting.md` is force-added), so any example catalogs on a
+given machine are **local-only** — do not expect to find them in a fresh clone,
+and do not point a reader at one.
+
+The lesson those examples teach, since you probably cannot read them: a
+well-scoped catalog for a service with a dedicated API host runs a couple of
+hundred lines and is almost entirely endpoints someone would actually call. An
+unscoped catalog for a service that serves its SPA and its API from one host runs
+to thousands of lines in which `/1/members/me`, `/1/board/{id}` and
+`/1/cards/{id}` are buried under hundreds of `/assets/*.js` bundles, CDN PNGs and
+analytics pings. Nobody reads the second kind, and it misrepresents the API
+surface. The difference is entirely about scoping, which is the main thing this
+skill exists to get right.
 
 ## 1. Capture
 
@@ -24,29 +34,66 @@ Pick the engine by what you're driving. Both write to the same store.
 pnpm sluice capture
 ```
 
-This launches Chrome under DevTools Protocol and passively records XHR/fetch.
-Then sign in and *use the product* — click into the areas you want to
-understand. Coverage comes from exercising features, not from waiting.
+This launches Chrome under the DevTools Protocol and passively records XHR/fetch.
+Then sign in and *use the product* — click into the areas you want to understand.
+Coverage comes from exercising features, not from waiting.
 
-Two live limitations to work around:
-- It attaches to a **single page target**, so a login flow that opens a new tab,
-  or work done in a second tab or a popout, produces nothing. Stay in one tab.
-- It captures XHR/Fetch only — **no WebSocket frames**. If the service's realtime
-  layer matters (Slack RTM, live cursors, presence), it will be invisible here.
-  Note that gap in the doc rather than concluding the endpoint doesn't exist.
+Three things to know before you start:
+
+- **It launches a dedicated Chrome profile at `~/.sluice/chrome`, not yours.** You
+  will land in a signed-out browser and have to sign in inside it. That profile
+  persists between runs, so you only pay for it once. To use a Chrome you are
+  already signed into, start that Chrome with `--remote-debugging-port=9222`
+  yourself and attach with `pnpm sluice capture --no-launch`.
+- **It captures XHR and Fetch only.** Documents, scripts, CSS, images, fonts,
+  media and beacons are dropped before they reach the store. WebSocket **text**
+  frames are captured (on by default); **binary** frames are not, so a realtime
+  layer that uses a binary protocol is invisible here. Note that gap in the doc
+  rather than concluding the endpoint doesn't exist.
+- It attaches to **every** Chrome page target and re-runs discovery every 2 s, so
+  a login flow that opens a new tab, a popout, and a second tab are all captured.
+  The only loss is in-flight requests in a tab you close — those are dropped when
+  the tab detaches. The engine reports stopped only when the last tab closes.
+
+Flags: `--url` (start URL), `--cdp-port` (default 9222; also settable as
+`cdpPort` in `sluice.config.json`, with the flag winning), `--port` (dashboard),
+`--headless`, `--no-launch`, `--chrome-profile`, `--db`. `capture` is the one
+server command that does **not** accept `--config`, and it uses the full app
+registry rather than the `adapters` allow-list, so a disabled app still gets
+attribution here.
 
 **Desktop app, or when you need everything:**
 
 ```bash
 pnpm sluice ca-install     # one-time, deliberate, reversible
-pnpm sluice start          # MITM proxy engine
+pnpm sluice start          # MITM proxy engine on 127.0.0.1:8080
+pnpm sluice proxy on       # ← routing. `start` does not do this for you.
 ```
 
-Be aware this currently decrypts **all** hosts, not just the ones you care
-about — so keep the session short and prefer `capture` when the browser is enough.
+`sluice start` starts the engine and **routes nothing on its own.** It prints an
+`open -a <App> --args --proxy-server=127.0.0.1:<port>` instruction; the system
+proxy is set only from the dashboard's Control panel or by `sluice proxy on`.
+Skipping that step is the commonest way to spend ten minutes capturing nothing.
+(`sluice start` also only *generates* the CA — trusting it is `ca-install`'s job
+alone, so TLS interception fails until you run it.)
+
+Engine A decrypts **every host by default**. Rather than racing a short session,
+scope it:
+
+```bash
+pnpm sluice start --host api.trello.com      # repeatable
+```
+
+`--host` is repeatable and concatenates with `interceptHosts` in config; the
+precedence is `--all-hosts` or `interceptAllHosts: true` → everything;
+`interceptAllHosts: false` → scoped even with no hosts; any host entry → scoped to
+adapter hosts plus those; otherwise → everything. Non-intercepted connections are
+tunnelled as raw bytes, which is a stronger guarantee than redaction: Sluice
+cannot read them, so it cannot store them.
 
 Confirm traffic is arriving in the dashboard before you spend ten minutes
-clicking. An engine that silently died looks exactly like a quiet app.
+clicking. An engine that silently died looks exactly like a quiet app;
+`sluice doctor --net` probes the proxy path end to end.
 
 ## 2. Render the catalog
 
@@ -59,12 +106,6 @@ pnpm sluice apidoc --host api.trello.com --out docs/trello-api.md
 - `--host a,b` — comma-separated **substrings**; keeps hosts containing any of them
 - `--app <id>` — scope to one adapter id (once an adapter exists)
 - `--db PATH`, `--out FILE` (omit `--out` to write to stdout)
-
-Without scoping you get everything the browser touched. `docs/trello-api.md` is
-the cautionary example: 2610 lines in which the genuinely useful entries
-(`/1/members/me`, `/1/board/{id}`, `/1/cards/{id}`) are buried under hundreds of
-`/assets/*.js` bundles, CDN PNGs and analytics pings. Nobody reads that, and it
-misrepresents the API surface.
 
 Scope to the API host, not the app host — `api.trello.com` rather than
 `trello.com`, `api.notion.com` rather than `notion.so`. If the service serves API
@@ -86,10 +127,12 @@ what it means. Improve it where it pays:
   `/1/members/me/cards` is "the user's open cards across all boards".
 - **Mark the auth mechanism** — this is what the adapter's `buildReplayRequest`
   needs. Trello authorizes by browser session cookie with no token param; Slack
-  uses a token form field plus a `d` cookie. Getting this wrong is the most
-  expensive mistake downstream.
-- **Note pagination shape** (cursor, offset, `before`/`since`) — this is what
-  replay actions and any future worklist are built on.
+  uses a token form field plus a `d` cookie; LinkedIn needs a `csrf-token` header
+  derived from the `JSESSIONID` cookie *in addition to* the cookie. Getting this
+  wrong is the most expensive mistake downstream.
+- **Note pagination shape** (cursor, offset, `before`/`since`, Relay
+  `pageInfo.endCursor`) — this is what replay actions and `nextCursors` are built
+  on.
 - **Flag anything that looked client-computed** — nonces, request ids, csrf
   tokens, `_x_*` params. These can't be replayed verbatim and the adapter will
   need to regenerate or drop them.
@@ -101,28 +144,41 @@ cards only; no admin or billing endpoints were driven".
 ## 4. Redaction caveat
 
 Captures are secret-redacted before they reach the store, so the doc is safe to
-commit — but the redactor is currently **imprecise in both directions**:
+commit — but the redactor is imprecise in both directions.
 
-- It over-masks: a bare `token=` query param is masked even when it's a public,
-  non-secret value (fast.com's speedtest token), so some URLs in the doc are not
-  reproducible as written.
-- It under-masks: values under field names the generic pattern misses
-  (`api_token`, `idToken`, a bare `d` cookie in a JSON body) can survive.
+**It over-masks on any host with no declared `publicParams`.** A bare `token=`
+query param is masked even when the value is public, so those URLs are not
+reproducible as written. An app fixes this for its own hosts by declaring
+`redaction.publicParams` — fast.com declares
+`{ hosts: ['fast.com','nflxvideo.net'], params: ['token'] }`, which is why its
+captured URLs stay replayable. If the service you are documenting has a public
+token param, that declaration is part of the adapter work.
+
+**It under-masks secrets with no registered value pattern.** The generic field
+rule can't match inside a compound name — `\btoken\b` does not match `idToken` —
+and there is no generic JWT pattern, so an opaque `"idToken":"eyJ…"` or a
+service-specific bearer with no declared shape can survive. (Slack-shaped `xox…`
+values are now caught wherever they appear, including under `api_token` and `d`,
+because Slack registers a *value* pattern and app redaction applies globally.)
 
 So **read the rendered doc before committing it** rather than trusting the
-pipeline. If you find a live credential shape that got through, that's a
-redaction bug worth fixing at the source in `packages/core/src/redact.ts`, not
-just scrubbing from the file.
+pipeline. If you find a live credential shape that got through, the durable fix
+is a value-shaped pattern in the owning app's `redaction.patterns` — not a field
+name, and not scrubbing the file by hand.
 
 ## Then what
 
 The catalog is the input to the `sluice-app` skill: the host list becomes
 `hosts` + `matchRequest`, the response shapes become `parse`, the interesting
-endpoints become `listReplayActions`, and the auth mechanism becomes
-`buildReplayRequest`. Do this pass first — writing an adapter against a real
-catalog is a different activity from writing one against a guess.
+endpoints become `listReplayActions`, the auth mechanism becomes
+`buildReplayRequest`, the pagination shape becomes `nextCursors`, and any
+service-specific token shape becomes `redaction`. Do this pass first — writing an
+adapter against a real catalog is a different activity from writing one against a
+guess.
 
 ## Commit policy
 
-`docs/*-api.md` catalogs may be local/gitignored depending on repo policy — do not force-commit secrets from live capture. Prefer redacted fixtures and the skill output path the user names.
-
+`docs/` is gitignored, so a catalog you generate stays local unless someone
+deliberately force-adds it. Do not force-commit secrets from live capture. Prefer
+redacted fixtures (`scrubCaptures` from `@sluice/adapter-sdk`) and the output path
+the user names.
