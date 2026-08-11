@@ -2,7 +2,7 @@
   "name": "@sluice/mcp",
   "version": "0.0.0",
   "type": "module",
-  "description": "Sluice MCP server \u2014 captured traffic, single + multi-step read-only replay (sluice_replay_flow), and each app's tools over MCP.",
+  "description": "Sluice MCP server \u2014 captured traffic, single + multi-step read-only replay (replay, sluice_replay_flow), and each app's tools over MCP.",
   "bin": {
     "sluice-mcp": "./dist/cli.js"
   },

@@ -52,19 +52,84 @@ bound above". Banning it would push people toward looser typing, not tighter.
 
 `forEach` is fine.
 
+## Rules escalated to error
+
+Everything else runs at Biome's recommended severity. These two are raised to
+`error`, and they are the config's only enforcement teeth.
+
+### `style/useImportType`
+
+`tsconfig.base.json` sets `verbatimModuleSyntax` (and `isolatedModules`), so an
+import statement is emitted exactly as written and no compiler elides type-only
+names for you. A type imported as a value becomes a real runtime import of
+something that does not exist at runtime. TypeScript rejects it outright under
+that flag, so this is a build failure rather than a style preference — the Biome
+rule just tells you before `pnpm typecheck` does. `import type { Capture } from
+'@sluice/core'`, always, for anything that is only a type.
+
+### `suspicious/noExplicitAny`
+
+Sluice's whole job is handling response bodies from services that owe it nothing.
+An `any` at an ingest or parse boundary is precisely how untrusted JSON gets
+treated as trusted: `body.items.map(…)` type-checks fine and throws on the first
+response that shaped `items` as an object. Use `unknown` and narrow it, or use the
+total coercion helpers in `@sluice/adapter-sdk` (`str`, `num`, `bool`, `arr`,
+`obj`, `safeJson`) which return `undefined` rather than lying about the shape.
+
 ## Suppressions in the source
 
-Two `biome-ignore` comments exist, both with a stated reason:
+Four `biome-ignore` comments exist, each with a stated reason:
 
 - `app-trello/src/chrome-cookies.ts` — a regex that matches control characters,
   because rejecting cookie values containing them *is the point*.
+- `app-loom/src/chrome-cookies.ts` — same rule, same reason.
+- `app-linkedin/src/chrome-cookies.ts` — same rule, same reason.
 - `webapp/src/components/DataBrowser.tsx` — an array index as a React key, because
   materialized rows have no guaranteed stable id and the page is replaced wholesale.
+
+Three of the four are the same suppression because four packages carry their own
+copy of the macOS OSCrypt cookie reader — `app-slack/src/slack-credentials.ts`
+plus `chrome-cookies.ts` in app-trello, app-loom and app-linkedin. De-duplicating
+those into one per-platform module removes two of these comments as a side effect.
 
 If you add one, say why in the comment. A suppression without a reason is just a
 disabled check.
 
-### `a11y/useKeyWithClickEvents` (webapp)
+## Overrides in biome.json
 
-`TrafficDashboard` row/tab click targets also handle keyboard activation. Where Biome still flags a pattern that already has `tabIndex` + `onKeyDown`, a file-local `biome-ignore` is acceptable; prefer wiring real keyboard handlers over blanket disables.
+### `a11y/useSemanticElements` (TrafficDashboard only)
+
+`biome.json` turns this rule off for exactly one path,
+`apps/webapp/src/components/TrafficDashboard.tsx`. It is a config override rather
+than a source suppression because it applies to the whole file — the traffic table
+is `role="grid"` over absolutely-positioned `div`s, not a `<table>`, and the rule
+fires on every one of them.
+
+The reason is the virtualizer: `@tanstack/react-virtual` positions rows by
+absolute offset, which table layout will not tolerate. The ARIA structure is real
+— `grid > rowgroup > row > gridcell` throughout, with the header inside the grid
+so a `role="row"` always has a grid ancestor — it just is not built out of table
+elements. The comment at the top of the grid in that file says the same thing.
+
+This is the only override in the config. Do not widen it; a second file wanting
+the same exemption is a sign the pattern should be extracted, not that the rule is
+wrong.
+
+## What Biome does not see
+
+`biome.json` matches three globs only: `packages/*/src/**/*.ts`,
+`apps/webapp/src/**/*.ts` and `apps/webapp/src/**/*.tsx`. Unlinted, therefore:
+
+- `scripts/build.mjs` — the esbuild build script.
+- `vite.config.ts` and anything else at a package root.
+- `apps/webapp/src/**/*.js`.
+- Everything in `packages/extension` — the MV3 extension is plain JavaScript with
+  no `src/*.ts`, so none of it is linted or typechecked.
+
+`pnpm lint` currently checks 160 files, exits 0, and reports 3 warnings and 1
+info: `style/useTemplate` and `complexity/noCommaOperator` in
+`packages/core/src/store.ts`, `style/useConst` in
+`packages/interceptor/src/flow-replay.ts`, and an unused `Supervisor` type import
+in `packages/runner/src/cli.ts`. Biome exits 0 on warnings, so CI is green with
+these outstanding — a clean run is not the same as a green one.
 
