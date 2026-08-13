@@ -47,6 +47,51 @@ Being straight about these matters more than the marketing value of omitting the
 - **The MITM engine decrypts every host by default** while it is running, not only the hosts an adapter claims. Unrelated tabs and apps on the same proxy path are redacted and stored unless you scope with `--host` / `interceptHosts` or set `interceptAllHosts: false`. Keep proxy sessions short, and prefer `sluice capture` (browser CDP, no proxy and no CA) when it is sufficient.
 - **Nothing expires by default.** Capture is retained until you remove it. Set `retentionDays` and/or `maxCaptures` in `sluice.config.json` (or `~/.sluice/config.json`) and the runner prunes at every `serve` and `start`, printing what it removed. Those two keys are the settings that most directly bound your exposure. Without them, use `sluice prune --days N` / `--max-rows N` or `sluice wipe`.
 
+### The MITM proxy listens on every interface, not just loopback
+
+This is the sharpest gap in the current design, and it is worth reading twice.
+
+The dashboard and API bind `127.0.0.1` as documented. The **proxy does not.**
+`mockttp` starts its listener with `server.listen(port)` and no host argument,
+which in Node means every interface, and there is no option in mockttp 4.6.0 to
+narrow it. Observed directly while `sluice start` was running:
+
+```
+TCP 127.0.0.1:7799  (LISTEN)   ← API + dashboard, loopback only
+TCP *:18080         (LISTEN)   ← MITM proxy, ALL interfaces
+```
+
+Two consequences while capture is running:
+
+- **Anyone on your network can use your machine as an open proxy.** On a shared
+  or untrusted LAN — a café, a hotel, a coworking space, a corporate network —
+  a stranger can route traffic through you. Because Engine A decrypts every host
+  by default, that traffic is decrypted and written into *your* store.
+- **It is a path to the loopback API.** A request sent *through* the proxy to
+  `127.0.0.1:<port>` arrives at the server looking local, so the loopback `Host`
+  check passes. What still stops it is the read token, which is required for
+  every `GET /api/*` and the `/ws` upgrade and compared in constant time. The
+  layer that should have stopped it earlier — binding to loopback — is absent.
+  This is the same shape as mitmproxy's CVE-2025-23217.
+
+Until mockttp exposes a bind address: do not run `sluice start` on a network you
+do not trust, keep proxy sessions short, and prefer `sluice capture` (browser
+CDP, no proxy at all) when it is sufficient. A host-level firewall rule on the
+proxy port is an effective stopgap.
+
+### The extension's host allowlist is a client-side promise
+
+The MV3 extension is default-deny and captures nothing until you name hosts. That
+check lives **only in the extension**. `POST /api/ingest` accepts whatever host
+the poster claims, with no server-side scope check against the installed
+adapters. So the guarantee "capturing my Slack will not ship my bank" holds only
+as long as the client is the one you installed — anything else holding the ingest
+token can post captures attributed to any host, and Sluice will store them.
+
+The ingest token is write-only and gates nothing else, so the blast radius is
+"false records in your own store" rather than disclosure. Still, the honest
+framing is that scope is enforced at the wrong end.
+
 ### Data at rest is plaintext
 
 `~/.sluice/sluice.db` holds up to **5 MB of response body per capture, in plaintext**. There is no encryption and no file-mode hardening: Sluice creates the parent directory and nothing calls `chmod`, so the database inherits your umask. Bodies over 2048 characters are gzip-compressed, which is a size optimisation and **not** protection.
