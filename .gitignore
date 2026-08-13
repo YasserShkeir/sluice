@@ -44,4 +44,11 @@ logs/
 
 # Design docs, plans and captured API catalogs — kept locally, not in the repo.
 # The API catalogs in particular are rendered from real captured traffic.
-docs/
+# Note the trailing /* rather than /: git will not descend into an excluded
+# DIRECTORY, so `docs/` would make the re-include below impossible.
+docs/*
+# ...except docs/public/, which is where anything meant for readers goes. The
+# carve-out is deliberate: a trust artifact nobody can read does no work, while
+# everything else under docs/ either contains real captured traffic or is a
+# private working note.
+!docs/public/
