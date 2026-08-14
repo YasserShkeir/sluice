@@ -202,6 +202,63 @@ test('materialize dedupes id-less collections via a content-hash key (slack_mess
   store.close();
 });
 
+test('materialize keeps an existing id PK when a later batch has no id (no __pk crash)', () => {
+  // Live materialize is incremental. A first batch can create slack_item with
+  // PRIMARY KEY(id); a later sinceTs batch of id-less objects used to INSERT
+  // `__pk` and abort the whole transaction ("table slack_item has no column
+  // named __pk"). The key strategy must stick to the existing table.
+  const store = new SqliteStore(':memory:');
+  store.insertCapture(
+    capture({
+      id: 'item-with-id',
+      ts: 1_700_000_000_000,
+      path: '/api/items.withId',
+      url: 'https://slack.com/api/items.withId',
+      resBody: JSON.stringify({
+        ok: true,
+        items: [{ id: 'I1', name: 'has-id' }],
+      }),
+    }),
+  );
+  materialize(store);
+  const cols1 = (
+    store.db.prepare('PRAGMA table_info("slack_item")').all() as Array<{ name: string; pk: number }>
+  );
+  assert.ok(cols1.some((c) => c.name === 'id' && c.pk > 0));
+  assert.ok(!cols1.some((c) => c.name === '__pk'));
+
+  store.insertCapture(
+    capture({
+      id: 'item-no-id',
+      ts: 1_700_000_010_000,
+      path: '/api/items.noId',
+      url: 'https://slack.com/api/items.noId',
+      resBody: JSON.stringify({
+        ok: true,
+        items: [
+          { name: 'orphan-a', kind: 'x' },
+          { name: 'orphan-b', kind: 'y' },
+        ],
+      }),
+    }),
+  );
+  // Incremental pass — only the id-less capture. Must not throw.
+  const r = materialize(store, { sinceTs: 1_700_000_005_000 });
+  assert.ok(r.tables.some((t) => t.name === 'slack_item'));
+  const cols2 = (
+    store.db.prepare('PRAGMA table_info("slack_item")').all() as Array<{ name: string }>
+  ).map((c) => c.name);
+  assert.ok(!cols2.includes('__pk'), 'must not bolt __pk onto an id-keyed table');
+  // Original id row still present; id-less rows were skipped.
+  const n = (store.db.prepare('SELECT COUNT(*) AS n FROM slack_item').get() as { n: number }).n;
+  assert.equal(n, 1);
+  const row = store.db.prepare('SELECT name FROM slack_item WHERE id = ?').get('I1') as {
+    name: string;
+  };
+  assert.equal(row.name, 'has-id');
+  store.close();
+});
+
 test('renderMarkdown emits a section per endpoint and leaks no secret values', () => {
   const store = new SqliteStore(':memory:');
   seed(store);

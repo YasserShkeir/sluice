@@ -104,6 +104,45 @@ export interface ReplayErrorMsg extends ServerFrame {
   error: string;
 }
 
+/**
+ * One step of a multi-step flow run, as reported to the dashboard.
+ *
+ * Mirrors interceptor `FlowStepResult` without importing interceptor into core.
+ * Bodies never travel here — only ids, status, and short detail strings.
+ */
+export interface FlowRunStepMsg {
+  seq: number;
+  role: string;
+  operation?: string;
+  method: string;
+  path: string;
+  status: string;
+  captureId?: string;
+  httpStatus?: number | null;
+  detail?: string;
+  durationMs?: number;
+}
+
+/** Successful multi-step flow run (or completed-with-soft-fails). */
+export interface FlowResultMsg extends ServerFrame {
+  type: 'flow.result';
+  requestId: string;
+  ok: boolean;
+  templateId: string;
+  primaryKey: string;
+  flowId?: string;
+  refreshed?: boolean;
+  error?: string;
+  steps: FlowRunStepMsg[];
+}
+
+/** Flow run refused or failed before producing a step list worth showing. */
+export interface FlowErrorMsg extends ServerFrame {
+  type: 'flow.error';
+  requestId: string;
+  error: string;
+}
+
 export interface SessionDiscoveredMsg extends ServerFrame {
   type: 'session.discovered';
   session: RedactedSession;
@@ -323,6 +362,8 @@ export type ServerMsg =
   | EntityUpsertMsg
   | ReplayResultMsg
   | ReplayErrorMsg
+  | FlowErrorMsg
+  | FlowResultMsg
   | SessionDiscoveredMsg
   | StatusMsg
   | AppsMsg
@@ -387,6 +428,22 @@ export interface ReplayRunMsg {
   type: 'replay.run';
   requestId: string;
   actionId: string;
+  params: Record<string, string>;
+  sessionId?: string;
+}
+
+/**
+ * Run a learned multi-step flow template from the dashboard (F7.3).
+ *
+ * Same rails as CLI `sluice replay --flow` and MCP `sluice_replay_flow`: each
+ * step pays method/operation/budget independently. Params are the template's
+ * `flowParams` (strings only), not adapter action params.
+ */
+export interface FlowRunMsg {
+  type: 'flow.run';
+  requestId: string;
+  /** Flow template id from `listFlowTemplates` / Learn-flows. */
+  templateId: string;
   params: Record<string, string>;
   sessionId?: string;
 }
@@ -516,6 +573,7 @@ export type ClientMsg =
   | HelloOkMsg
   | SubscribeMsg
   | ReplayRunMsg
+  | FlowRunMsg
   | ExportMsg
   | SyncMsg
   | CaptureControlMsg

@@ -97,6 +97,18 @@ const replayRun = z.object({
   sessionId: id.optional(),
 });
 
+const flowRun = z.object({
+  type: z.literal('flow.run'),
+  requestId: id,
+  templateId: id,
+  // Same string-only map as replay.run — flow params become URL/path pieces.
+  params: z.record(z.string().max(MAX_PARAM_VALUE)).refine(
+    (p) => Object.keys(p).length <= MAX_PARAMS,
+    `at most ${MAX_PARAMS} params`,
+  ),
+  sessionId: id.optional(),
+});
+
 const exportMsg = z.object({
   type: z.literal('export'),
   containerId: id.optional(),
@@ -166,6 +178,7 @@ export const clientMsgSchema = z.discriminatedUnion('type', [
   helloOk,
   subscribe,
   replayRun,
+  flowRun,
   exportMsg,
   sync,
   captureControl,
