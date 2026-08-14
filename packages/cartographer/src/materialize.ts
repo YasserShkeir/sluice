@@ -11,6 +11,18 @@
  * Only *response* record objects are materialized (never request bodies, which
  * are where the redacted token lives), and rows are keyed so a re-run never
  * duplicates data.
+ *
+ * ## Primary-key strategy is sticky
+ *
+ * A fresh table keys on `id` when the *current* batch's records carry one, else
+ * on a content-hash column `__pk`. Live materialize is incremental (`sinceTs`),
+ * so a later batch can disagree with the first — e.g. one Slack endpoint emits
+ * items with `id`, another emits id-less rows into the same `slack_item`
+ * collector. `CREATE TABLE IF NOT EXISTS` will not rewrite the first schema, and
+ * blindly inserting `__pk` into an id-keyed table throws
+ * `table … has no column named __pk` and aborts the whole transaction (every
+ * app's rebuild). Inserts always follow the **existing** table's key column;
+ * id-less rows are skipped on an id-keyed table rather than crashing.
  */
 import { createHash } from 'node:crypto';
 import type { SqliteStore } from '@sluice/core';
@@ -182,26 +194,54 @@ function toBindable(v: unknown): string | number | null {
   }
 }
 
+interface ColInfo {
+  name: string;
+  pk: number;
+}
+
+function tableInfo(store: SqliteStore, table: string): ColInfo[] {
+  return store.db.prepare(`PRAGMA table_info(${quoteIdent(table)})`).all() as ColInfo[];
+}
+
+/**
+ * How rows are keyed in an already-created table, or how a new one should be.
+ *
+ * Existing wins: an incremental batch must not invent `__pk` against an id-keyed
+ * table (or drop `id` as the conflict target). Fresh tables follow the batch.
+ */
+function keyMode(store: SqliteStore, spec: TableSpec): 'id' | '__pk' {
+  const cols = tableInfo(store, spec.name);
+  if (cols.length === 0) return spec.primaryKey === 'id' ? 'id' : '__pk';
+  if (cols.some((c) => c.name === '__pk')) return '__pk';
+  if (cols.some((c) => c.name === 'id' && c.pk > 0)) return 'id';
+  // Odd legacy: has `id` but not marked pk, or neither — prefer id when present.
+  if (cols.some((c) => c.name === 'id')) return 'id';
+  return '__pk';
+}
+
 function createOrAlterTable(store: SqliteStore, spec: TableSpec): void {
-  const hasId = spec.primaryKey === 'id';
-  const defs: string[] = [];
-  if (!hasId) defs.push(`"__pk" TEXT PRIMARY KEY`);
-  for (const [name, col] of Object.entries(spec.columns)) {
-    let def = `${quoteIdent(name)} ${col.sqliteType}`;
-    if (hasId && name === 'id') def += ' PRIMARY KEY';
-    defs.push(def);
+  const existing = tableInfo(store, spec.name);
+  if (existing.length === 0) {
+    const useId = spec.primaryKey === 'id';
+    const defs: string[] = [];
+    if (!useId) defs.push(`"__pk" TEXT PRIMARY KEY`);
+    for (const [name, col] of Object.entries(spec.columns)) {
+      let def = `${quoteIdent(name)} ${col.sqliteType}`;
+      if (useId && name === 'id') def += ' PRIMARY KEY';
+      defs.push(def);
+    }
+    store.db.exec(`CREATE TABLE IF NOT EXISTS ${quoteIdent(spec.name)} (${defs.join(', ')})`);
   }
-  store.db.exec(`CREATE TABLE IF NOT EXISTS ${quoteIdent(spec.name)} (${defs.join(', ')})`);
 
   // The runner may re-materialize as new fields appear; add any missing columns.
-  const existing = new Set(
-    (store.db.prepare(`PRAGMA table_info(${quoteIdent(spec.name)})`).all() as Array<{
-      name: string;
-    }>).map((r) => r.name),
-  );
+  // Never add `__pk` to an id-keyed table — inserts follow keyMode(), and a
+  // half-migrated PK is worse than skipping id-less rows.
+  const have = new Set(tableInfo(store, spec.name).map((r) => r.name));
   for (const [name, col] of Object.entries(spec.columns)) {
-    if (!existing.has(name)) {
-      store.db.exec(`ALTER TABLE ${quoteIdent(spec.name)} ADD COLUMN ${quoteIdent(name)} ${col.sqliteType}`);
+    if (!have.has(name)) {
+      store.db.exec(
+        `ALTER TABLE ${quoteIdent(spec.name)} ADD COLUMN ${quoteIdent(name)} ${col.sqliteType}`,
+      );
     }
   }
 }
@@ -212,16 +252,32 @@ function insertRecords(
   records: Array<Record<string, unknown>>,
 ): void {
   const colNames = Object.keys(spec.columns);
-  const hasId = spec.primaryKey === 'id';
-  const allCols = hasId ? colNames : ['__pk', ...colNames];
+  const mode = keyMode(store, spec);
+  const allCols = mode === 'id' ? colNames : ['__pk', ...colNames];
+  // Ensure every INSERT column exists (createOrAlter only adds spec.columns).
+  if (mode === '__pk') {
+    const have = new Set(tableInfo(store, spec.name).map((r) => r.name));
+    if (!have.has('__pk')) {
+      // Table existed without __pk and without an id PK — last-resort column so
+      // inserts can proceed. Not a PRIMARY KEY (SQLite can't ADD that); uniqueness
+      // is best-effort via REPLACE on the rowid-less path only when __pk was PK.
+      // Prefer drop+rebuild via sluice build-db for a clean schema.
+      store.db.exec(`ALTER TABLE ${quoteIdent(spec.name)} ADD COLUMN "__pk" TEXT`);
+    }
+  }
   const columnList = allCols.map(quoteIdent).join(', ');
   const placeholders = allCols.map(() => '?').join(', ');
   const stmt = store.db.prepare(
     `INSERT OR REPLACE INTO ${quoteIdent(spec.name)} (${columnList}) VALUES (${placeholders})`,
   );
   for (const rec of records) {
-    const values = colNames.map((n) => toBindable(rec[n]));
-    stmt.run(hasId ? values : [contentHash(rec), ...values]);
+    if (mode === 'id') {
+      // Id-keyed table: skip id-less rows rather than inventing a second key.
+      if (rec.id === undefined || rec.id === null) continue;
+      stmt.run(colNames.map((n) => toBindable(rec[n])));
+    } else {
+      stmt.run([contentHash(rec), ...colNames.map((n) => toBindable(rec[n]))]);
+    }
   }
 }
 

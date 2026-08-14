@@ -121,11 +121,27 @@ export interface ReplayRecord {
   params: Record<string, string>;
   startedAt: number;
   state: 'pending' | 'ok' | 'error';
+  /** Single-action vs multi-step flow (F7.3). */
+  kind?: 'action' | 'flow';
   /** Set on 'ok' — the capture id, so the traffic table can be pointed at it. */
   captureId?: string;
   status?: number | null;
   /** Entities the response yielded, for the "what did this get me?" line. */
   entities?: number;
+  /** Flow-only: parent interaction flow id when the runner persisted one. */
+  flowId?: string;
+  /** Flow-only: per-step log from `flow.result`. */
+  flowSteps?: Array<{
+    seq: number;
+    role: string;
+    operation?: string;
+    method: string;
+    path: string;
+    status: string;
+    captureId?: string;
+    httpStatus?: number | null;
+    detail?: string;
+  }>;
   /** Set on 'error' — already redacted by the runner. */
   error?: string;
   finishedAt?: number;
@@ -146,6 +162,19 @@ let engines: EngineStatus[] = [];
 let appCatalog: AppCatalogEntry[] = [];
 /** Newest first, capped. Running + recently-finished operations. */
 let operations: OpProgress[] = [];
+
+/**
+ * Highest broadcast `seq` this tab has applied. Sent as `subscribe.sinceSeq` on
+ * reconnect so the runner can resume from its ring instead of re-priming 2000
+ * rows. Cleared when a full backfill replaces the buffer (or on wipe).
+ */
+let lastBroadcastSeq = 0;
+/**
+ * When true, the next `capture.backfill` with `mode: 'full'` replaces the ring
+ * before applying. Set on open; cleared after the first full-prime chunk so
+ * multi-chunk primes fold rather than wipe mid-stream.
+ */
+let expectFullPrimeReplace = true;
 
 /** How many operations the activity surface keeps. */
 const MAX_OPERATIONS = 20;
@@ -304,6 +333,7 @@ export function distinctValues(captures: Capture[], pick: (c: Capture) => string
 export function clearCaptureRing(): void {
   captureArr.length = 0;
   captureIndex.clear();
+  lastBroadcastSeq = 0;
   touch();
 }
 
@@ -324,6 +354,12 @@ function upsertCapture(c: Capture): void {
 }
 
 function handleMessage(msg: ServerMsg): void {
+  // Broadcast frames carry seq; point-to-point answers do not. Track the high
+  // water mark so a reconnect can resume instead of a full 2000-row backfill.
+  if (typeof msg.seq === 'number' && Number.isFinite(msg.seq) && msg.seq > lastBroadcastSeq) {
+    lastBroadcastSeq = msg.seq;
+  }
+
   switch (msg.type) {
     case 'hello':
       appVersion = msg.appVersion;
@@ -337,6 +373,15 @@ function handleMessage(msg: ServerMsg): void {
     case 'capture.backfill':
       // Priming batch sent on subscribe, oldest-first. One frame per capture
       // used to melt the socket on reload; these arrive in chunks instead.
+      // Full prime (first connect or failed resume) replaces the previous era;
+      // resume mode only folds deltas onto what we already hold.
+      if (msg.mode === 'full' && expectFullPrimeReplace) {
+        captureArr.length = 0;
+        captureIndex.clear();
+        expectFullPrimeReplace = false;
+        // New era — do not keep a stale high-water mark from the previous ring.
+        lastBroadcastSeq = 0;
+      }
       for (const c of msg.captures) upsertCapture(c);
       break;
     case 'replay.result':
@@ -357,6 +402,35 @@ function handleMessage(msg: ServerMsg): void {
       // Was a no-op, so a denied or failed replay was invisible: the safety
       // rails refuse a write with a reason, and the reason never reached anyone.
       settleReplay(msg.requestId, (r) => ({ ...r, state: 'error', error: msg.error }));
+      break;
+    case 'flow.result':
+      settleReplay(msg.requestId, (r) => ({
+        ...r,
+        kind: 'flow',
+        state: msg.ok ? 'ok' : 'error',
+        error: msg.ok ? undefined : (msg.error ?? 'flow failed'),
+        flowId: msg.flowId,
+        captureId: msg.steps.find((s) => s.captureId)?.captureId,
+        flowSteps: msg.steps.map((s) => ({
+          seq: s.seq,
+          role: s.role,
+          operation: s.operation,
+          method: s.method,
+          path: s.path,
+          status: s.status,
+          captureId: s.captureId,
+          httpStatus: s.httpStatus,
+          detail: s.detail,
+        })),
+      }));
+      break;
+    case 'flow.error':
+      settleReplay(msg.requestId, (r) => ({
+        ...r,
+        kind: 'flow',
+        state: 'error',
+        error: msg.error,
+      }));
       break;
     case 'status':
       // MERGED by engine kind, not assigned. A transition frame carries one
@@ -537,7 +611,13 @@ function connect(): void {
   ws.onopen = () => {
     retries = 0;
     setConnection('open');
-    send({ type: 'subscribe' });
+    // Next full prime (if resume is refused) should replace, not stitch eras.
+    expectFullPrimeReplace = true;
+    const sub: ClientMsg =
+      lastBroadcastSeq > 0
+        ? { type: 'subscribe', sinceSeq: lastBroadcastSeq }
+        : { type: 'subscribe' };
+    send(sub);
     for (const raw of outbox.splice(0)) ws.send(raw);
   };
 
@@ -679,9 +759,37 @@ export function sendReplayRun(
     params,
     startedAt: Date.now(),
     state: 'pending',
+    kind: 'action',
   };
   replays = [record, ...replays].slice(0, MAX_REPLAYS);
   touch();
   send({ type: 'replay.run', requestId, actionId, params });
+  return requestId;
+}
+
+/**
+ * Run a learned multi-step flow from the dashboard (F7.3).
+ *
+ * Same pending-before-send discipline as {@link sendReplayRun}: the reply is
+ * correlated by `requestId`, so the worklist row must exist first.
+ */
+export function sendFlowRun(
+  templateId: string,
+  label: string,
+  params: Record<string, string>,
+): string {
+  const requestId = newRequestId();
+  const record: ReplayRecord = {
+    requestId,
+    actionId: templateId,
+    label,
+    params,
+    startedAt: Date.now(),
+    state: 'pending',
+    kind: 'flow',
+  };
+  replays = [record, ...replays].slice(0, MAX_REPLAYS);
+  touch();
+  send({ type: 'flow.run', requestId, templateId, params });
   return requestId;
 }

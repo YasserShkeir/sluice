@@ -26,7 +26,7 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import type { AppCatalogEntry, AppCatalogReplayAction } from '@sluice/core';
 import { navigate, useLink } from '../router.js';
-import { sendReplayRun } from '../ws.js';
+import { sendFlowRun, sendReplayRun } from '../ws.js';
 import type { ReplayRecord, StoreState } from '../ws.js';
 import { fetchFlowTemplates, type FlowTemplateSummary } from '../api.js';
 import { Button } from '../ui/button.js';
@@ -57,26 +57,35 @@ export function ReplayPage({ actionId, apps, replays, budget }: Props) {
     () => entries.find((e) => e.action.id === actionId),
     [entries, actionId],
   );
+  const [selectedFlowId, setSelectedFlowId] = useState<string | undefined>();
 
   return (
     <ResizablePanelGroup orientation="horizontal">
       <ResizablePanel defaultSize="22" minSize="14">
         <div className="flex h-full min-h-0 flex-col">
           <div className="min-h-0 flex-1 overflow-auto">
-            <ActionList entries={entries} selectedId={actionId} />
+            <ActionList entries={entries} selectedId={actionId} onPickAction={() => setSelectedFlowId(undefined)} />
           </div>
           <div className="max-h-[40%] shrink-0 overflow-auto border-t border-border">
-            <FlowTemplatesPanel />
+            <FlowTemplatesPanel
+              selectedId={selectedFlowId}
+              onSelect={(id) => {
+                setSelectedFlowId(id);
+                if (actionId) navigate({ name: 'replay' });
+              }}
+            />
           </div>
         </div>
       </ResizablePanel>
       <ResizableHandle orientation="horizontal" />
       <ResizablePanel defaultSize="40" minSize="24">
-        {selected === undefined ? (
+        {selectedFlowId !== undefined ? (
+          <FlowRunForm key={selectedFlowId} templateId={selectedFlowId} budget={budget} />
+        ) : selected === undefined ? (
           <Empty>
             {entries.length === 0
               ? 'No app exposes a replay action. Adapters declare them with listReplayActions().'
-              : 'Pick an action on the left. Multi-step templates list below — replay those via CLI (`sluice replay --flow`) or MCP `sluice_replay_flow`.'}
+              : 'Pick an action on the left, or a learned multi-step flow below.'}
           </Empty>
         ) : (
           <ActionForm key={selected.action.id} entry={selected} budget={budget} />
@@ -92,7 +101,15 @@ export function ReplayPage({ actionId, apps, replays, budget }: Props) {
 
 // ── The action list ──────────────────────────────────────────────────────────────
 
-function ActionList({ entries, selectedId }: { entries: Entry[]; selectedId?: string }) {
+function ActionList({
+  entries,
+  selectedId,
+  onPickAction,
+}: {
+  entries: Entry[];
+  selectedId?: string;
+  onPickAction: () => void;
+}) {
   const link = useLink();
   const byApp = useMemo(() => {
     const out = new Map<string, Entry[]>();
@@ -115,6 +132,7 @@ function ActionList({ entries, selectedId }: { entries: Entry[]; selectedId?: st
                 key={action.id}
                 {...link({ name: 'replay', actionId: action.id })}
                 aria-current={action.id === selectedId ? 'page' : undefined}
+                onClick={onPickAction}
                 className={[
                   'flex items-center gap-2 px-2.5 py-1.5 pl-4 text-[12px] no-underline transition-colors',
                   'focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-accent',
@@ -319,6 +337,7 @@ function Worklist({ replays }: { replays: ReplayRecord[] }) {
           <div className="flex items-baseline gap-2">
             <StateDot state={r.state} />
             <span className="truncate text-[12px] text-fg">{r.label}</span>
+            {r.kind === 'flow' ? <Badge className="shrink-0">flow</Badge> : null}
             <span className="ml-auto shrink-0 text-[11px] tabular-nums text-fg-mute">
               {r.finishedAt === undefined
                 ? 'running…'
@@ -333,16 +352,53 @@ function Worklist({ replays }: { replays: ReplayRecord[] }) {
             </div>
           ) : null}
           {r.state === 'error' ? (
-            <p className="mt-1 whitespace-pre-wrap break-words text-[11.5px] text-danger">
+            <p className="mt-1 whitespace-pre-wrap wrap-break-word text-[11.5px] text-danger">
               {r.error}
             </p>
           ) : null}
-          {r.state === 'ok' ? (
+          {r.state === 'ok' && r.kind !== 'flow' ? (
             <div className="mt-1 flex items-center gap-2 text-[11px] text-fg-mute">
               <span>HTTP {r.status ?? '—'}</span>
               <span>
                 {r.entities ?? 0} {r.entities === 1 ? 'entity' : 'entities'}
               </span>
+              <button
+                type="button"
+                onClick={() => navigate({ name: 'traffic' })}
+                className="text-fg-dim underline-offset-2 hover:text-accent hover:underline"
+              >
+                see it in Traffic
+              </button>
+            </div>
+          ) : null}
+          {r.flowSteps && r.flowSteps.length > 0 ? (
+            <ol className="mt-1.5 space-y-0.5 border-l border-border pl-2 text-[10.5px] text-fg-mute">
+              {r.flowSteps.map((s) => (
+                <li key={s.seq} className="flex flex-wrap gap-x-1.5">
+                  <span className="tabular-nums text-fg-dim">[{s.seq}]</span>
+                  <span
+                    className={
+                      s.status === 'ok'
+                        ? 'text-ok'
+                        : s.status === 'skipped' || s.status === 'soft_fail'
+                          ? 'text-fg-mute'
+                          : 'text-danger'
+                    }
+                  >
+                    {s.status}
+                  </span>
+                  <span className="font-mono">
+                    {s.method} {s.path}
+                  </span>
+                  {s.httpStatus != null ? <span>→ {s.httpStatus}</span> : null}
+                  {s.detail ? <span className="text-fg-mute">— {s.detail}</span> : null}
+                </li>
+              ))}
+            </ol>
+          ) : null}
+          {r.state === 'ok' && r.kind === 'flow' ? (
+            <div className="mt-1 flex items-center gap-2 text-[11px] text-fg-mute">
+              {r.flowId ? <span className="font-mono text-[10px]">flow {r.flowId}</span> : null}
               <button
                 type="button"
                 onClick={() => navigate({ name: 'traffic' })}
@@ -378,9 +434,15 @@ function Empty({ children }: { children: React.ReactNode }) {
   return <p className="p-4 text-[12px] text-fg-mute">{children}</p>;
 }
 
-// ── Learned multi-step templates (read-only picker) ──────────────────────────────
+// ── Learned multi-step templates ─────────────────────────────────────────────────
 
-function FlowTemplatesPanel() {
+function FlowTemplatesPanel({
+  selectedId,
+  onSelect,
+}: {
+  selectedId?: string;
+  onSelect: (id: string) => void;
+}) {
   const [templates, setTemplates] = useState<FlowTemplateSummary[]>([]);
   const [error, setError] = useState<string | null>(null);
 
@@ -407,33 +469,164 @@ function FlowTemplatesPanel() {
         <p className="px-2.5 py-1 text-[11px] text-fg-mute">{error}</p>
       ) : templates.length === 0 ? (
         <p className="px-2.5 py-1.5 text-[11px] text-fg-mute">
-          None yet. Capture traffic, run <code className="font-mono">sluice learn-flows</code>, or open Traffic → Group flows.
+          None yet. Capture traffic, run <code className="font-mono">sluice learn-flows</code>, or
+          open Traffic → Group flows.
         </p>
       ) : (
         <ul className="overflow-auto">
-          {templates.map((t) => (
-            <li
-              key={t.id}
-              className="border-t border-border/60 px-2.5 py-1.5 text-[11px] text-fg-dim"
-              title={`id=${t.id}`}
-            >
-              <div className="flex items-center gap-1.5">
-                <span className="truncate font-medium text-fg">{t.primaryKey}</span>
-                <Badge className="ml-auto shrink-0">{t.adapterId}</Badge>
-              </div>
-              <div className="text-fg-mute">
-                {t.stepCount} steps · {t.sampleCount} sample{t.sampleCount === 1 ? '' : 's'}
-                {t.flowParams.length > 0
-                  ? ` · params ${t.flowParams.map((p) => p.name + (p.required ? '*' : '')).join(', ')}`
-                  : ''}
-              </div>
-              <div className="mt-0.5 font-mono text-[10px] text-fg-mute">
-                sluice replay --flow {t.id}
-              </div>
-            </li>
-          ))}
+          {templates.map((t) => {
+            const selected = t.id === selectedId;
+            return (
+              <li key={t.id} className="border-t border-border/60">
+                <button
+                  type="button"
+                  onClick={() => onSelect(t.id)}
+                  aria-current={selected ? 'true' : undefined}
+                  className={[
+                    'w-full px-2.5 py-1.5 text-left text-[11px] transition-colors',
+                    'focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-accent',
+                    selected ? 'bg-accent-dim text-fg' : 'text-fg-dim hover:bg-bg-3 hover:text-fg',
+                  ].join(' ')}
+                  title={`id=${t.id}`}
+                >
+                  <div className="flex items-center gap-1.5">
+                    <span className="truncate font-medium text-fg">{t.primaryKey}</span>
+                    <Badge className="ml-auto shrink-0">{t.adapterId}</Badge>
+                  </div>
+                  <div className="text-fg-mute">
+                    {t.stepCount} steps · {t.sampleCount} sample
+                    {t.sampleCount === 1 ? '' : 's'}
+                    {t.flowParams.length > 0
+                      ? ` · params ${t.flowParams.map((p) => p.name + (p.required ? '*' : '')).join(', ')}`
+                      : ''}
+                  </div>
+                </button>
+              </li>
+            );
+          })}
         </ul>
       )}
     </section>
+  );
+}
+
+/** Form + run for one learned flow template (F7.3). */
+function FlowRunForm({
+  templateId,
+  budget,
+}: {
+  templateId: string;
+  budget: StoreState['replayBudget'];
+}) {
+  const [tmpl, setTmpl] = useState<FlowTemplateSummary | null>(null);
+  const [loadError, setLoadError] = useState<string | null>(null);
+  const [values, setValues] = useState<Record<string, string>>({});
+
+  useEffect(() => {
+    let cancelled = false;
+    setTmpl(null);
+    setLoadError(null);
+    void fetchFlowTemplates({ limit: 100 })
+      .then((r) => {
+        if (cancelled) return;
+        const hit = r.templates.find((t) => t.id === templateId) ?? null;
+        setTmpl(hit);
+        if (!hit) setLoadError('Template not found — it may have been re-learned with a new id.');
+        else {
+          const init: Record<string, string> = {};
+          for (const p of hit.flowParams) init[p.name] = '';
+          setValues(init);
+        }
+      })
+      .catch((e: unknown) => {
+        if (!cancelled) setLoadError(e instanceof Error ? e.message : String(e));
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [templateId]);
+
+  const missing =
+    tmpl?.flowParams.filter((p) => p.required && (values[p.name] ?? '').trim() === '').map((p) => p.name) ??
+    [];
+  const exhausted = budget !== undefined && budget.tokens < 1;
+  // Multi-step: need at least as many tokens as required steps when known.
+  const stepNeed = tmpl?.stepCount ?? 1;
+  const shortBudget = budget !== undefined && budget.tokens < Math.min(stepNeed, budget.capacity);
+
+  const run = useCallback(() => {
+    if (!tmpl) return;
+    const params: Record<string, string> = {};
+    for (const [k, v] of Object.entries(values)) if (v.trim() !== '') params[k] = v;
+    sendFlowRun(tmpl.id, `Flow · ${tmpl.primaryKey}`, params);
+  }, [tmpl, values]);
+
+  if (loadError) return <Empty>{loadError}</Empty>;
+  if (!tmpl) return <Empty>Loading template…</Empty>;
+
+  return (
+    <div className="flex h-full flex-col">
+      <div className="flex shrink-0 items-center gap-2 border-b border-border bg-bg-1 px-2.5 py-1.5">
+        <span className="text-[12.5px] font-medium text-fg">{tmpl.primaryKey}</span>
+        <Badge>flow</Badge>
+        <Badge>{tmpl.adapterId}</Badge>
+        <span className="ml-auto">
+          <RateMeter budget={budget} />
+        </span>
+      </div>
+
+      <form
+        className="flex-1 overflow-auto p-3"
+        onSubmit={(e) => {
+          e.preventDefault();
+          if (missing.length === 0 && !exhausted) run();
+        }}
+      >
+        <p className="mb-3 text-[12px] text-fg-mute">
+          {tmpl.stepCount} learned step{tmpl.stepCount === 1 ? '' : 's'} · {tmpl.sampleCount} sample
+          {tmpl.sampleCount === 1 ? '' : 's'}. Each step pays the same read-only rails and rate budget
+          as a single replay.
+        </p>
+        {tmpl.flowParams.length === 0 ? (
+          <p className="text-[12px] text-fg-mute">No flow parameters — run as observed.</p>
+        ) : (
+          <div className="flex flex-col gap-3">
+            {tmpl.flowParams.map((p) => (
+              <label key={p.name} className="flex flex-col gap-1">
+                <span className="text-[11.5px] text-fg-dim">
+                  {p.name}
+                  {p.required ? <span className="text-danger"> *</span> : null}
+                </span>
+                <Input
+                  value={values[p.name] ?? ''}
+                  onChange={(e) => setValues((v) => ({ ...v, [p.name]: e.target.value }))}
+                  autoComplete="off"
+                  spellCheck={false}
+                />
+              </label>
+            ))}
+          </div>
+        )}
+        {missing.length > 0 ? (
+          <p className="mt-3 text-[11.5px] text-danger">Required: {missing.join(', ')}</p>
+        ) : null}
+        {shortBudget && !exhausted ? (
+          <p className="mt-3 text-[11.5px] text-fg-mute">
+            Budget is low for a {stepNeed}-step flow — some soft companions may be denied mid-run.
+          </p>
+        ) : null}
+        <div className="mt-4 flex items-center gap-2">
+          <Button type="submit" disabled={missing.length > 0 || exhausted}>
+            Run flow
+          </Button>
+          {exhausted ? (
+            <span className="text-[11.5px] text-danger">Rate budget exhausted</span>
+          ) : null}
+        </div>
+        <p className="mt-3 font-mono text-[10px] text-fg-mute">
+          CLI: sluice replay --flow {tmpl.id}
+        </p>
+      </form>
+    </div>
   );
 }

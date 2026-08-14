@@ -37,6 +37,7 @@ import type {
   EngineStatus,
   EnvironmentMsg,
   ExportMsg,
+  FlowRunMsg,
   ParseResult,
   PtyClientFrame,
   PtyServerFrame,
@@ -51,8 +52,13 @@ import type {
   SubscribeMsg,
 } from '@sluice/core';
 import type { TerminalHooks, TerminalSession } from './claude-terminal.js';
-import { ReplayDeniedError, replayBudget, runReplay } from '@sluice/interceptor';
-import { dropMaterialized, faithfulReplayRequest, materialize } from '@sluice/cartographer';
+import { ReplayDeniedError, replayBudget, runFlowReplay, runReplay, resolveJsonPath } from '@sluice/interceptor';
+import {
+  buildFlowStepRequest,
+  dropMaterialized,
+  faithfulReplayRequest,
+  materialize,
+} from '@sluice/cartographer';
 
 /** Any capture engine, structurally — only its status() is consumed here. */
 interface EngineLike {
@@ -679,6 +685,101 @@ export async function startServer(opts: StartServerOpts): Promise<StartServerRes
     }
   }
 
+  /**
+   * Multi-step flow run from the dashboard (F7.3). Same pipeline as CLI
+   * `sluice replay --flow` and MCP `sluice_replay_flow`: learn template →
+   * buildFlowStepRequest (with app.hosts) → runFlowReplay → per-step runReplay.
+   */
+  async function onFlowRun(ws: WebSocket, msg: FlowRunMsg): Promise<void> {
+    try {
+      const tmpl = store.getFlowTemplate(msg.templateId);
+      if (!tmpl) {
+        throw new Error(
+          `Unknown flow template "${msg.templateId}". Run \`sluice learn-flows\` or open Traffic → Group flows.`,
+        );
+      }
+      const app = adapters.find((a) => a.id === tmpl.adapterId);
+      if (!app) {
+        throw new Error(`No installed app for adapter "${tmpl.adapterId}".`);
+      }
+      const sessions = getSessions().filter((s) => s.adapterId === app.id);
+      const session =
+        (msg.sessionId ? sessions.find((s) => s.id === msg.sessionId) : undefined) ?? sessions[0];
+      if (!session) {
+        throw new Error(
+          `No active ${app.displayName} session — run \`sluice extract-token\` first.`,
+        );
+      }
+
+      const result = await runFlowReplay({
+        template: tmpl,
+        params: msg.params ?? {},
+        session,
+        io: {
+          build: (step, s, ctx) =>
+            buildFlowStepRequest(tmpl, step, s, {
+              params: ctx.params,
+              priorResponses: ctx.priorResponses,
+              resolvePath: resolveJsonPath,
+              allowedHosts: app.hosts,
+            }),
+          run: (req) => runReplay(req),
+          record: (c) => {
+            c.adapterId = app.id;
+            // Same funnel as single replay: attribute, store, stream, materialize.
+            ingestCapture(c);
+          },
+          refresh: app.credentials
+            ? async () => {
+                const again = getSessions().filter((s) => s.adapterId === app.id);
+                return again[0];
+              }
+            : undefined,
+        },
+      });
+
+      if (result.flow) {
+        try {
+          store.upsertFlow(result.flow);
+        } catch {
+          /* parent flow persist is best-effort */
+        }
+      }
+
+      send(ws, {
+        type: 'flow.result',
+        requestId: msg.requestId,
+        ok: result.ok,
+        templateId: tmpl.id,
+        primaryKey: tmpl.primaryKey,
+        flowId: result.flow?.id,
+        refreshed: result.refreshed || undefined,
+        error: result.error ? redactText(result.error) : undefined,
+        steps: result.steps.map((s) => ({
+          seq: s.seq,
+          role: s.role,
+          operation: s.operation,
+          method: s.method,
+          path: s.path,
+          status: s.status,
+          captureId: s.captureId,
+          httpStatus: s.httpStatus,
+          detail: s.detail ? redactText(s.detail) : undefined,
+          durationMs: s.durationMs,
+        })),
+      });
+      broadcast(statusFrame());
+    } catch (e) {
+      const code = e instanceof ReplayDeniedError ? `[${e.code}] ` : '';
+      send(ws, {
+        type: 'flow.error',
+        requestId: msg.requestId,
+        error: `${code}${redactText(errMsg(e))}`,
+      });
+      broadcast(statusFrame());
+    }
+  }
+
   function onExport(ws: WebSocket, msg: ExportMsg): void {
     // The frozen ServerMsg protocol has no dedicated export frame, so we honor
     // an export request by (re)emitting the requested entities as an
@@ -1301,6 +1402,9 @@ export async function startServer(opts: StartServerOpts): Promise<StartServerRes
           break;
         case 'replay.run':
           void onReplayRun(ws, parsed);
+          break;
+        case 'flow.run':
+          void onFlowRun(ws, parsed);
           break;
         case 'export':
           onExport(ws, parsed);
