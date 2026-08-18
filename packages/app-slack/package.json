@@ -14,11 +14,9 @@
   "dependencies": {
     "@sluice/adapter-sdk": "workspace:*",
     "@sluice/core": "workspace:*",
-    "better-sqlite3": "^11.7.0",
     "classic-level": "^1.4.0"
   },
   "devDependencies": {
-    "@types/better-sqlite3": "^7.6.12",
     "@types/node": "^20.10.0"
   }
 }

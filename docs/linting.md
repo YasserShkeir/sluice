@@ -78,19 +78,13 @@ total coercion helpers in `@sluice/adapter-sdk` (`str`, `num`, `bool`, `arr`,
 
 ## Suppressions in the source
 
-Four `biome-ignore` comments exist, each with a stated reason:
+`biome-ignore` comments that still exist, each with a stated reason:
 
-- `app-trello/src/chrome-cookies.ts` — a regex that matches control characters,
-  because rejecting cookie values containing them *is the point*.
-- `app-loom/src/chrome-cookies.ts` — same rule, same reason.
-- `app-linkedin/src/chrome-cookies.ts` — same rule, same reason.
+- `packages/core/src/chrome-cookies.ts` — a regex that matches control characters,
+  because rejecting cookie values containing them *is the point* (shared Chrome
+  cookie header builder; apps no longer each carry this suppression).
 - `webapp/src/components/DataBrowser.tsx` — an array index as a React key, because
   materialized rows have no guaranteed stable id and the page is replaced wholesale.
-
-Three of the four are the same suppression because four packages carry their own
-copy of the macOS OSCrypt cookie reader — `app-slack/src/slack-credentials.ts`
-plus `chrome-cookies.ts` in app-trello, app-loom and app-linkedin. De-duplicating
-those into one per-platform module removes two of these comments as a side effect.
 
 If you add one, say why in the comment. A suppression without a reason is just a
 disabled check.

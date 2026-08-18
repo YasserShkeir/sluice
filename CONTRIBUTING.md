@@ -271,9 +271,10 @@ and the adapter conformance suite. Note the glob is `src/*.test.ts` — top leve
 `src/` only, not recursive.
 
 Still uncovered and worth contributing:
-- the **cookie/Keychain decryptors** (`app-slack/src/slack-credentials.ts` plus
-  `chrome-cookies.ts` in `app-trello`, `app-loom` and `app-linkedin`) — testable
-  with a fixture Cookies SQLite and an injected passphrase, no Keychain needed;
+- the **cookie/Keychain decryptors** — crypto lives in `@sluice/core`
+  (`oscrypt.ts`, `chrome-cookies.ts`); app packages are thin domain wrappers.
+  Testable with a fixture Cookies SQLite and an injected passphrase, no Keychain
+  needed (`decryptOscryptV10` is pure);
 - the **capture engines** — use `sluice record` + `sluice mock` for scrubbed
   NDJSON fixture replay through the real ingest path (`scrubCaptures` from
   `@sluice/adapter-sdk` is the sanctioned way to make a real recording
@@ -289,20 +290,19 @@ Still uncovered and worth contributing:
 ## Platform support
 
 Credential extraction is macOS-only today (Keychain + the macOS OSCrypt v10
-scheme). There are **four** copies of the same AES-128-CBC / PBKDF2-SHA1
-(`saltysalt`, 1003 iterations, 16 bytes) decrypt:
+scheme). The AES-128-CBC / PBKDF2-SHA1 (`saltysalt`, 1003 iterations, 16 bytes)
+decrypt and Chrome profile reader live once in `@sluice/core`:
 
 ```
-packages/app-slack/src/slack-credentials.ts
-packages/app-trello/src/chrome-cookies.ts
-packages/app-loom/src/chrome-cookies.ts
-packages/app-linkedin/src/chrome-cookies.ts
+packages/core/src/oscrypt.ts          # decryptOscryptV10, keychainPassphrase, withCopiedSqliteDb
+packages/core/src/chrome-cookies.ts   # readChromeCookieHeader / locateChromeProfile
 ```
 
-Keep them in sync when touching decrypt — each also zeroes its own passphrase
-`Buffer`. Windows (DPAPI + AES-256-GCM) and Linux (libsecret/kwallet) are wanted;
-the credential-provider seam already exists, but four copies of the same crypto
-will diverge, so de-duplicate into a shared per-platform module first.
+App packages keep only domain wrappers (`app-trello` / `app-loom` /
+`app-linkedin` `chrome-cookies.ts`) and Slack's LevelDB + host-ranking path
+(`app-slack/src/slack-credentials.ts`). Callers still zero the passphrase
+`Buffer` after use. Windows (DPAPI + AES-256-GCM) and Linux (libsecret/kwallet)
+belong next to those core modules — not as a fifth paste in an app package.
 
 Non-macOS users can paste credentials in only where the app implements
 `sessionFromInput`, and today that is **Slack alone** (`--token` / `--cookie`).

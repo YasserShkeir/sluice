@@ -8,3 +8,5 @@ export * from './util.js';
 export * from './body-codec.js';
 export * from './auth-failure.js';
 export * from './replay-deny.js';
+export * from './oscrypt.js';
+export * from './chrome-cookies.js';

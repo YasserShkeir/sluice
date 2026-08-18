@@ -14,6 +14,7 @@ import { diffLines, diffStat } from '../diff.js';
 import { setPin, usePin } from '../pin.js';
 import { matchTemplateForFlow, primaryMembership, indexFlowsByCapture } from '../flow-ui.js';
 import { JsonTree } from './JsonTree.js';
+import { Tab as TabBtn, TabList } from '../ui/tabs.js';
 
 interface Props {
   capture: Capture;
@@ -216,21 +217,13 @@ export function CaptureInspector({ capture, onClose }: Props) {
         </div>
       </div>
 
-      <div className="flex shrink-0 gap-0.5 border-b border-border px-2 pt-1">
+      <TabList>
         {TABS.map((t) => (
-          <button
-            key={t.id}
-            type="button"
-            onClick={() => setTab(t.id)}
-            className={[
-              'rounded-t px-2.5 py-1 text-[12px]',
-              tab === t.id ? 'bg-bg-3 text-fg' : 'text-fg-dim hover:text-fg',
-            ].join(' ')}
-          >
+          <TabBtn key={t.id} selected={tab === t.id} onClick={() => setTab(t.id)}>
             {t.label}
-          </button>
+          </TabBtn>
         ))}
-      </div>
+      </TabList>
 
       <div className="flex min-h-0 flex-1 flex-col gap-2 overflow-hidden p-3">
         {tab === 'response' || tab === 'request' ? (

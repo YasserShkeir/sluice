@@ -2,7 +2,9 @@
 /**
  * Engine B (macOS) — cold-start credential extraction. Reads the `xoxc-` token
  * from Slack desktop's LevelDB (`localConfig_v2`) and decrypts the `d` (`xoxd-…`)
- * cookie from Slack's Chromium Cookies SQLite DB using the macOS OSCrypt scheme.
+ * cookie from Slack's Chromium Cookies SQLite DB using the macOS OSCrypt scheme
+ * shared via `@sluice/core` (`decryptOscryptV10` / `keychainPassphrase` /
+ * `withCopiedSqliteDb`).
  *
  * Security discipline (docs/interceptor-plan.md §2.3 / §5):
  *   - Copy-then-read the LevelDB dir and the Cookies triplet into 0700 temp dirs
@@ -12,21 +14,22 @@
  *   - The keychain passphrase Buffer is zeroed (`fill(0)`) after use.
  *   - Secrets live only in the returned in-memory Session; nothing is logged.
  */
-import { execFileSync } from 'node:child_process';
-import { createDecipheriv, pbkdf2Sync } from 'node:crypto';
 import { cpSync, existsSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import Database from 'better-sqlite3';
 import { ClassicLevel } from 'classic-level';
-import { newId } from '@sluice/core';
-import type { Session } from '@sluice/core';
+import {
+  decryptOscryptV10,
+  keychainPassphrase,
+  newId,
+  withCopiedSqliteDb,
+  type Session,
+} from '@sluice/core';
 import { slackAppSupportDirs } from './paths.js';
 
 const ADAPTER_ID = 'slack';
-/** OSCrypt macOS (`v10`): AES-128-CBC, IV = 16 spaces, PBKDF2-SHA1 salt 'saltysalt'. */
-const IV = Buffer.alloc(16, 0x20);
-const SALT = Buffer.from('saltysalt');
+const SLACK_SAFE_STORAGE = 'Slack Safe Storage';
+const SLACK_ACCOUNT = 'Slack';
 
 export interface SlackWorkspaceInfo {
   id: string;
@@ -143,6 +146,7 @@ async function readLocalConfig(
         try {
           return JSON.parse(decodeLevelValue(v)) as { teams?: Record<string, LocalTeam> };
         } catch {
+          /* try next key */
         }
       }
       return {};
@@ -196,20 +200,12 @@ function decodeLevelValue(v: Buffer): string {
   return v.toString('utf8');
 }
 
-// ── Cookie decryption (Chromium OSCrypt, macOS v10) ────────────────────────────
+// ── Cookie decryption (Chromium OSCrypt via @sluice/core) ───────────────────────
 
 function readSlackCookies(cookiesPath: string): Record<string, string> {
-  const pass = keychainPassphrase();
-  const work = mkdtempSync(join(tmpdir(), 'sluice-cookies-'));
+  const pass = keychainPassphrase(SLACK_SAFE_STORAGE, SLACK_ACCOUNT);
   try {
-    const dst = join(work, 'Cookies');
-    cpSync(cookiesPath, dst);
-    for (const suffix of ['-wal', '-shm']) {
-      const extra = cookiesPath + suffix;
-      if (existsSync(extra)) cpSync(extra, dst + suffix);
-    }
-    const db = new Database(dst, { readonly: true, fileMustExist: true });
-    try {
+    return withCopiedSqliteDb(cookiesPath, (db) => {
       const rows = db
         .prepare(
           `SELECT name, host_key, encrypted_value FROM cookies
@@ -230,47 +226,19 @@ function readSlackCookies(cookiesPath: string): Record<string, string> {
       const jar: Record<string, string> = {};
       for (const [name, ent] of best) {
         try {
-          jar[name] = decryptCookie(ent.value, pass);
+          jar[name] = decryptOscryptV10(ent.value, pass, {
+            encoding: 'utf8',
+            hostHash: 'if-binary-prefix',
+          });
         } catch {
           // Skip cookies we can't decrypt (non-v10 / unrelated); `d` is what matters.
         }
       }
       return jar;
-    } finally {
-      db.close();
-    }
+    });
   } finally {
     pass.fill(0); // §2.3 zero the passphrase
-    rmSync(work, { recursive: true, force: true }); // §2.3 shred temp copy
   }
-}
-
-/** Triggers the macOS Keychain prompt — the OS consent boundary; never suppressed. */
-function keychainPassphrase(): Buffer {
-  const base = ['find-generic-password', '-w', '-s', 'Slack Safe Storage'];
-  let raw: string;
-  try {
-    raw = execFileSync('/usr/bin/security', [...base, '-a', 'Slack'], { encoding: 'utf8' });
-  } catch {
-    // The account label varies across builds; retry keyed on the service only.
-    raw = execFileSync('/usr/bin/security', base, { encoding: 'utf8' });
-  }
-  return Buffer.from(raw.trim(), 'utf8');
-}
-
-function decryptCookie(enc: Buffer, pass: Buffer): string {
-  if (enc.subarray(0, 3).toString('ascii') !== 'v10') throw new Error('unexpected cookie version');
-  const key = pbkdf2Sync(pass, SALT, 1003, 16, 'sha1');
-  const decipher = createDecipheriv('aes-128-cbc', key, IV);
-  decipher.setAutoPadding(true);
-  let pt = Buffer.concat([decipher.update(enc.subarray(3)), decipher.final()]);
-  // Newer Chromium prepends a 32-byte SHA-256 host hash; strip it when the head
-  // byte isn't printable ASCII (a real `xoxd-…` value starts printable).
-  if (pt.length > 32) {
-    const head = pt[0];
-    if (head === undefined || head < 0x20 || head > 0x7e) pt = pt.subarray(32);
-  }
-  return pt.toString('utf8');
 }
 
 // ── path helpers ──────────────────────────────────────────────────────────────
