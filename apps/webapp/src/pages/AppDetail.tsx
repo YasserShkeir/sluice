@@ -188,7 +188,7 @@ export function AppDetail({ id, apps, captures, onFilterTraffic }: Props) {
             <Empty>Nothing captured for this app in the live window yet.</Empty>
           ) : (
             <div className="max-h-[420px] overflow-auto rounded-lg border border-border">
-              <table className="db-table">
+              <table className="w-full border-collapse font-mono text-[11.5px] [&_th]:sticky [&_th]:top-0 [&_th]:whitespace-nowrap [&_th]:border-b [&_th]:border-border-2 [&_th]:bg-bg-2 [&_th]:px-2.5 [&_th]:py-1 [&_th]:text-left [&_th]:font-medium [&_th]:text-fg-dim [&_td]:max-w-[260px] [&_td]:overflow-hidden [&_td]:text-ellipsis [&_td]:whitespace-nowrap [&_td]:border-b [&_td]:border-border [&_td]:px-2.5 [&_td]:py-0.5">
                 <thead>
                   <tr>
                     <th>Method</th>

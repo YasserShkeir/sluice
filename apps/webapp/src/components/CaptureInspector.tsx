@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 import { useEffect, useMemo, useState } from 'react';
 import type { Capture, Item } from '@sluice/core';
-import { formatClock, formatDuration, humanizeBytes, prettyJson, statusClass, toCurl } from '../format.js';
+import { formatClock, formatDuration, humanizeBytes, prettyJson, toCurl } from '../format.js';
+import { Badge, statusTone } from '../ui/badge.js';
 import {
   fetchCaptureBody,
   fetchCaptureEntities,
@@ -210,7 +211,7 @@ export function CaptureInspector({ capture, onClose }: Props) {
           {capture.method} {capture.path}
         </div>
         <div className="mt-1 flex flex-wrap items-center gap-x-3 gap-y-0.5 text-[11px]">
-          <span className={`status-badge ${statusClass(capture.status)}`}>{capture.status ?? '—'}</span>
+          <Badge tone={statusTone(capture.status)}>{capture.status ?? '—'}</Badge>
           <span className="text-fg-mute">{formatDuration(capture.durationMs)}</span>
           <span className="text-fg-mute">{capture.source}</span>
           <span className="text-fg-mute break-all">{capture.host}</span>

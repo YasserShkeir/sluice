@@ -33,7 +33,10 @@ import { distinctValues, sendCaptureControl, sendSync } from '../ws.js';
 import { appOf } from '../analytics.js';
 import { fetchFlows, fetchCapturesByIds, searchCaptureBodies } from '../api.js';
 import type { FlowSummary } from '../api.js';
-import { formatClock, formatDuration, humanizeBytes, statusClass, toCurl } from '../format.js';
+import { formatClock, formatDuration, humanizeBytes, toCurl } from '../format.js';
+import { Badge, statusTone } from '../ui/badge.js';
+import { Button } from '../ui/button.js';
+import { Input } from '../ui/input.js';
 import { EMPTY_QUERY, matchesFilter, parseFilter, serverSideTerms } from '../filter.js';
 import type { FilterQuery } from '../filter.js';
 import { buildFlowGroupedRows, primaryMembership, indexFlowsByCapture } from '../flow-ui.js';
@@ -510,11 +513,15 @@ export function TrafficDashboard({
 
   return (
     <section className="dashboard">
-      <header className="toolbar">
-        <div className="tb-group tb-controls">
-          <button
-            type="button"
-            className={`tb-btn rec-toggle ${recording && !capturePaused ? 'is-recording' : 'is-paused'}`}
+      <header className="flex flex-wrap items-center gap-x-3.5 gap-y-2.5 border-b border-border bg-bg-1 px-3 py-1.5">
+        <div className="flex flex-wrap items-center gap-2">
+          <Button
+            size="sm"
+            className={
+              recording && !capturePaused
+                ? 'border-[#4a2020] bg-[#1d1416] text-[#f0a0a0] hover:border-err hover:bg-[#1d1416] hover:text-[#f0a0a0]'
+                : 'border-[#2c4a30] bg-[#131a15] text-ok hover:border-ok hover:bg-[#131a15] hover:text-ok'
+            }
             onClick={() => {
               const next = !recording;
               setRecording(next);
@@ -534,13 +541,12 @@ export function TrafficDashboard({
             }
           >
             {recording && !capturePaused ? '❚❚ Pause' : '● Record'}
-          </button>
-          <button type="button" className="tb-btn" onClick={clear} title="Clear captured traffic">
+          </Button>
+          <Button size="sm" onClick={clear} title="Clear captured traffic">
             Clear
-          </button>
-          <button
-            type="button"
-            className="tb-btn"
+          </Button>
+          <Button
+            size="sm"
             onClick={() => {
               setSyncing(true);
               sendSync();
@@ -549,21 +555,21 @@ export function TrafficDashboard({
             title="Reconstruct structure for every known session"
           >
             {syncing ? 'syncing…' : '⟳ Sync'}
-          </button>
+          </Button>
         </div>
 
-        <div className="tb-group tb-filters">
-          <button
-            type="button"
-            className={`tb-btn ${groupByFlow ? 'is-active' : ''}`}
+        <div className="flex min-w-[220px] flex-1 flex-wrap items-center gap-2 basis-80">
+          <Button
+            size="sm"
+            variant={groupByFlow ? 'primary' : 'default'}
             aria-pressed={groupByFlow}
             title="Group companions under observed/pinned interaction flows (run sluice learn-flows to populate)"
             onClick={() => setGroupByFlow((v) => !v)}
           >
             {groupByFlow ? '☰ Flows on' : '☰ Group flows'}
-          </button>
-          <input
-            className="tb-filter font-mono"
+          </Button>
+          <Input
+            className="h-6 min-w-[120px] flex-1 basis-auto px-2 text-[11.5px]"
             placeholder={'status:429 op:conversations.* dur:>1500 body:"not_in_channel" -op:client.counts'}
             value={queryText}
             spellCheck={false}
@@ -588,8 +594,8 @@ export function TrafficDashboard({
           ) : null}
         </div>
 
-        <div className="tb-group tb-count">
-          <span className="tabnum muted">
+        <div className="ml-auto flex flex-wrap items-center gap-2">
+          <span className="tabnum text-fg-mute">
             {(displayRows ? filteredCaptures.length : rows.length).toLocaleString()} /{' '}
             {total.toLocaleString()} requests
             {groupByFlow
@@ -988,7 +994,7 @@ function Row({
           </Cell>
           <Cell col={8} title={c.path}>{c.path}</Cell>
           <Cell col={9}>
-            <span className={`status-badge ${statusClass(c.status)}`}>{c.status ?? '—'}</span>
+            <Badge tone={statusTone(c.status)}>{c.status ?? '—'}</Badge>
           </Cell>
           <Cell col={10} className="tabnum text-fg-dim">{humanizeBytes(c.resBody ?? c.reqBody)}</Cell>
           <Cell col={11} className="tabnum text-fg-dim">{formatDuration(c.durationMs)}</Cell>
@@ -1089,7 +1095,7 @@ function AddFilter({ label, prefix, options, labels, onPick }: AddFilterProps) {
   if (options.length === 0) return null;
   return (
     <select
-      className="tb-select"
+      className="h-6 max-w-40 cursor-pointer rounded border border-border-2 bg-bg-2 px-1.5 font-mono text-[11.5px] text-fg outline-none focus:border-accent"
       value=""
       onChange={(e) => {
         if (e.target.value) onPick(`${prefix}:${e.target.value}`);
