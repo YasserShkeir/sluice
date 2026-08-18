@@ -121,22 +121,51 @@ export function NavBar({
             ❚❚ capture paused
           </span>
         ) : null}
-        <span className={`conn-pill conn-${connection}`}>
-          <span className="dot" />
+        <span
+          className={[
+            'inline-flex items-center gap-1.5 rounded-full border border-border-2 bg-bg-2 px-2 py-0.5 text-[11.5px]',
+          ].join(' ')}
+        >
+          <span
+            className={[
+              'inline-block h-2 w-2 rounded-full',
+              connection === 'open'
+                ? 'bg-ok shadow-[0_0_6px_var(--color-ok)]'
+                : connection === 'connecting'
+                  ? 'animate-pulse bg-warn'
+                  : 'bg-err',
+            ].join(' ')}
+            aria-hidden="true"
+          />
           {CONN_LABEL[connection]}
           {connection !== 'open' && retries > 0 ? ` · retry ${retries}` : ''}
         </span>
         {engines.length > 0 ? (
-          <span className="engines">
+          <span className="inline-flex gap-1.5">
             {engines.map((e) => (
-              <span key={e.engine} className={`engine engine-${e.state}`} title={e.detail ?? ''}>
+              <span
+                key={e.engine}
+                title={e.detail ?? ''}
+                className={[
+                  'rounded border px-1.5 py-0.5 font-mono text-[11px]',
+                  e.state === 'running'
+                    ? 'border-[#2c4a30] bg-bg-2 text-[#9ad0a0]'
+                    : e.state === 'starting'
+                      ? 'border-border-2 bg-bg-2 text-warn'
+                      : e.state === 'restarting'
+                        ? 'animate-pulse border-[#4a3c20] bg-bg-2 text-warn'
+                        : e.state === 'error'
+                          ? 'border-[#4a2020] bg-bg-2 text-err'
+                          : 'border-border-2 bg-bg-2 text-fg-mute',
+                ].join(' ')}
+              >
                 {e.engine}
                 {e.proxyPort ? `:${e.proxyPort}` : ''}
               </span>
             ))}
           </span>
         ) : null}
-        {appVersion ? <span className="muted small">v{appVersion}</span> : null}
+        {appVersion ? <span className="text-[11px] text-fg-mute">v{appVersion}</span> : null}
       </div>
     </header>
   );

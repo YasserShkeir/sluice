@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useState, type ReactNode } from 'react';
 import type { Capture } from '@sluice/core';
 import { formatBytes, formatClock, formatDuration, statusClass } from '../format.js';
 import {
@@ -63,16 +63,16 @@ export function Overview({ captures, onSelect }: Props) {
   const errSev = kpis.errorRate >= 0.05 ? 'err' : kpis.errorRate >= 0.01 ? 'warn' : 'ok';
 
   return (
-    <section className="overview" aria-label="Traffic overview">
-      <div className="ov-head">
-        <span className="ov-title">Overview</span>
-        <span className="muted small">
+    <section className="flex flex-col gap-2.5 px-3 pb-3.5 pt-2.5" aria-label="Traffic overview">
+      <div className="flex flex-wrap items-baseline gap-2.5">
+        <span className="text-[12px] font-semibold uppercase tracking-wide text-fg">Overview</span>
+        <span className="text-[11px] text-fg-mute">
           live · derived from the last {fmtInt(captures.length)} captures (SQLite is the full record)
         </span>
       </div>
 
       {/* ── KPI tiles ─────────────────────────────────────────────────────── */}
-      <div className="kpi-row">
+      <div className="grid grid-cols-7 gap-2 max-[1100px]:grid-cols-[repeat(auto-fit,minmax(130px,1fr))]">
         <Kpi value={fmtInt(kpis.total)} label="Total requests" />
         <Kpi value={fmtInt(kpis.reqPerMin)} label="Req / min" hint="last 60s" />
         <Kpi value={fmtInt(kpis.distinctEndpoints)} label="Endpoints" hint="method+host+path" />
@@ -83,41 +83,38 @@ export function Overview({ captures, onSelect }: Props) {
       </div>
 
       {/* ── Charts ────────────────────────────────────────────────────────── */}
-      <div className="charts-row">
-        <div className="chart-card">
-          <div className="chart-title">Requests over time</div>
+      <div className="grid grid-cols-[1.5fr_1.3fr_1.5fr] gap-2 max-[1000px]:grid-cols-[repeat(auto-fit,minmax(250px,1fr))]">
+        <ChartCard title="Requests over time">
           <RequestsChart series={series} />
-        </div>
-        <div className="chart-card">
-          <div className="chart-title">Status distribution</div>
+        </ChartCard>
+        <ChartCard title="Status distribution">
           <StatusDonut dist={dist} />
-        </div>
-        <div className="chart-card">
-          <div className="chart-title">Top endpoints</div>
+        </ChartCard>
+        <ChartCard title="Top endpoints">
           <EndpointBars tops={tops} />
-        </div>
+        </ChartCard>
       </div>
 
       {/* ── Smart cards ───────────────────────────────────────────────────── */}
-      <div className="cards-row">
-        <div className="ov-card">
-          <div className="ov-card-head">
-            <span>Recent errors</span>
-            <span className="muted small">status ≥ 400 or ok:false</span>
-          </div>
+      <div className="grid grid-cols-[repeat(auto-fit,minmax(280px,1fr))] gap-2">
+        <SmartCard title="Recent errors" hint="status ≥ 400 or ok:false">
           {errs.length === 0 ? (
-            <div className="ov-card-empty">No errors in view.</div>
+            <div className="px-0.5 py-2.5 text-[11px] text-fg-mute">No errors in view.</div>
           ) : (
-            <ul className="ov-list">
+            <ul className="m-0 list-none p-0">
               {errs.map((e) => (
                 <li key={e.id}>
-                  <button type="button" className="ov-list-row" onClick={() => pick(e.id)}>
+                  <button
+                    type="button"
+                    onClick={() => pick(e.id)}
+                    className="flex w-full items-center gap-2 border-b border-bg-2 px-1 py-0.5 font-mono text-[11.5px] last:border-b-0 hover:bg-bg-2 focus-visible:outline focus-visible:outline-1 focus-visible:outline-offset-[-1px] focus-visible:outline-accent"
+                  >
                     <span className={`status-badge ${statusClass(e.status)}`}>{e.status ?? 'ERR'}</span>
-                    <span className="ov-ep mono" title={`${e.host}${e.path}`}>
+                    <span className="min-w-0 flex-1 truncate text-fg" title={`${e.host}${e.path}`}>
                       {e.host}
                       {e.path}
                     </span>
-                    <span className="ov-reason muted" title={e.reason}>
+                    <span className="max-w-[42%] shrink truncate text-fg-mute" title={e.reason}>
                       {e.reason}
                     </span>
                   </button>
@@ -125,32 +122,34 @@ export function Overview({ captures, onSelect }: Props) {
               ))}
             </ul>
           )}
-        </div>
+        </SmartCard>
 
-        <div className="ov-card">
-          <div className="ov-card-head">
-            <span>Slowest endpoints</span>
-            <span className="muted small">by max duration</span>
-          </div>
+        <SmartCard title="Slowest endpoints" hint="by max duration">
           {slow.length === 0 ? (
-            <div className="ov-card-empty">No timings yet.</div>
+            <div className="px-0.5 py-2.5 text-[11px] text-fg-mute">No timings yet.</div>
           ) : (
-            <ul className="ov-list">
+            <ul className="m-0 list-none p-0">
               {slow.map((s) => (
                 <li key={s.key}>
-                  <button type="button" className="ov-list-row" onClick={() => pick(s.id)}>
-                    <span className="ov-method mono">{s.method}</span>
-                    <span className="ov-ep mono" title={s.hostPath}>
+                  <button
+                    type="button"
+                    onClick={() => pick(s.id)}
+                    className="flex w-full items-center gap-2 border-b border-bg-2 px-1 py-0.5 font-mono text-[11.5px] last:border-b-0 hover:bg-bg-2 focus-visible:outline focus-visible:outline-1 focus-visible:outline-offset-[-1px] focus-visible:outline-accent"
+                  >
+                    <span className="w-10 shrink-0 text-fg-dim">{s.method}</span>
+                    <span className="min-w-0 flex-1 truncate text-fg" title={s.hostPath}>
                       {s.hostPath}
                     </span>
-                    {s.count > 1 ? <span className="ov-count muted small tabnum">×{s.count}</span> : null}
-                    <span className="ov-dur tabnum">{formatDuration(s.durationMs)}</span>
+                    {s.count > 1 ? (
+                      <span className="shrink-0 tabular-nums text-[11px] text-fg-mute">×{s.count}</span>
+                    ) : null}
+                    <span className="shrink-0 tabular-nums text-fg-dim">{formatDuration(s.durationMs)}</span>
                   </button>
                 </li>
               ))}
             </ul>
           )}
-        </div>
+        </SmartCard>
       </div>
     </section>
   );
@@ -165,13 +164,44 @@ interface KpiProps {
   sev?: 'ok' | 'warn' | 'err';
 }
 function Kpi({ value, label, hint, sev }: KpiProps) {
+  const sevCls =
+    sev === 'ok' ? 'text-ok' : sev === 'warn' ? 'text-warn' : sev === 'err' ? 'text-err' : 'text-fg';
   return (
-    <div className="kpi">
-      <div className={`kpi-val tabnum${sev ? ` kpi-sev-${sev}` : ''}`}>{value}</div>
-      <div className="kpi-label">
+    <div className="min-w-0 rounded-md border border-border bg-bg-1 px-2.5 py-2">
+      <div className={`truncate text-[20px] font-semibold leading-tight tabular-nums ${sevCls}`}>{value}</div>
+      <div className="mt-0.5 truncate text-[10.5px] uppercase tracking-wide text-fg-dim">
         {label}
-        {hint ? <span className="kpi-hint"> · {hint}</span> : null}
+        {hint ? <span className="normal-case tracking-normal text-fg-mute"> · {hint}</span> : null}
       </div>
+    </div>
+  );
+}
+
+function ChartCard({ title, children }: { title: string; children: ReactNode }) {
+  return (
+    <div className="flex min-w-0 flex-col rounded-md border border-border bg-bg-1 px-2.5 py-2">
+      <div className="mb-1.5 text-[10.5px] uppercase tracking-wider text-fg-dim">{title}</div>
+      {children}
+    </div>
+  );
+}
+
+function SmartCard({
+  title,
+  hint,
+  children,
+}: {
+  title: string;
+  hint: string;
+  children: ReactNode;
+}) {
+  return (
+    <div className="flex min-w-0 flex-col rounded-md border border-border bg-bg-1 px-2.5 py-2">
+      <div className="mb-1 flex items-baseline justify-between gap-2 text-[10.5px] uppercase tracking-wider text-fg-dim">
+        <span>{title}</span>
+        <span className="normal-case tracking-normal text-fg-mute">{hint}</span>
+      </div>
+      {children}
     </div>
   );
 }
@@ -190,7 +220,7 @@ function RequestsChart({ series }: { series: TimeSeries }) {
   const { buckets, max, start, end } = series;
   const n = buckets.length;
 
-  if (n === 0 || max === 0) return <div className="chart-empty">No requests yet.</div>;
+  if (n === 0 || max === 0) return <div className="px-0.5 py-5 text-[11px] text-fg-mute">No requests yet.</div>;
 
   const x = (i: number): number => padL + (n <= 1 ? plotW / 2 : (i / (n - 1)) * plotW);
   const y = (v: number): number => padT + plotH - (v / max) * plotH;
@@ -201,7 +231,7 @@ function RequestsChart({ series }: { series: TimeSeries }) {
 
   return (
     <svg
-      className="chart-svg"
+      className="block h-auto w-full"
       viewBox={`0 0 ${W} ${H}`}
       role="img"
       aria-label={`Requests over time; peak ${max} per bucket`}
@@ -243,8 +273,8 @@ function StatusDonut({ dist }: { dist: StatusDist }) {
   let acc = 0; // cumulative percent, for dash offsets
 
   return (
-    <div className="donut-wrap">
-      <svg className="donut" viewBox="0 0 42 42" role="img" aria-label="Status code distribution">
+    <div className="flex items-center gap-3">
+      <svg className="h-24 w-24 shrink-0" viewBox="0 0 42 42" role="img" aria-label="Status code distribution">
         <circle cx={21} cy={21} r={15.915} fill="none" style={{ stroke: 'var(--bg-3)' }} strokeWidth={6} />
         {total > 0 &&
           segs.map((s) => {
@@ -274,13 +304,15 @@ function StatusDonut({ dist }: { dist: StatusDist }) {
           requests
         </text>
       </svg>
-      <ul className="donut-legend">
+      <ul className="m-0 flex min-w-0 flex-1 list-none flex-col gap-0.5 p-0 text-[11px]">
         {segs.map((s) => (
-          <li key={s.key}>
-            <span className="swatch" style={{ background: s.color }} aria-hidden="true" />
-            <span className="lg-label">{s.key}</span>
-            <span className="lg-val tabnum">{fmtInt(s.value)}</span>
-            <span className="lg-pct muted tabnum">{total > 0 ? `${Math.round((s.value / total) * 100)}%` : '—'}</span>
+          <li key={s.key} className="grid grid-cols-[10px_auto_1fr_auto] items-center gap-1.5">
+            <span className="inline-block h-2.5 w-2.5 rounded-sm" style={{ background: s.color }} aria-hidden="true" />
+            <span className="text-fg">{s.key}</span>
+            <span className="tabular-nums text-fg">{fmtInt(s.value)}</span>
+            <span className="text-right tabular-nums text-fg-mute">
+              {total > 0 ? `${Math.round((s.value / total) * 100)}%` : '—'}
+            </span>
           </li>
         ))}
       </ul>
@@ -296,13 +328,13 @@ function EndpointBars({ tops }: { tops: EndpointCount[] }) {
   const gap = 3;
   const padT = 2;
 
-  if (tops.length === 0) return <div className="chart-empty">No endpoints yet.</div>;
+  if (tops.length === 0) return <div className="px-0.5 py-5 text-[11px] text-fg-mute">No endpoints yet.</div>;
 
   const H = padT + tops.length * rowH + 2;
   const max = tops[0]!.count;
 
   return (
-    <svg className="chart-svg" viewBox={`0 0 ${W} ${H}`} role="img" aria-label="Top endpoints by request count">
+    <svg className="block h-auto w-full" viewBox={`0 0 ${W} ${H}`} role="img" aria-label="Top endpoints by request count">
       {tops.map((e, i) => {
         const yTop = padT + i * rowH;
         const barH = rowH - gap;
