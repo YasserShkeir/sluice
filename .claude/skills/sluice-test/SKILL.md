@@ -194,10 +194,12 @@ with `${app.id}_`, and `ctx.store` exposes none of `db` / `insertCapture` /
 `applyParseResult` / `upsertItem` / `upsertSession` / `listSessions` /
 `pruneCaptures` / `close`.
 
-**Credential decryption (`slack-credentials.ts`, `chrome-cookies.ts`)** — testable
-without a Keychain: build a fixture Cookies SQLite file and inject the passphrase
-rather than shelling out to `/usr/bin/security`. If the function doesn't allow
-injection, refactoring it to accept one is part of the work.
+**Credential decryption (`@sluice/core` `oscrypt.ts` / `chrome-cookies.ts`)** —
+`decryptOscryptV10` is pure and covered by fixture encrypt/decrypt tests. Full
+profile readers are testable without a Keychain by building a fixture Cookies
+SQLite and injecting the passphrase rather than shelling out to
+`/usr/bin/security`. If a caller doesn't allow injection, refactoring it to
+accept one is part of the work.
 
 ## Things that need care
 

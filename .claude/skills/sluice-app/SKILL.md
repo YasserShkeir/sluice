@@ -334,14 +334,15 @@ user is told to sign in when they already are.
 providers today (slack, trello, loom, linkedin) return `[]` or throw off macOS.
 Implement `sessionFromInput` so paste-in still works, as Slack does.
 
-If you need Chrome cookie decryption, **extract a shared helper rather than
-copy-pasting a fifth time.** The same macOS OSCrypt v10 code (AES-128-CBC, IV of
-16 space bytes, PBKDF2-SHA1 with salt `saltysalt` and 1003 iterations) now exists
-in four places: `app-trello/src/chrome-cookies.ts`, `app-loom/src/chrome-cookies.ts`,
-`app-linkedin/src/chrome-cookies.ts`, and `app-slack/src/slack-credentials.ts`.
-Three of the four also carry their own `biome-ignore lint/suspicious/noControlCharactersInRegex`.
-The advice not to duplicate it has now been ignored twice; deduplicating is the
-tracked fix.
+If you need Chrome cookie decryption, **use `@sluice/core`** — do not paste a
+fifth copy. Shared helpers:
+
+- `decryptOscryptV10` / `keychainPassphrase` / `withCopiedSqliteDb` — `packages/core/src/oscrypt.ts`
+- `readChromeCookieHeader` / `locateChromeProfile` — `packages/core/src/chrome-cookies.ts`
+
+App packages keep thin domain wrappers (`domainSuffix: 'example.com'`) plus any
+service-specific header post-processing. Slack desktop still owns LevelDB + host
+ranking in `slack-credentials.ts` but decrypts through the same OSCrypt helpers.
 
 ## MCP tools (optional)
 

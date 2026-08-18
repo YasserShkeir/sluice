@@ -1,206 +1,34 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 /**
- * Chrome (macOS) — read + decrypt the Trello session cookies from Google Chrome's
- * `Cookies` SQLite DB and assemble a `Cookie:` request header.
+ * Trello session cookies from Google Chrome (macOS).
  *
- * Adapted from `@sluice/app-slack`'s slack-credentials.ts (the proven macOS
- * Chromium OSCrypt scheme), with two Chrome-specific changes:
- *   - the store is Chrome's per-profile `Cookies` DB (Default / Profile N), and
- *   - the Keychain item is **"Chrome Safe Storage"** (account "Chrome"), not
- *     "Slack Safe Storage".
- *
- * Security discipline (mirrors slack-credentials.ts §2.3 / §5):
- *   - Copy-then-read the `Cookies` triplet into a 0700 temp dir (it may be locked
- *     while Chrome runs) and `rm -rf` it in `finally`.
- *   - The Keychain prompt on `security find-generic-password` is the OS consent
- *     boundary — never suppressed, and taken only after we've found a profile
- *     that actually holds trello.com cookies.
- *   - The passphrase Buffer is zeroed (`fill(0)`) after use.
- *   - A cookie VALUE is NEVER logged.
- *
- * OSCrypt macOS (`v10`): AES-128-CBC, IV = 16 spaces, key = PBKDF2-SHA1 of the
- * Keychain passphrase (salt 'saltysalt', 1003 iters, 16 bytes). The decrypted
- * plaintext may carry a leading 32-byte SHA-256 host hash (newer Chromium) that
- * is stripped when present.
+ * Thin domain wrapper over `@sluice/core`'s shared Chromium OSCrypt + Chrome
+ * profile reader. Crypto, Keychain, and copy-then-read live in core so they are
+ * not pasted a fifth time when the next cookie-auth app lands.
  */
-import { execFileSync } from 'node:child_process';
-import { createDecipheriv, pbkdf2Sync } from 'node:crypto';
-import { chmodSync, cpSync, existsSync, mkdtempSync, rmSync } from 'node:fs';
-import { homedir, tmpdir } from 'node:os';
-import { join } from 'node:path';
-import Database from 'better-sqlite3';
+import {
+  locateChromeProfile,
+  readChromeCookieHeader,
+  type ChromeCookieHeader,
+} from '@sluice/core';
 
-/** OSCrypt macOS (`v10`): AES-128-CBC, IV = 16 spaces, PBKDF2-SHA1 salt 'saltysalt'. */
-const IV = Buffer.alloc(16, 0x20);
-const SALT = Buffer.from('saltysalt');
-
-/** Chrome's default profile directory names, in preference order. */
-const CHROME_PROFILES = ['Default', 'Profile 1', 'Profile 2', 'Profile 3'] as const;
-
-export interface TrelloCookieHeader {
-  /** `name1=value1; name2=value2` — SECRET; never persist, stream, or log. */
-  cookieHeader: string;
-  /** the Chrome profile the cookies were read from (e.g. 'Default'). */
-  profile: string;
-}
+export type TrelloCookieHeader = ChromeCookieHeader;
 
 /**
  * Locate the first Chrome profile signed in to Trello, decrypt its trello.com
- * cookies, and return them as a ready-to-send `Cookie:` header. Throws with a
- * clear message when not on macOS or when no Trello session is found.
+ * cookies, and return them as a ready-to-send `Cookie:` header.
  */
 export function readTrelloCookieHeader(): TrelloCookieHeader {
-  if (process.platform !== 'darwin') {
-    throw new Error(
-      'readTrelloCookieHeader supports macOS (darwin) only — Chrome cookie decryption goes through the macOS Keychain.',
-    );
-  }
-
-  const located = locateTrelloProfile();
-  if (!located) {
-    throw new Error(
-      'No Chrome profile with trello.com cookies found — open https://trello.com in Google Chrome and sign in first.',
-    );
-  }
-
-  const cookies = readChromeTrelloCookies(located.cookiesPath);
-  const cookieHeader = buildCookieHeader(cookies);
-  if (!cookieHeader) {
-    throw new Error(
-      `Chrome profile "${located.profile}" had no decryptable trello.com cookies — is your Trello session in this profile?`,
-    );
-  }
-  return { cookieHeader, profile: located.profile };
+  return readChromeCookieHeader({
+    domainSuffix: 'trello.com',
+    serviceLabel: 'Trello',
+  });
 }
 
-// ── Profile discovery (no Keychain prompt) ──────────────────────────────────────
-
 /**
- * Return the FIRST Chrome profile whose `Cookies` DB both exists and holds
- * trello.com rows. This is a passive count — it does NOT decrypt and never
- * triggers the Keychain prompt, so we only prompt once a real target is found.
+ * Passive probe: first Chrome profile whose Cookies DB holds trello.com rows.
+ * Does not decrypt and never triggers Keychain.
  */
 export function locateTrelloProfile(): { profile: string; cookiesPath: string } | undefined {
-  const base = join(homedir(), 'Library', 'Application Support', 'Google', 'Chrome');
-  for (const profile of CHROME_PROFILES) {
-    const cookiesPath = join(base, profile, 'Cookies');
-    if (!existsSync(cookiesPath)) continue;
-    const hasTrello = withCopiedDb(cookiesPath, (db) => {
-      const row = db
-        .prepare(`SELECT COUNT(*) AS n FROM cookies WHERE (host_key = 'trello.com' OR host_key = '.trello.com' OR host_key LIKE '%.trello.com')`)
-        .get() as { n: number } | undefined;
-      return (row?.n ?? 0) > 0;
-    });
-    if (hasTrello) return { profile, cookiesPath };
-  }
-  return undefined;
-}
-
-// ── Cookie read + decrypt ────────────────────────────────────────────────────────
-
-interface RawCookie {
-  name: string;
-  host: string;
-  value: string;
-}
-
-/**
- * Decrypt every trello.com cookie in the given profile's `Cookies` DB. The
- * Keychain passphrase is fetched ONCE (a single OS consent prompt) and zeroed in
- * `finally`; undecryptable rows are skipped rather than failing the batch.
- */
-function readChromeTrelloCookies(cookiesPath: string): RawCookie[] {
-  const pass = keychainPassphrase();
-  try {
-    return withCopiedDb(cookiesPath, (db) => {
-      const rows = db
-        .prepare(
-          `SELECT name, host_key, encrypted_value FROM cookies WHERE (host_key = 'trello.com' OR host_key = '.trello.com' OR host_key LIKE '%.trello.com')`,
-        )
-        .all() as Array<{ name: string; host_key: string; encrypted_value: Buffer }>;
-      const out: RawCookie[] = [];
-      for (const r of rows) {
-        try {
-          out.push({ name: r.name, host: r.host_key, value: decryptCookie(r.encrypted_value, pass) });
-        } catch {
-          // Skip cookies we can't decrypt (non-v10 / unrelated encoding).
-        }
-      }
-      return out;
-    });
-  } finally {
-    pass.fill(0); // zero the passphrase
-  }
-}
-
-/**
- * Copy the `Cookies` triplet (+ `-wal`/`-shm` if present) into a fresh 0700 temp
- * dir, open it readonly, run `fn`, and shred the copy in `finally`. Copy-then-read
- * dodges Chrome's exclusive SQLite lock while the browser is running.
- */
-function withCopiedDb<T>(cookiesPath: string, fn: (db: Database.Database) => T): T {
-  const work = mkdtempSync(join(tmpdir(), 'sluice-chrome-'));
-  try {
-    chmodSync(work, 0o700);
-    const dst = join(work, 'Cookies');
-    cpSync(cookiesPath, dst);
-    for (const suffix of ['-wal', '-shm']) {
-      const extra = cookiesPath + suffix;
-      if (existsSync(extra)) cpSync(extra, dst + suffix);
-    }
-    const db = new Database(dst, { readonly: true, fileMustExist: true });
-    try {
-      return fn(db);
-    } finally {
-      db.close();
-    }
-  } finally {
-    rmSync(work, { recursive: true, force: true }); // shred the temp copy
-  }
-}
-
-/** Triggers the macOS Keychain prompt — the OS consent boundary; never suppressed. */
-function keychainPassphrase(): Buffer {
-  const base = ['find-generic-password', '-w', '-s', 'Chrome Safe Storage'];
-  let raw: string;
-  try {
-    raw = execFileSync('/usr/bin/security', [...base, '-a', 'Chrome'], { encoding: 'utf8' });
-  } catch {
-    // The account label varies across builds; retry keyed on the service only.
-    raw = execFileSync('/usr/bin/security', base, { encoding: 'utf8' });
-  }
-  return Buffer.from(raw.trim(), 'utf8');
-}
-
-function decryptCookie(enc: Buffer, pass: Buffer): string {
-  if (enc.subarray(0, 3).toString('ascii') !== 'v10') throw new Error('unexpected cookie version');
-  const key = pbkdf2Sync(pass, SALT, 1003, 16, 'sha1');
-  const decipher = createDecipheriv('aes-128-cbc', key, IV);
-  decipher.setAutoPadding(true);
-  let pt = Buffer.concat([decipher.update(enc.subarray(3)), decipher.final()]);
-  // Chrome (v104+) ALWAYS prepends a 32-byte SHA-256 of the eTLD+1 to the plaintext.
-  if (pt.length >= 32) pt = pt.subarray(32);
-  // Cookie values are Latin-1/ASCII; decode byte-preserving so the value stays a
-  // valid HTTP header value (utf8 would emit U+FFFD for any stray byte).
-  return pt.toString('latin1');
-}
-
-/**
- * Assemble `name1=value1; name2=value2` from the decrypted cookies, deduping by
- * name and preferring the apex `.trello.com` (or `trello.com`) host over any
- * subdomain-scoped duplicate.
- */
-function buildCookieHeader(cookies: RawCookie[]): string {
-  const isApex = (host: string): boolean => host === '.trello.com' || host === 'trello.com';
-  // Drop any cookie whose value carries control chars — it either didn't decrypt
-  // cleanly or can't be a valid HTTP header value; the auth cookie (a JWT) is clean.
-  // biome-ignore lint/suspicious/noControlCharactersInRegex: matching control chars IS the point — they are what we reject
-  const headerSafe = (v: string): boolean => !/[\u0000-\u001f\u007f]/.test(v);
-  const chosen = new Map<string, RawCookie>();
-  for (const c of cookies) {
-    if (!c.value || !headerSafe(c.value)) continue;
-    const prev = chosen.get(c.name);
-    if (!prev || (isApex(c.host) && !isApex(prev.host))) chosen.set(c.name, c);
-  }
-  return [...chosen.values()].map((c) => `${c.name}=${c.value}`).join('; ');
+  return locateChromeProfile('trello.com');
 }
