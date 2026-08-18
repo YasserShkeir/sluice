@@ -3,6 +3,8 @@ import { useCallback, useEffect, useState } from 'react';
 import { fetchApiDoc, fetchTable, listTables } from '../api.js';
 import { StoragePanel } from './StoragePanel.js';
 import type { TableInfo, TablePage } from '../api.js';
+import { Button } from '../ui/button.js';
+import { cn } from '../ui/cn.js';
 
 /**
  * The Cartographer's output, made visible.
@@ -23,30 +25,48 @@ type Mode = 'storage' | 'tables' | 'apidoc';
 
 const PAGE = 50;
 
+const thClass =
+  'sticky top-0 whitespace-nowrap border-b border-border-2 bg-bg-2 px-2.5 py-1 text-left font-medium text-fg-dim';
+const tdClass =
+  'max-w-[260px] overflow-hidden text-ellipsis whitespace-nowrap border-b border-border px-2.5 py-0.5';
+
 export function DataBrowser() {
   const [open, setOpen] = useState(true);
   const [mode, setMode] = useState<Mode>('storage');
 
   return (
-    <section className="databrowser">
-      <header className="db-head">
-        <button type="button" className="db-toggle" onClick={() => setOpen((o) => !o)} aria-expanded={open}>
+    <section className="flex h-full min-h-0 flex-col bg-bg-1">
+      <header className="flex items-center gap-3.5 px-3 py-1.5">
+        <button
+          type="button"
+          className="cursor-pointer border-0 bg-transparent p-0.5 text-[length:var(--fs)] text-fg"
+          onClick={() => setOpen((o) => !o)}
+          aria-expanded={open}
+        >
           {open ? '▾' : '▸'} Data & storage
         </button>
         {open ? (
-          <div className="db-modes">
-            <button type="button" className={mode === 'storage' ? 'on' : ''} onClick={() => setMode('storage')}>
-              Storage
-            </button>
-            <button type="button" className={mode === 'tables' ? 'on' : ''} onClick={() => setMode('tables')}>
-              Per-app tables
-            </button>
-            <button type="button" className={mode === 'apidoc' ? 'on' : ''} onClick={() => setMode('apidoc')}>
-              API catalog
-            </button>
+          <div className="flex gap-1">
+            {(
+              [
+                ['storage', 'Storage'],
+                ['tables', 'Per-app tables'],
+                ['apidoc', 'API catalog'],
+              ] as const
+            ).map(([id, label]) => (
+              <Button
+                key={id}
+                size="sm"
+                variant={mode === id ? 'primary' : 'default'}
+                aria-pressed={mode === id}
+                onClick={() => setMode(id)}
+              >
+                {label}
+              </Button>
+            ))}
           </div>
         ) : (
-          <span className="muted db-hint">
+          <span className="text-[11.5px] text-fg-mute">
             typed tables + the endpoint catalog built from what you captured
           </span>
         )}
@@ -86,42 +106,48 @@ function Tables() {
     load(selected, 0);
   }, [selected, load]);
 
-  if (error) return <p className="db-empty err">Could not load tables: {error}</p>;
-  if (!tables) return <p className="db-empty muted">Loading…</p>;
+  if (error) return <p className="px-3.5 py-4 text-[12.5px] text-err">Could not load tables: {error}</p>;
+  if (!tables) return <p className="px-3.5 py-4 text-[12.5px] text-fg-mute">Loading…</p>;
   if (tables.length === 0) {
     return (
-      <p className="db-empty muted">
+      <p className="px-3.5 py-4 text-[12.5px] text-fg-mute">
         No per-app tables yet. They are derived from captured responses — capture some traffic, or
-        run <code>sluice build-db</code>.
+        run <code className="font-mono text-fg">sluice build-db</code>.
       </p>
     );
   }
 
   return (
-    <div className="db-body">
-      <aside className="db-tablelist">
+    <div className="flex min-h-0 flex-1 gap-0 border-t border-border">
+      <aside className="w-[210px] flex-none overflow-y-auto border-r border-border">
         {tables.map((t) => (
-          <button type="button"
+          <button
+            type="button"
             key={t.name}
-            className={t.name === selected ? 'on' : ''}
+            className={cn(
+              'flex w-full cursor-pointer items-center justify-between gap-2 border-0 border-b border-border bg-transparent px-2.5 py-1.5 text-left font-mono text-[11.5px]',
+              t.name === selected ? 'bg-accent-dim text-fg' : 'text-fg-dim hover:bg-bg-2',
+            )}
             onClick={() => setSelected(t.name)}
             title={`${t.columns.length} columns`}
           >
-            <span className="db-tname">{t.name}</span>
-            <span className="db-trows tabnum">{t.rows}</span>
+            <span className="min-w-0 overflow-hidden text-ellipsis whitespace-nowrap">{t.name}</span>
+            <span className="tabnum flex-none text-fg-mute">{t.rows}</span>
           </button>
         ))}
       </aside>
 
-      <div className="db-grid">
+      <div className="flex min-w-0 flex-1 flex-col">
         {page ? (
           <>
-            <div className="db-gridscroll">
-              <table className="db-table">
+            <div className="min-h-0 flex-1 overflow-auto">
+              <table className="w-full border-collapse font-mono text-[11.5px]">
                 <thead>
                   <tr>
                     {page.columns.map((c) => (
-                      <th key={c}>{c}</th>
+                      <th key={c} className={thClass}>
+                        {c}
+                      </th>
                     ))}
                   </tr>
                 </thead>
@@ -133,7 +159,7 @@ function Tables() {
                     // biome-ignore lint/suspicious/noArrayIndexKey: rows are replaced wholesale per page
                     <tr key={i}>
                       {page.columns.map((c) => (
-                        <td key={c} title={cellText(row[c])}>
+                        <td key={c} className={tdClass} title={cellText(row[c])}>
                           {cellText(row[c])}
                         </td>
                       ))}
@@ -142,11 +168,12 @@ function Tables() {
                 </tbody>
               </table>
             </div>
-            <footer className="db-pager">
-              <span className="muted tabnum">
+            <footer className="flex items-center gap-2.5 border-t border-border px-2.5 py-1.5">
+              <span className="tabnum text-fg-mute">
                 {page.total === 0 ? 0 : offset + 1}–{Math.min(offset + PAGE, page.total)} of {page.total}
               </span>
-              <button type="button"
+              <Button
+                size="sm"
                 disabled={offset === 0}
                 onClick={() => {
                   const next = Math.max(0, offset - PAGE);
@@ -155,8 +182,9 @@ function Tables() {
                 }}
               >
                 ← prev
-              </button>
-              <button type="button"
+              </Button>
+              <Button
+                size="sm"
                 disabled={offset + PAGE >= page.total}
                 onClick={() => {
                   const next = offset + PAGE;
@@ -165,11 +193,11 @@ function Tables() {
                 }}
               >
                 next →
-              </button>
+              </Button>
             </footer>
           </>
         ) : (
-          <p className="db-empty muted">Loading rows…</p>
+          <p className="px-3.5 py-4 text-[12.5px] text-fg-mute">Loading rows…</p>
         )}
       </div>
     </div>
@@ -212,49 +240,55 @@ function ApiDoc() {
       .catch((e: unknown) => setError(e instanceof Error ? e.message : String(e)));
   }, []);
 
-  if (error) return <p className="db-empty err">Could not load the catalog: {error}</p>;
-  if (!map) return <p className="db-empty muted">Loading…</p>;
+  if (error) return <p className="px-3.5 py-4 text-[12.5px] text-err">Could not load the catalog: {error}</p>;
+  if (!map) return <p className="px-3.5 py-4 text-[12.5px] text-fg-mute">Loading…</p>;
 
   const endpoints = map.endpoints ?? [];
   if (endpoints.length === 0) {
-    return <p className="db-empty muted">Nothing captured yet — the catalog is built from real traffic.</p>;
+    return (
+      <p className="px-3.5 py-4 text-[12.5px] text-fg-mute">
+        Nothing captured yet — the catalog is built from real traffic.
+      </p>
+    );
   }
 
   return (
-    <div className="db-body">
-      <div className="db-grid">
-        <div className="db-gridscroll">
-          <table className="db-table">
-            <thead>
-              <tr>
-                <th>Method</th>
-                <th>Host</th>
-                <th>Path</th>
-                <th>Status</th>
-                <th>Params</th>
-                <th>Seen</th>
+    <div className="flex min-h-0 flex-1 flex-col border-t border-border">
+      <div className="min-h-0 flex-1 overflow-auto">
+        <table className="w-full border-collapse font-mono text-[11.5px]">
+          <thead>
+            <tr>
+              <th className={thClass}>Method</th>
+              <th className={thClass}>Host</th>
+              <th className={thClass}>Path</th>
+              <th className={thClass}>Status</th>
+              <th className={thClass}>Params</th>
+              <th className={thClass}>Seen</th>
+            </tr>
+          </thead>
+          <tbody>
+            {endpoints.map((e) => (
+              <tr key={e.key}>
+                <td className={tdClass}>{e.method}</td>
+                <td className={tdClass} title={e.hosts.join(', ')}>
+                  {e.hosts[0] ?? '—'}
+                </td>
+                <td className={tdClass} title={e.path}>
+                  {e.path}
+                </td>
+                <td className={cn(tdClass, 'tabnum')}>{e.statuses.join(', ') || '—'}</td>
+                <td className={tdClass} title={e.requestParams.join(', ')}>
+                  {e.requestParams.length > 0 ? `${e.requestParams.length}` : '—'}
+                </td>
+                <td className={cn(tdClass, 'tabnum')}>{e.sampleCount}</td>
               </tr>
-            </thead>
-            <tbody>
-              {endpoints.map((e) => (
-                <tr key={e.key}>
-                  <td>{e.method}</td>
-                  <td title={e.hosts.join(', ')}>{e.hosts[0] ?? '—'}</td>
-                  <td title={e.path}>{e.path}</td>
-                  <td className="tabnum">{e.statuses.join(', ') || '—'}</td>
-                  <td title={e.requestParams.join(', ')}>
-                    {e.requestParams.length > 0 ? `${e.requestParams.length}` : '—'}
-                  </td>
-                  <td className="tabnum">{e.sampleCount}</td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
-        <footer className="db-pager">
-          <span className="muted tabnum">{endpoints.length} endpoints</span>
-        </footer>
+            ))}
+          </tbody>
+        </table>
       </div>
+      <footer className="flex items-center gap-2.5 border-t border-border px-2.5 py-1.5">
+        <span className="tabnum text-fg-mute">{endpoints.length} endpoints</span>
+      </footer>
     </div>
   );
 }

@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 import { useEffect, useMemo, useState, type ReactNode } from 'react';
 import type { Capture } from '@sluice/core';
-import { formatBytes, formatClock, formatDuration, statusClass } from '../format.js';
+import { formatBytes, formatClock, formatDuration } from '../format.js';
+import { Badge, statusTone } from '../ui/badge.js';
 import {
   computeKpis,
   recentErrors,
@@ -109,7 +110,7 @@ export function Overview({ captures, onSelect }: Props) {
                     onClick={() => pick(e.id)}
                     className="flex w-full items-center gap-2 border-b border-bg-2 px-1 py-0.5 font-mono text-[11.5px] last:border-b-0 hover:bg-bg-2 focus-visible:outline focus-visible:outline-1 focus-visible:outline-offset-[-1px] focus-visible:outline-accent"
                   >
-                    <span className={`status-badge ${statusClass(e.status)}`}>{e.status ?? 'ERR'}</span>
+                    <Badge tone={statusTone(e.status)}>{e.status ?? 'ERR'}</Badge>
                     <span className="min-w-0 flex-1 truncate text-fg" title={`${e.host}${e.path}`}>
                       {e.host}
                       {e.path}

@@ -14,18 +14,6 @@ export function formatDuration(ms: number | null): string {
   return `${(ms / 1000).toFixed(2)}s`;
 }
 
-/** Semantic status class → CSS colour bucket. */
-export function statusClass(status: number | null): string {
-  if (status === null) return 'st-none';
-  if (status === 429) return 'st-429';
-  if (status >= 500) return 'st-5xx';
-  if (status >= 400) return 'st-4xx';
-  if (status >= 300) return 'st-3xx';
-  if (status >= 200) return 'st-2xx';
-  return 'st-none';
-}
-
-
 /** Humanize a raw byte count (B / KB / MB / GB). */
 export function formatBytes(n: number): string {
   if (n < 1024) return `${n} B`;

@@ -197,7 +197,15 @@ export function App() {
       <main className="min-h-0 flex-1 overflow-hidden">{page}</main>
 
       {toast ? (
-        <div className={`toast toast-${toast.level}`} role="status" aria-live="polite">
+        <div
+          className={
+            toast.level === 'error'
+              ? 'fixed bottom-[18px] right-[18px] z-10 max-w-[420px] rounded-md border border-[#5a2323] bg-[#24161a] px-3.5 py-2 text-[#f4b9b9] shadow-[0_6px_24px_rgba(0,0,0,0.45)]'
+              : 'fixed bottom-[18px] right-[18px] z-10 max-w-[420px] rounded-md border border-border-2 bg-bg-2 px-3.5 py-2 text-fg shadow-[0_6px_24px_rgba(0,0,0,0.45)]'
+          }
+          role="status"
+          aria-live="polite"
+        >
           {toast.text}
         </div>
       ) : null}
