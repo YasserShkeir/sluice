@@ -25,6 +25,7 @@ import type {
   Container,
   EngineStatus,
   Item,
+  ParseResult,
   Session,
   WorkItem,
   Workspace,
@@ -67,6 +68,13 @@ interface CredFlags {
   token?: string;
   cookie?: string;
   'app-support'?: string;
+  /**
+   * Which signed-in workspace to act as, by label substring or exact team id.
+   * Without it a caller gets whichever workspace the extractor happened to
+   * return first, which is only ever right by luck once you are signed in to
+   * more than one. See `acquireSession`.
+   */
+  workspace?: string;
 }
 
 /** Can we open a TCP connection to this port? Used to spot a dangling system proxy. */
@@ -262,11 +270,26 @@ async function extractAllSessions(flags: CredFlags, adapterId?: string): Promise
  * session reaching Slack's builder emits a literal `Cookie: cookieHeader`
  * header, and a Slack session reaching Trello's fires unauthenticated. Since
  * `apps[0]` is Slack, `sluice replay <any trello action>` did exactly that.
+ *
+ * `flags.workspace` is the same class of bug one level down, between workspaces
+ * of ONE adapter. Without it this returned `sessions[0]` — whichever team the
+ * extractor listed first — so on a machine signed in to several Slack
+ * workspaces, a replay against any other one came back HTTP 200 carrying
+ * `channel_not_found`: a real answer, from the wrong workspace, that reads like
+ * a missing channel. `cmdSync` already takes `--workspace`; this is the same
+ * selector so the two commands cannot disagree about what a workspace name means.
  */
 async function acquireSession(flags: CredFlags, adapterId?: string): Promise<Session> {
   const sessions = await extractAllSessions(flags, adapterId);
-  const first = sessions[0];
+  const scoped = selectWorkspace(sessions, flags.workspace);
+  const first = scoped[0];
   if (!first) {
+    if (flags.workspace && sessions.length > 0) {
+      // Naming what IS available turns a dead end into the next command to run.
+      throw new Error(
+        `No workspace matching "${flags.workspace}". Have: ${sessions.map((s) => s.label).join(', ')}`,
+      );
+    }
     throw new Error(
       adapterId
         ? `No signed-in ${adapterId} workspace found — sign in to it, or pass --token/--cookie.`
@@ -274,6 +297,19 @@ async function acquireSession(flags: CredFlags, adapterId?: string): Promise<Ses
     );
   }
   return first;
+}
+
+/**
+ * Filter sessions to one workspace by label substring or exact team id.
+ *
+ * Extracted so `cmdSync` and `acquireSession` share one definition of a match:
+ * a selector that resolved a channel under `sync` but not under `replay` would
+ * be worse than having no selector at all.
+ */
+function selectWorkspace(sessions: Session[], workspace?: string): Session[] {
+  if (!workspace) return sessions;
+  const wanted = workspace.toLowerCase();
+  return sessions.filter((s) => s.label.toLowerCase().includes(wanted) || s.workspaceId === workspace);
 }
 
 /** Never throws: returns ALL workspace sessions (one per team), or [] with a warning. */
@@ -1424,6 +1460,7 @@ async function cmdReplay(args: string[]): Promise<number> {
       all: { type: 'boolean' },
       'dry-run': { type: 'boolean' },
       db: { type: 'string' },
+      workspace: { type: 'string' },
       token: { type: 'string' },
       cookie: { type: 'string' },
       'app-support': { type: 'string' },
@@ -1433,10 +1470,14 @@ async function cmdReplay(args: string[]): Promise<number> {
   });
   if (values.help) {
     console.log(
-      'sluice replay <actionId> [--param k=v ...] [--adapter ID] [--token X --cookie Y] [--db PATH]\n' +
+      'sluice replay <actionId> [--param k=v ...] [--adapter ID] [--workspace NAME] [--token X --cookie Y] [--db PATH]\n' +
         'sluice replay --flow <templateId|primaryKey> [--param k=v ...] [--adapter ID] [--db PATH]\n' +
         'sluice replay --list [--adapter ID]   list available replay actions\n' +
-        'sluice replay --all [--container ID] [--adapter ID] [--dry-run]\n' +
+        'sluice replay --all [--container ID] [--adapter ID] [--workspace NAME] [--dry-run]\n' +
+        '  --workspace <name|team-id> picks which signed-in workspace to act as.\n' +
+        '  Without it the first extracted session wins, which on a machine signed\n' +
+        '  in to several workspaces returns HTTP 200 + channel_not_found from the\n' +
+        '  wrong one. Same selector as `sluice sync --workspace`.\n' +
         '  Drain the cursor worklist: replay every queued page, ingest it, and queue\n' +
         '  whatever it names next. --dry-run prints what it would replay and claims\n' +
         '  nothing. Stops cleanly when the replay budget is spent.\n' +
@@ -2225,10 +2266,7 @@ async function cmdSync(args: string[]): Promise<number> {
     return 1;
   }
 
-  const wanted = values.workspace?.toLowerCase();
-  const picked = wanted
-    ? sessions.filter((s) => s.label.toLowerCase().includes(wanted) || s.workspaceId === values.workspace)
-    : sessions;
+  const picked = selectWorkspace(sessions, values.workspace);
   if (picked.length === 0) {
     console.error(`No workspace matching "${values.workspace}". Have: ${sessions.map((s) => s.label).join(', ')}`);
     return 1;
@@ -2274,6 +2312,201 @@ async function cmdSync(args: string[]): Promise<number> {
   reconcileAll(store);
   materializeQuiet(store);
   store.close();
+  return 0;
+}
+
+/** One page of the unattributed walk. Small enough that decoding bodies stays cheap. */
+const REPARSE_PAGE = 500;
+
+/**
+ * Attribute and parse captures that landed before their app was installed.
+ *
+ * Attribution happens once, at capture time, from whatever adapters the
+ * capturing process held — so traffic recorded before an app existed is stored
+ * with `adapter_id NULL`, and `ingestCapture` stamps `parsed_at` on it anyway
+ * (it parses `adapter ? adapter.parse(c) : {}`). Nothing revisited those rows:
+ * 19,405 Notion captures sat fully parsed-and-empty while the parser, run over
+ * them offline, produced 8,279 pages. Installing an app was retroactively
+ * useless. This command is the missing revisit.
+ *
+ * Keyed on `adapter_id IS NULL`, NOT on `parsed_at` — the stamp is already set on
+ * exactly the rows that need this.
+ *
+ * Walks OLDEST-FIRST, and that is load-bearing rather than a detail. Entity
+ * upserts are last-writer-wins on text, so applying captures newest-first left
+ * the EARLIEST observation of every row in the store — the opposite of live
+ * ingest, where captures arrive in time order and a later observation
+ * supersedes an earlier one. On this machine it silently downgraded 9 Notion
+ * rows to their pre-rename titles, which would have made a downstream
+ * derivation keyed on those titles produce nothing and look like missing data
+ * rather than stale data.
+ *
+ * Paged with an inclusive `sinceTs` keyset. Inclusive because rows can share a
+ * millisecond, so the ids already handled at the boundary tick are carried
+ * forward and skipped; they accumulate for as long as the boundary does not
+ * advance, so a tick wider than one page is still drained rather than looped on.
+ */
+async function cmdReparse(args: string[]): Promise<number> {
+  const { values } = parseArgs({
+    args,
+    options: {
+      adapter: { type: 'string' },
+      db: { type: 'string' },
+      'dry-run': { type: 'boolean' },
+      reapply: { type: 'boolean' },
+      limit: { type: 'string' },
+      help: { type: 'boolean', short: 'h' },
+    },
+  });
+  if (values.help) {
+    console.log(
+      'sluice reparse [--adapter ID] [--dry-run] [--reapply] [--limit N] [--db PATH]\n' +
+        '  Re-attribute captures no adapter claimed (adapter_id IS NULL) against the apps\n' +
+        '  installed NOW, parse the ones that match into entities, and seed the worklist\n' +
+        '  from them — the revisit that installing an app after capturing never got.\n' +
+        '  Applies them oldest-first, so the newest observation of a row wins.\n' +
+        '  --dry-run counts what each app would claim and writes nothing.\n' +
+        '  --adapter restricts the claim to one app; other apps\' traffic stays unclaimed.\n' +
+        '  --reapply (needs --adapter) re-derives entities from captures that app ALREADY\n' +
+        '  owns, instead of unattributed ones. For healing a store whose rows were written\n' +
+        '  out of order; it reads the same captures again and writes no new ones.',
+    );
+    return 0;
+  }
+  const adapters = values.adapter ? apps.filter((a) => a.id === values.adapter) : apps;
+  if (values.adapter && adapters.length === 0) {
+    console.error(`Unknown adapter "${values.adapter}". Installed: ${apps.map((a) => a.id).join(', ')}`);
+    return 1;
+  }
+  const dry = Boolean(values['dry-run']);
+  const reapply = Boolean(values.reapply);
+  if (reapply && !values.adapter) {
+    // Without a scope this would re-derive every app in the store from every
+    // capture it holds — a long, surprising operation to get from one flag.
+    console.error('--reapply needs --adapter: name the app whose captures should be re-read.');
+    return 1;
+  }
+  const max = values.limit ? Number(values.limit) : Number.POSITIVE_INFINITY;
+  if (!Number.isFinite(max) && values.limit) {
+    console.error(`--limit must be a number, got "${values.limit}".`);
+    return 1;
+  }
+
+  const store = openStore(resolveDb(values.db, (values as { config?: string }).config));
+  const claimed = new Map<string, number>();
+  const totals = { workspaces: 0, actors: 0, containers: 0, items: 0 };
+  let scanned = 0;
+  let unmatched = 0;
+  let parseErrors = 0;
+  let seeds = 0;
+  let sinceTs: number | undefined;
+  let boundaryTs: number | undefined;
+  let seenAtBoundary = new Set<string>();
+
+  while (scanned < max) {
+    const batch = store.listCaptures({
+      ...(reapply ? { adapterId: values.adapter } : { unattributed: true }),
+      limit: REPARSE_PAGE,
+      order: 'asc',
+      ...(sinceTs !== undefined ? { sinceTs } : {}),
+    });
+    const page = batch.filter((c) => !seenAtBoundary.has(c.id));
+    if (page.length === 0) {
+      // A short batch means the walk is genuinely finished. A FULL batch that is
+      // entirely already-seen means one millisecond holds more captures than a
+      // page, and advancing would skip them — say so rather than stop quietly.
+      if (batch.length >= REPARSE_PAGE) {
+        console.error(
+          `Stopped at ts=${boundaryTs}: more than ${REPARSE_PAGE} captures share that millisecond. ` +
+            `Re-run with a larger page, or prune; ${scanned} capture(s) were processed.`,
+        );
+      }
+      break;
+    }
+
+    for (const c of page) {
+      if (scanned >= max) break;
+      scanned += 1;
+      const adapter = adapters.find((a) => {
+        try {
+          return a.matchRequest({ host: c.host, path: c.path, method: c.method, url: c.url });
+        } catch {
+          return false; // matchRequest is contractually non-throwing; a capture is not lost to one that does
+        }
+      });
+      if (!adapter) {
+        unmatched += 1;
+        continue;
+      }
+      claimed.set(adapter.id, (claimed.get(adapter.id) ?? 0) + 1);
+      if (dry) continue;
+
+      c.adapterId = adapter.id;
+      if (adapter.classify) {
+        try {
+          const named = adapter.classify(c);
+          if (named.operation) c.classification = named.operation;
+        } catch {
+          /* classify is non-throwing by contract */
+        }
+      }
+      c.parsedAt = Date.now();
+      store.insertCapture(c); // upsert: rewrites adapter_id, classification, parsed_at in place
+      let parsed: ParseResult = {};
+      try {
+        parsed = adapter.parse(c);
+      } catch (e) {
+        parseErrors += 1;
+        console.error(`  ${adapter.id} parse failed on ${c.id}: ${errMsg(e)}`);
+      }
+      const counts = store.applyParseResult(parsed, c.ts || Date.now());
+      totals.workspaces += counts.workspaces;
+      totals.actors += counts.actors;
+      totals.containers += counts.containers;
+      totals.items += counts.items;
+      if (adapter.nextCursors !== undefined) {
+        try {
+          const next = adapter.nextCursors(c);
+          if (next.length > 0) seeds += store.enqueueCursors(next);
+        } catch {
+          /* nextCursors is non-throwing by contract */
+        }
+      }
+    }
+
+    // Next page starts at the newest ts this one reached, inclusive. Ids already
+    // handled at that tick accumulate while the boundary stands still.
+    const newest = Math.max(...page.map((c) => c.ts));
+    const atBoundary = page.filter((c) => c.ts === newest).map((c) => c.id);
+    if (newest === boundaryTs) {
+      for (const id of atBoundary) seenAtBoundary.add(id);
+    } else {
+      boundaryTs = newest;
+      seenAtBoundary = new Set(atBoundary);
+    }
+    sinceTs = newest;
+  }
+
+  if (!dry) {
+    reconcileAll(store);
+    materializeQuiet(store);
+  }
+  store.close();
+
+  const verb = dry ? (reapply ? 'would re-read' : 'would claim') : reapply ? 're-read' : 'claimed';
+  const what = reapply ? `${values.adapter} capture(s)` : 'unattributed capture(s)';
+  console.log(`${dry ? 'DRY RUN — ' : ''}scanned ${scanned} ${what}; ${unmatched} match no installed app.`);
+  if (claimed.size === 0) {
+    console.log(`No app ${verb} anything.`);
+    return 0;
+  }
+  for (const [id, n] of [...claimed.entries()].sort((a, b) => b[1] - a[1])) console.log(`  ${id.padEnd(12)} ${verb} ${n}`);
+  if (!dry) {
+    console.log(
+      `entities: workspaces=${totals.workspaces} actors=${totals.actors} containers=${totals.containers} items=${totals.items}; ` +
+        `worklist +${seeds}${parseErrors ? `; ${parseErrors} parse error(s)` : ''}`,
+    );
+  }
   return 0;
 }
 
@@ -3101,6 +3334,7 @@ Commands:
   ca-uninstall    Remove trust for Sluice's local CA.
   sync            Reconstruct structure for ALL (or one) workspace via the Web API.
   build-db        Materialize per-app tables (one per collection, e.g. channels, users) from captures.
+  reparse         Attribute + parse captures recorded before their app was installed (adapter_id NULL).
   apidoc          Render an endpoint catalog (Markdown) from captured traffic.
   replay          Run one replay action by id, --flow <template>, or --all to drain cursors.
   flows           List / show / pin interaction flows and learned templates.
@@ -3154,6 +3388,8 @@ async function main(): Promise<number> {
       return cmdSync(rest);
     case 'build-db':
       return cmdBuildDb(rest);
+    case 'reparse':
+      return cmdReparse(rest);
     case 'apidoc':
       return cmdApiDoc(rest);
     case 'replay':

@@ -477,3 +477,132 @@ test('replay --flow without a template fails before session acquire', async () =
   assert.equal(code, 1);
   assert.match(err, /Unknown flow template|learn-flows|flows list/);
 });
+
+// ── reparse ──────────────────────────────────────────────────────────────────
+
+/**
+ * One Notion page observed twice, renamed in between, stored with no adapter —
+ * the shape of traffic captured before its app was installed.
+ *
+ * Bodies are the real `loadPageChunk` envelope, doubly-nested wrapper included,
+ * because the whole point is that the installed adapter parses them.
+ */
+function renamedPageDb(): { dbPath: string; pageId: string } {
+  const dbPath = join(scratch(), 'sluice.db');
+  const store = new SqliteStore(dbPath);
+  const pageId = 'f1c3b2a0-6d4e-4f8a-9b7c-2e5d8a1f0c34';
+  const space = '5e9a7c1d-3b2f-4e6a-8d0c-7f4b1a9e2d58';
+  const chunk = (title: string, editedAt: number): string =>
+    JSON.stringify({
+      recordMap: {
+        __version__: 3,
+        block: {
+          [pageId]: {
+            spaceId: space,
+            value: {
+              role: 'editor',
+              value: {
+                id: pageId,
+                type: 'page',
+                properties: { title: [[title]] },
+                parent_id: 'c0000000-0000-4000-8000-000000000001',
+                parent_table: 'collection',
+                space_id: space,
+                last_edited_time: editedAt,
+                alive: true,
+              },
+            },
+          },
+        },
+      },
+    });
+
+  for (const [i, [title, ts]] of (
+    [
+      ['old name', 1_757_000_000_000],
+      ['NEW NAME', 1_757_900_000_000],
+    ] as const
+  ).entries()) {
+    store.insertCapture({
+      id: `cap_${i}`,
+      ts,
+      source: 'mitm',
+      adapterId: null, // captured before app-notion existed — the case reparse exists for
+      method: 'POST',
+      url: 'https://app.notion.com/api/v3/loadPageChunk',
+      host: 'app.notion.com',
+      path: '/api/v3/loadPageChunk',
+      status: 200,
+      durationMs: 10,
+      reqHeaders: {},
+      reqBody: JSON.stringify({ pageId }),
+      resHeaders: {},
+      resBody: chunk(title, ts),
+      parsedAt: ts, // stamped but never parsed: exactly what ingestCapture leaves behind
+    });
+  }
+  store.close();
+  return { dbPath, pageId };
+}
+
+test('reparse applies captures oldest-first, so the newest observation wins', async () => {
+  const { dbPath, pageId } = renamedPageDb();
+
+  const dry = await run('reparse', '--adapter', 'notion', '--dry-run', '--db', dbPath);
+  assert.equal(dry.code, 0);
+  assert.match(dry.out, /would claim 2/);
+  const untouched = new SqliteStore(dbPath);
+  assert.equal(untouched.queryItems({ adapterId: 'notion' }).length, 0, '--dry-run writes nothing');
+  untouched.close();
+
+  const { code, out } = await run('reparse', '--adapter', 'notion', '--db', dbPath);
+  assert.equal(code, 0);
+  assert.match(out, /claimed 2/);
+
+  const store = new SqliteStore(dbPath);
+  const items = store.queryItems({ adapterId: 'notion' });
+  assert.equal(items.length, 1);
+  // Newest-first application would leave 'old name' here: entity upserts are
+  // last-writer-wins, so the last capture applied is the one that sticks.
+  assert.equal(items[0]?.text, 'NEW NAME');
+  assert.equal(items[0]?.id, pageId);
+  // Attribution is written back, so a second run has nothing left to claim.
+  assert.equal(store.countCaptures({ unattributed: true }), 0);
+  store.close();
+
+  const again = await run('reparse', '--adapter', 'notion', '--db', dbPath);
+  assert.equal(again.code, 0);
+  assert.match(again.out, /No app claimed anything|scanned 0/);
+});
+
+test('reparse --reapply heals rows an out-of-order run already wrote', async () => {
+  const { dbPath } = renamedPageDb();
+  await run('reparse', '--adapter', 'notion', '--db', dbPath);
+
+  // Simulate the damage the newest-first walk used to leave: the earliest
+  // observation sitting in a row whose captures are all attributed, so a plain
+  // reparse has nothing left to claim and cannot reach it.
+  const store = new SqliteStore(dbPath);
+  const [item] = store.queryItems({ adapterId: 'notion' });
+  store.upsertItem({ ...item!, text: 'old name' });
+  store.close();
+
+  const plain = await run('reparse', '--adapter', 'notion', '--db', dbPath);
+  assert.match(plain.out, /scanned 0 unattributed/);
+  const stale = new SqliteStore(dbPath);
+  assert.equal(stale.queryItems({ adapterId: 'notion' })[0]?.text, 'old name');
+  stale.close();
+
+  const healed = await run('reparse', '--adapter', 'notion', '--reapply', '--db', dbPath);
+  assert.equal(healed.code, 0);
+  assert.match(healed.out, /re-read 2/);
+  const fixed = new SqliteStore(dbPath);
+  assert.equal(fixed.queryItems({ adapterId: 'notion' })[0]?.text, 'NEW NAME');
+  fixed.close();
+});
+
+test('reparse --reapply without --adapter refuses rather than re-deriving everything', async () => {
+  const { code, err } = await run('reparse', '--reapply');
+  assert.equal(code, 1);
+  assert.match(err, /--reapply needs --adapter/);
+});

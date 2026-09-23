@@ -243,6 +243,24 @@ export interface CaptureQuery {
   /** Only captures no adapter claimed (`adapter_id IS NULL`) — the pre-scoping noise. */
   unattributed?: boolean;
   /**
+   * Oldest-first instead of the default newest-first.
+   *
+   * It matters to anything that REBUILDS state from the capture log rather than
+   * displaying it. Entity upserts are last-writer-wins, so applying captures
+   * newest-first leaves the oldest observation of every row in the store — the
+   * opposite of what live ingest produces, where captures arrive in time order
+   * and a later observation supersedes an earlier one.
+   */
+  order?: 'asc' | 'desc';
+  /**
+   * Only captures observed at or before this epoch-ms instant (`ts <= untilTs`).
+   * The paging key for a walk that must visit every row newest-first: results
+   * are ordered by `ts DESC`, so the last row's `ts` is the next page's bound.
+   * Inclusive, because rows can share a millisecond and an exclusive bound
+   * would drop the rest of that tick; callers skip the ids they already saw.
+   */
+  untilTs?: number;
+  /**
    * Look up these capture ids (order of results is not guaranteed to match).
    * Used by the traffic UI to hydrate flow members outside the live WS ring.
    * Capped by the store implementation.
