@@ -10,7 +10,7 @@
  * SQLite, and error strings pass through `redactText` before printing.
  */
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { closeSync, existsSync, mkdirSync, openSync, readFileSync, rmSync, statSync, writeFileSync, writeSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import process from 'node:process';
@@ -38,7 +38,7 @@ import {
   installExternalAdapters,
   readEnabledAdapterIds,
 } from '@sluice/apps';
-import { parseNdjson, runMockCaptures } from '@sluice/adapter-sdk';
+import { runMockCaptures } from '@sluice/adapter-sdk';
 import {
   CdpEngine,
   defaultChromeProfileDir,
@@ -58,6 +58,7 @@ import type { LaunchedChrome, Supervisor } from '@sluice/interceptor';
 import { buildApiMap, buildFlowStepRequest, clusterCapturesIntoFlows, faithfulReplayRequest, learnFlowTemplates, materialize, renderMarkdown } from '@sluice/cartographer';
 
 import * as config from './config.js';
+import { readNdjsonFile } from './ndjson-file.js';
 import { clearProxy, detectNetworkService, getProxyState, setProxy } from './proxy.js';
 import { startServer, type StartServerResult } from './server.js';
 import { EngineController, type EngineHandle } from './engine-controller.js';
@@ -1994,35 +1995,44 @@ async function cmdRecord(args: string[]): Promise<number> {
   store.close();
 
   const skipped = { asset: 0, binary: 0 };
-  const lines: string[] = [];
-  // Oldest first: the mock runner replays in timestamp order anyway, but a
-  // fixture that reads chronologically is far easier to reason about by hand.
-  for (const capture of [...captures].reverse()) {
-    const app = apps.find((a) => a.id === capture.adapterId);
-    const kind = app?.classify?.(capture)?.class;
-    if (!values['include-assets'] && (kind === 'asset' || kind === 'binary')) {
-      skipped[kind] += 1;
-      continue;
-    }
-    lines.push(
-      JSON.stringify({
-        ...capture,
-        url: redactUrl(capture.url),
-        reqHeaders: redactHeaders(capture.reqHeaders ?? {}),
-        resHeaders: redactHeaders(capture.resHeaders ?? {}),
-        reqBody: capture.reqBody === null ? null : redactText(capture.reqBody),
-        resBody: capture.resBody === null ? null : redactText(capture.resBody),
-      }),
-    );
-  }
+  // Written a line at a time rather than joined and written once. Joining is how
+  // this used to work and it has a hard ceiling: V8 caps a single string at
+  // ~512 MB, so `sluice record` over a real capture set — 12k Notion page chunks,
+  // ~1.5 GB of response bodies — died with "Invalid string length" before it
+  // wrote a byte, on exactly the volume the command exists to handle.
+  const fd = values.out ? openSync(values.out, 'w') : undefined;
+  const emit = (line: string): void => {
+    if (fd === undefined) process.stdout.write(`${line}\n`);
+    else writeSync(fd, `${line}\n`);
+  };
 
-  const ndjson = lines.length > 0 ? `${lines.join('\n')}\n` : '';
-  if (values.out) {
-    writeFileSync(values.out, ndjson);
-    console.error(`Wrote ${lines.length} captures to ${values.out}`);
-  } else {
-    process.stdout.write(ndjson);
+  let written = 0;
+  try {
+    // Oldest first: the mock runner replays in timestamp order anyway, but a
+    // fixture that reads chronologically is far easier to reason about by hand.
+    for (const capture of [...captures].reverse()) {
+      const app = apps.find((a) => a.id === capture.adapterId);
+      const kind = app?.classify?.(capture)?.class;
+      if (!values['include-assets'] && (kind === 'asset' || kind === 'binary')) {
+        skipped[kind] += 1;
+        continue;
+      }
+      emit(
+        JSON.stringify({
+          ...capture,
+          url: redactUrl(capture.url),
+          reqHeaders: redactHeaders(capture.reqHeaders ?? {}),
+          resHeaders: redactHeaders(capture.resHeaders ?? {}),
+          reqBody: capture.reqBody === null ? null : redactText(capture.reqBody),
+          resBody: capture.resBody === null ? null : redactText(capture.resBody),
+        }),
+      );
+      written += 1;
+    }
+  } finally {
+    if (fd !== undefined) closeSync(fd);
   }
+  if (values.out) console.error(`Wrote ${written} captures to ${values.out}`);
   const dropped = skipped.asset + skipped.binary;
   if (dropped > 0) {
     console.error(
@@ -2081,7 +2091,7 @@ async function cmdMock(args: string[]): Promise<number> {
     return 1;
   }
 
-  const { captures, skipped } = parseNdjson(readFileSync(file, 'utf8'));
+  const { captures, skipped } = readNdjsonFile(file);
   if (skipped.length > 0) {
     // Named, not counted: a fixture is hand-scrubbed, and "3 lines were bad" is
     // not enough to go and fix them.

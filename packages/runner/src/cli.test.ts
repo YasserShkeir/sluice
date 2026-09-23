@@ -22,6 +22,7 @@ import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 import test, { after } from 'node:test';
 import { SqliteStore } from '@sluice/core';
+import { readNdjsonFile } from './ndjson-file.js';
 
 const execFileAsync = promisify(execFile);
 const CLI = fileURLToPath(new URL('./cli.ts', import.meta.url));
@@ -155,6 +156,52 @@ test('mock fails cleanly when the fixture does not exist', async () => {
   const { code, err } = await run('mock', '/nonexistent/fixture.ndjson');
   assert.equal(code, 1);
   assert.match(err, /not found/i);
+});
+
+test('record writes one line per capture, oldest first, in the form mock reads back', async () => {
+  // record writes line by line and mock reads in chunks (a single joined string
+  // capped both at ~512 MB). This pins that the two still agree on the format.
+  const dbPath = join(scratch(), 'sluice.db');
+  const store = new SqliteStore(dbPath);
+  for (const [i, ts] of [1_700_000_000_000, 1_700_000_060_000, 1_700_000_120_000].entries()) {
+    store.insertCapture({
+      id: `cap_${i}`,
+      ts,
+      source: 'mitm',
+      adapterId: null,
+      method: 'GET',
+      url: `https://api.example.test/v1/items/${i}`,
+      host: 'api.example.test',
+      path: `/v1/items/${i}`,
+      status: 200,
+      durationMs: 5,
+      reqHeaders: {},
+      reqBody: null,
+      resHeaders: {},
+      resBody: `{"title":"Café ${i} 🧪"}`,
+    });
+  }
+  store.close();
+
+  const file = join(scratch(), 'fixture.ndjson');
+  const { code, err } = await run('record', '--out', file, '--db', dbPath);
+  assert.equal(code, 0);
+  assert.match(err, /Wrote 3 captures/);
+  const text = readFileSync(file, 'utf8');
+  assert.equal(text.split('\n').length, 4, 'three lines, each newline-terminated');
+
+  const { captures, skipped } = readNdjsonFile(file);
+  assert.deepEqual(skipped, []);
+  assert.deepEqual(
+    captures.map((c) => c.id),
+    ['cap_0', 'cap_1', 'cap_2'],
+    'oldest first',
+  );
+  assert.equal(captures[2]?.resBody, '{"title":"Café 2 🧪"}');
+
+  const piped = await run('record', '--db', dbPath);
+  assert.equal(piped.code, 0);
+  assert.equal(piped.out, text, 'stdout carries the same bytes as --out');
 });
 
 test('an unknown command exits non-zero rather than doing something', async () => {
