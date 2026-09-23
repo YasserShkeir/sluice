@@ -525,6 +525,42 @@ test('replay --flow without a template fails before session acquire', async () =
   assert.match(err, /Unknown flow template|learn-flows|flows list/);
 });
 
+// ── workspace selection ──────────────────────────────────────────────────────
+// Pasted --token/--cookie sessions, so no extractor runs and no Keychain prompt
+// is raised. Each case exits before a request is built, so nothing leaves the
+// machine either.
+
+const PASTED = ['--token', 'xoxc-not-a-real-token', '--cookie', 'd=not-a-real-cookie'];
+
+test('replay --workspace that matches nothing fails and names the workspaces there are', async () => {
+  const { code, err } = await run('replay', 'slack.conversations.list', '--workspace', 'no-such-team', ...PASTED);
+  assert.equal(code, 1);
+  assert.match(err, /No workspace matching "no-such-team"\. Have: Slack \(paste-in\)/);
+});
+
+test('replay --workspace matches a label substring, ignoring case', async () => {
+  // Past the selector, the malformed --param is the next thing to fail, which
+  // shows the workspace was accepted without sending anything.
+  const { code, err } = await run(
+    'replay',
+    'slack.conversations.list',
+    '--workspace',
+    'PASTE-IN',
+    '--param',
+    'noequals',
+    ...PASTED,
+  );
+  assert.equal(code, 1);
+  assert.doesNotMatch(err, /No workspace matching/);
+  assert.match(err, /Bad --param "noequals"/);
+});
+
+test('sync --workspace shares the matcher and the miss message', async () => {
+  const { code, err } = await run('sync', '--workspace', 'no-such-team', ...PASTED);
+  assert.equal(code, 1);
+  assert.match(err, /No workspace matching "no-such-team"\. Have: Slack \(paste-in\)/);
+});
+
 // ── reparse ──────────────────────────────────────────────────────────────────
 
 /**
