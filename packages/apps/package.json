@@ -19,6 +19,7 @@
     "@sluice/app-gmail": "workspace:*",
     "@sluice/app-loom": "workspace:*",
     "@sluice/app-linkedin": "workspace:*",
+    "@sluice/app-notion": "workspace:*",
     "@sluice/adapter-sdk": "workspace:*"
   },
   "devDependencies": {

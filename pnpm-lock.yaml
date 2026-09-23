@@ -159,6 +159,19 @@ importers:
         specifier: ^20.10.0
         version: 20.19.43
 
+  packages/app-notion:
+    dependencies:
+      '@sluice/adapter-sdk':
+        specifier: workspace:*
+        version: link:../adapter-sdk
+      '@sluice/core':
+        specifier: workspace:*
+        version: link:../core
+    devDependencies:
+      '@types/node':
+        specifier: ^20.10.0
+        version: 20.19.43
+
   packages/app-slack:
     dependencies:
       '@sluice/adapter-sdk':
@@ -205,6 +218,9 @@ importers:
       '@sluice/app-loom':
         specifier: workspace:*
         version: link:../app-loom
+      '@sluice/app-notion':
+        specifier: workspace:*
+        version: link:../app-notion
       '@sluice/app-slack':
         specifier: workspace:*
         version: link:../app-slack
