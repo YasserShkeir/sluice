@@ -199,6 +199,49 @@ test('listCaptures honours sinceTs — the incremental materialize path', () => 
   store.close();
 });
 
+test('listCaptures order: newest-first by default, oldest-first on request', () => {
+  const store = new SqliteStore(':memory:');
+  store.insertCapture(capture({ id: 'mid', ts: 3_000 }));
+  store.insertCapture(capture({ id: 'old', ts: 1_000 }));
+  store.insertCapture(capture({ id: 'new', ts: 5_000 }));
+
+  const ids = (q: Parameters<SqliteStore['listCaptures']>[0]) => store.listCaptures(q).map((c) => c.id);
+  assert.deepEqual(ids({}), ['new', 'mid', 'old']);
+  assert.deepEqual(ids({ order: 'desc' }), ['new', 'mid', 'old']);
+  assert.deepEqual(ids({ order: 'asc' }), ['old', 'mid', 'new']);
+  // The direction is mapped, never interpolated: junk falls back to the default.
+  assert.deepEqual(ids({ order: 'asc; DROP TABLE captures' as 'asc' }), ['new', 'mid', 'old']);
+  store.close();
+});
+
+test('an oldest-first walk on the (ts, id) keyset visits every row once, ties included', () => {
+  // Seven rows per millisecond across a page size of five, so page edges fall
+  // inside ticks. Paging on ts alone either skips the rest of a tick or hands
+  // the same rows back; the keyset does neither.
+  const store = new SqliteStore(':memory:');
+  const expected: string[] = [];
+  for (let tick = 0; tick < 4; tick++) {
+    for (let k = 6; k >= 0; k--) {
+      const id = `c${tick}_${k}`;
+      store.insertCapture(capture({ id, ts: 1_000 + tick }));
+    }
+    for (let k = 0; k < 7; k++) expected.push(`c${tick}_${k}`);
+  }
+
+  const seen: string[] = [];
+  let after: { ts: number; id: string } | undefined;
+  for (;;) {
+    const page = store.listCaptures({ order: 'asc', limit: 5, ...(after ? { after } : {}) });
+    const last = page[page.length - 1];
+    if (last === undefined) break;
+    seen.push(...page.map((c) => c.id));
+    after = { ts: last.ts, id: last.id };
+  }
+  assert.deepEqual(seen, expected, 'ts order, id order within a tick, no repeats, no gaps');
+  assert.equal(store.countCaptures({ after: { ts: 1_001, id: 'c1_3' } }), 3 + 7 + 7, 'count honours the same keyset');
+  store.close();
+});
+
 // ── Body compression ─────────────────────────────────────────────────────────
 
 test('a large body is stored compressed and reads back identical', () => {

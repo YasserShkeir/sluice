@@ -648,6 +648,51 @@ test('reparse --reapply heals rows an out-of-order run already wrote', async () 
   fixed.close();
 });
 
+test('reparse drains a millisecond that holds more captures than one page', async () => {
+  // 600 captures no installed app matches, all at one ms, then 10 Notion ones a
+  // ms later. Unmatched rows stay unattributed, so the first 500 come back on
+  // every page; a walk keyed on ts alone re-read them, saw nothing new and
+  // stopped with exit 0, having claimed none of the Notion captures behind them.
+  const dbPath = join(scratch(), 'sluice.db');
+  const store = new SqliteStore(dbPath);
+  const base = 1_757_000_000_000;
+  const add = (id: string, ts: number, host: string, path: string): void =>
+    store.insertCapture({
+      id,
+      ts,
+      source: 'mitm',
+      adapterId: null,
+      method: 'POST',
+      url: `https://${host}${path}`,
+      host,
+      path,
+      status: 200,
+      durationMs: 1,
+      reqHeaders: {},
+      reqBody: '{}',
+      resHeaders: {},
+      resBody: '{}',
+      parsedAt: ts,
+    });
+  for (let i = 0; i < 600; i++) add(`cap_other_${String(i).padStart(3, '0')}`, base, 'telemetry.example.test', '/v1/events');
+  for (let i = 0; i < 10; i++) add(`cap_notion_${i}`, base + 1, 'app.notion.com', '/api/v3/loadPageChunk');
+  store.close();
+
+  const dry = await run('reparse', '--adapter', 'notion', '--dry-run', '--db', dbPath);
+  assert.equal(dry.code, 0, dry.err);
+  assert.match(dry.out, /scanned 610 unattributed/);
+  assert.match(dry.out, /would claim 10/);
+
+  const real = await run('reparse', '--adapter', 'notion', '--db', dbPath);
+  assert.equal(real.code, 0, real.err);
+  assert.match(real.out, /scanned 610 unattributed/);
+  assert.match(real.out, /claimed 10/);
+  const after = new SqliteStore(dbPath);
+  assert.equal(after.countCaptures({ adapterId: 'notion' }), 10);
+  assert.equal(after.countCaptures({ unattributed: true }), 600, 'the unmatched rows are left alone');
+  after.close();
+});
+
 test('reparse --reapply without --adapter refuses rather than re-deriving everything', async () => {
   const { code, err } = await run('reparse', '--reapply');
   assert.equal(code, 1);

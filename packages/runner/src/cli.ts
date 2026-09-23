@@ -2351,10 +2351,12 @@ const REPARSE_PAGE = 500;
  * derivation keyed on those titles produce nothing and look like missing data
  * rather than stale data.
  *
- * Paged with an inclusive `sinceTs` keyset. Inclusive because rows can share a
- * millisecond, so the ids already handled at the boundary tick are carried
- * forward and skipped; they accumulate for as long as the boundary does not
- * advance, so a tick wider than one page is still drained rather than looped on.
+ * Paged on a `(ts, id)` keyset: oldest-first with ties broken by id, and each
+ * page starting strictly after the last row of the one before. A `ts` bound
+ * alone cannot do this. Rows share a millisecond, and rows this walk does not
+ * claim (--dry-run, --reapply, or traffic no selected app matches) stay in the
+ * result set, so a tick holding more than one page of them came back as the
+ * same page every time and the walk stopped there, exiting 0.
  */
 async function cmdReparse(args: string[]): Promise<number> {
   const { values } = parseArgs({
@@ -2409,30 +2411,17 @@ async function cmdReparse(args: string[]): Promise<number> {
   let unmatched = 0;
   let parseErrors = 0;
   let seeds = 0;
-  let sinceTs: number | undefined;
-  let boundaryTs: number | undefined;
-  let seenAtBoundary = new Set<string>();
+  let after: { ts: number; id: string } | undefined;
 
   while (scanned < max) {
-    const batch = store.listCaptures({
+    const page = store.listCaptures({
       ...(reapply ? { adapterId: values.adapter } : { unattributed: true }),
       limit: REPARSE_PAGE,
       order: 'asc',
-      ...(sinceTs !== undefined ? { sinceTs } : {}),
+      ...(after ? { after } : {}),
     });
-    const page = batch.filter((c) => !seenAtBoundary.has(c.id));
-    if (page.length === 0) {
-      // A short batch means the walk is genuinely finished. A FULL batch that is
-      // entirely already-seen means one millisecond holds more captures than a
-      // page, and advancing would skip them — say so rather than stop quietly.
-      if (batch.length >= REPARSE_PAGE) {
-        console.error(
-          `Stopped at ts=${boundaryTs}: more than ${REPARSE_PAGE} captures share that millisecond. ` +
-            `Re-run with a larger page, or prune; ${scanned} capture(s) were processed.`,
-        );
-      }
-      break;
-    }
+    const last = page[page.length - 1];
+    if (last === undefined) break;
 
     for (const c of page) {
       if (scanned >= max) break;
@@ -2484,17 +2473,7 @@ async function cmdReparse(args: string[]): Promise<number> {
       }
     }
 
-    // Next page starts at the newest ts this one reached, inclusive. Ids already
-    // handled at that tick accumulate while the boundary stands still.
-    const newest = Math.max(...page.map((c) => c.ts));
-    const atBoundary = page.filter((c) => c.ts === newest).map((c) => c.id);
-    if (newest === boundaryTs) {
-      for (const id of atBoundary) seenAtBoundary.add(id);
-    } else {
-      boundaryTs = newest;
-      seenAtBoundary = new Set(atBoundary);
-    }
-    sinceTs = newest;
+    after = { ts: last.ts, id: last.id };
   }
 
   if (!dry) {

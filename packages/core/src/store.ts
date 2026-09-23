@@ -124,9 +124,12 @@ function captureWhere(q: CaptureQuery): Where {
     parts.push('ts >= @sinceTs');
     params.sinceTs = q.sinceTs;
   }
-  if (q.untilTs !== undefined) {
-    parts.push('ts <= @untilTs');
-    params.untilTs = q.untilTs;
+  if (q.after) {
+    // Row-value comparison, so it matches the `ts, id` order an oldest-first
+    // listCaptures uses.
+    parts.push('(ts, id) > (@afterTs, @afterId)');
+    params.afterTs = q.after.ts;
+    params.afterId = q.after.id;
   }
   if (q.tabId) {
     parts.push('tab_id = @tabId');
@@ -424,9 +427,10 @@ export class SqliteStore {
     const limit = q.limit ?? 500;
     // Mapped from the union rather than interpolated: `order` reaches SQL text,
     // and a value that is merely typed is not a value that has been checked.
-    const direction = q.order === 'asc' ? 'ASC' : 'DESC';
+    // Oldest-first adds `id` as a tie-break so an `after` keyset can page it.
+    const orderBy = q.order === 'asc' ? 'ts ASC, id ASC' : 'ts DESC';
     const rows = this.db
-      .prepare(`SELECT * FROM captures ${clause} ORDER BY ts ${direction} LIMIT @limit`)
+      .prepare(`SELECT * FROM captures ${clause} ORDER BY ${orderBy} LIMIT @limit`)
       .all({ ...params, limit }) as CaptureRow[];
     return rows.map(rowToCapture);
   }
