@@ -10,9 +10,11 @@ of guessing at endpoints, you drive the real client, capture what it actually
 calls, and render a catalog with real request/response shapes.
 
 Output lands in `docs/<service>-api.md`. Note that the whole `docs/` tree is
-gitignored (only `docs/linting.md` is force-added), so any example catalogs on a
+gitignored except `docs/public/` (the only tracked docs location, and nothing
+rendered from captured traffic belongs there), so any example catalogs on a
 given machine are **local-only** — do not expect to find them in a fresh clone,
-and do not point a reader at one.
+and do not point a reader at one. The project graph hard-excludes `docs/`
+outside `docs/public/` too.
 
 The lesson those examples teach, since you probably cannot read them: a
 well-scoped catalog for a service with a dedicated API host runs a couple of
@@ -45,8 +47,10 @@ Three things to know before you start:
   persists between runs, so you only pay for it once. To use a Chrome you are
   already signed into, start that Chrome with `--remote-debugging-port=9222`
   yourself and attach with `pnpm sluice capture --no-launch`.
-- **It captures XHR and Fetch only.** Documents, scripts, CSS, images, fonts,
-  media and beacons are dropped before they reach the store. WebSocket **text**
+- **It captures XHR and Fetch** (plus Document navigations only on hosts an
+  installed adapter already claims, so a new, un-adapted service is
+  XHR/Fetch-only). Scripts, CSS, images, fonts, media and beacons are dropped
+  before they reach the store. WebSocket **text**
   frames are captured (on by default); **binary** frames are not, so a realtime
   layer that uses a binary protocol is invisible here. Note that gap in the doc
   rather than concluding the endpoint doesn't exist.

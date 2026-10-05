@@ -3,8 +3,7 @@
  * app-trello tests. Run with:
  *   node --import tsx --test src/*.test.ts   (from this package)
  *
- * The cookie decryption is macOS/Keychain-bound and is skipped off darwin rather
- * than failing; everything else here is pure.
+ * Everything here is pure: no test reads Chrome's cookie store or the Keychain.
  *
  * The shared invariants (never-throws, host lookalikes, seed ownership, secrets
  * resolved by value) come from `runConformance` at the bottom — this file only
@@ -19,6 +18,7 @@ import {
   parseTrelloCapture,
   trelloAdapter,
   trelloApp,
+  trelloHeaders,
   trelloNextCursors,
 } from './index.js';
 
@@ -38,6 +38,7 @@ function capture(over: Partial<Capture> = {}): Capture {
 const trelloJson = (path: string, body: unknown, over: Partial<Capture> = {}): Capture =>
   makeJsonCapture('trello.com', path, body, over);
 
+/** Synthetic, Trello-shaped (24 hex) ids — never copied from a real account. */
 const BOARD = '5f00000000000000000000b1';
 const OTHER_BOARD = '5f00000000000000000000b2';
 
@@ -113,6 +114,64 @@ test('a single card endpoint still parses into one item', () => {
   );
 });
 
+test('a board\'s lists parse into containers', () => {
+  // The dead end this closes: `trello.board.lists` was fanned out to from every
+  // cards response, and its answer normalized to nothing at all.
+  const r = parseTrelloCapture(
+    trelloJson(`/1/boards/${BOARD}/lists`, [
+      { id: 'L1', name: 'Todo', idBoard: BOARD },
+      { id: 'L2', name: 'Done', idBoard: BOARD },
+      { name: 'id-less' },
+    ]),
+  );
+  assert.equal(r.items, undefined, 'a list is not a card');
+  assert.deepEqual(
+    r.containers?.map((c) => [c.id, c.kind, c.name, c.workspaceId]),
+    [
+      ['L1', 'other', 'Todo', 'trello'],
+      ['L2', 'other', 'Done', 'trello'],
+    ],
+  );
+  assert.equal((r.containers?.[0]?.raw as { idBoard?: string } | undefined)?.idBoard, BOARD, 'the board stays in raw');
+});
+
+test('an action feed yields one item per card comment and skips other activity', () => {
+  const comment = {
+    id: 'act1',
+    type: 'commentCard',
+    idMemberCreator: 'm1',
+    date: '2025-01-02T03:04:05.000Z',
+    data: { text: 'Looks good', card: { id: 'card1' }, board: { id: BOARD } },
+  };
+  const move = { id: 'act2', type: 'updateCard', data: { card: { id: 'card1' }, board: { id: BOARD } } };
+  for (const path of [`/1/boards/${BOARD}/actions`, `/1/cards/card1/actions`]) {
+    const r = parseTrelloCapture(trelloJson(path, [comment, move]));
+    assert.deepEqual(
+      r.items?.map((i) => [i.id, i.kind, i.containerId, i.text, i.threadId, i.authorId, i.ts]),
+      [['act1', 'message', BOARD, 'Looks good', 'card1', 'm1', Date.parse('2025-01-02T03:04:05.000Z')]],
+      path,
+    );
+  }
+  // A comment with no data still lands on the board the path names.
+  const bare = parseTrelloCapture(trelloJson(`/1/boards/${BOARD}/actions`, [{ id: 'a1', type: 'commentCard' }]));
+  assert.equal(bare.items?.[0]?.containerId, BOARD);
+});
+
+test('a parse that yields anything names the Trello workspace its children hang off', () => {
+  // Without it every container and item pointed at a `trello` workspace that
+  // only existed once a Chrome profile had been probed.
+  for (const r of [
+    parseTrelloCapture(trelloJson('/1/members/me/boards', [{ id: BOARD, name: 'Roadmap' }])),
+    parseTrelloCapture(trelloJson(`/1/cards/c1`, { id: 'c1', name: 'Ship it', idBoard: BOARD })),
+  ]) {
+    assert.deepEqual(
+      r.workspaces?.map((w) => [w.id, w.adapterId, w.name]),
+      [['trello', 'trello', 'Trello']],
+    );
+  }
+  assert.deepEqual(parseTrelloCapture(trelloJson('/1/webhooks', [])), {}, 'nothing recognized, no workspace');
+});
+
 // ── classify ─────────────────────────────────────────────────────────────────────
 
 test('classify labels the SPA as assets, not as unrecognized API calls', () => {
@@ -164,11 +223,11 @@ test('classify reports a failure as an error but keeps the operation', () => {
 });
 
 test('classify collapses shortLink card/board paths to :id ops', () => {
-  // Live traffic uses /1/card/SynCard1; templates must not key on the short id.
-  const card = classifyTrelloCapture(trelloJson('/1/card/SynCard1', { id: 'c1' }));
+  // Live traffic uses /1/card/<shortLink>; templates must not key on the short id.
+  const card = classifyTrelloCapture(trelloJson('/1/card/AbCd1234', { id: 'c1' }));
   assert.equal(card.class, 'messages');
   assert.equal(card.operation, 'cards/:id');
-  const board = classifyTrelloCapture(trelloJson('/1/board/SynBrd01', { id: BOARD, name: 'B' }));
+  const board = classifyTrelloCapture(trelloJson('/1/board/WxYz5678', { id: BOARD, name: 'B' }));
   assert.equal(board.class, 'structure');
   assert.equal(board.operation, 'boards/:id');
 });
@@ -313,6 +372,7 @@ test('buildReplayRequest puts the session cookie in the Cookie header', () => {
   const req = trelloAdapter.buildReplayRequest(action, {}, SESSION);
   assert.equal(req.headers.Cookie, 'token=REAL_COOKIE_VALUE');
   assert.ok(req.headers['User-Agent'], 'browser-like headers are sent too');
+  assert.equal(trelloHeaders().Cookie, undefined, 'no cookie, no Cookie header');
 });
 
 test('a board-scoped action interpolates the id into the PATH', () => {
@@ -348,11 +408,6 @@ test('the app exposes a credential provider with a passive probe', () => {
   // stay invisible until a tool failed.
   assert.ok(trelloApp.credentials, 'trello authenticates, so it needs a provider');
   assert.equal(typeof trelloApp.credentials.listWorkspaces, 'function');
-});
-
-test('listWorkspaces is passive and never throws', { skip: process.platform !== 'darwin' }, async () => {
-  const out = await trelloApp.credentials?.listWorkspaces?.();
-  assert.ok(Array.isArray(out));
 });
 
 // ── the shared invariants ────────────────────────────────────────────────────────

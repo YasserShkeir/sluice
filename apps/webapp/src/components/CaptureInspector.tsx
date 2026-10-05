@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-import { useEffect, useMemo, useState } from 'react';
+import { useMemo, useState } from 'react';
 import type { Capture, Item } from '@sluice/core';
 import { formatClock, formatDuration, humanizeBytes, prettyJson, toCurl } from '../format.js';
 import { Badge, statusTone } from '../ui/badge.js';
@@ -13,7 +13,8 @@ import {
 } from '../api.js';
 import { diffLines, diffStat } from '../diff.js';
 import { setPin, usePin } from '../pin.js';
-import { matchTemplateForFlow, primaryMembership, indexFlowsByCapture } from '../flow-ui.js';
+import { matchTemplateForFlow, indexFlowsByCapture } from '../flow-ui.js';
+import { useAsync } from '../use-async.js';
 import { JsonTree } from './JsonTree.js';
 import { Tab as TabBtn, TabList } from '../ui/tabs.js';
 
@@ -102,73 +103,20 @@ function Headers({ headers }: { headers: Record<string, string> }) {
 
 export function CaptureInspector({ capture, onClose }: Props) {
   const [tab, setTab] = useState<Tab>('response');
-  // Bodies are not shipped over the WS backfill (they can be 5 MB each), so the
-  // inspector fetches them on demand and merges over whatever the capture row
-  // already carries. Headers come back on the same request.
-  const [fetched, setFetched] = useState<{
-    reqBody: string | null;
-    resBody: string | null;
-    reqHeaders: Record<string, string>;
-    resHeaders: Record<string, string>;
-  } | null>(null);
-  const [entities, setEntities] = useState<Item[] | null>(null);
-  const [flowInfo, setFlowInfo] = useState<{
-    flows: FlowSummary[];
-    templates: FlowTemplateSummary[];
-  } | null>(null);
+  const [opened, setOpened] = useState<ReadonlySet<Tab>>(() => new Set([tab]));
+  if (!opened.has(tab)) setOpened(new Set(opened).add(tab)); // latch: a tab's data loads on first open and is kept
+  // List rows carry at most 64 KiB of each body (a stored one can be 5 MB), so the
+  // inspector fetches the whole body on demand and merges over whatever the
+  // capture row already carries. Headers come back on the same request; a failed fetch falls
+  // back to the inline fields below.
+  const { data: fetched } = useAsync(() => fetchCaptureBody(capture.id), [capture.id]);
+  // The parent keys this component by capture.id (TrafficPage), so per-capture state needs no reset.
+  const ents = useAsync(() => (opened.has('entities') ? fetchCaptureEntities(capture.id) : null), [opened.has('entities')]);
+  const entities = ents.data?.items ?? (ents.error === null ? null : []);
+  const app = capture.adapterId ?? undefined;
+  const fl = useAsync(() => (opened.has('flow') ? Promise.all([fetchFlows({ limit: 100, app }), fetchFlowTemplates({ limit: 100, app })]) : null), [opened.has('flow')]);
+  const flowInfo = fl.data ? { flows: fl.data[0].flows, templates: fl.data[1].templates } : fl.error === null ? null : { flows: [], templates: [] };
   const pinned = usePin();
-
-  useEffect(() => {
-    setFetched(null);
-    setEntities(null);
-    setFlowInfo(null);
-    let live = true;
-    fetchCaptureBody(capture.id)
-      .then((b) => {
-        if (live) setFetched(b);
-      })
-      .catch(() => {
-        /* fall back to the inline fields below */
-      });
-    return () => {
-      live = false;
-    };
-  }, [capture.id]);
-
-  // Lazy: only hit the entities endpoint when that tab is first opened.
-  useEffect(() => {
-    if (tab !== 'entities' || entities !== null) return;
-    let live = true;
-    fetchCaptureEntities(capture.id)
-      .then((r) => {
-        if (live) setEntities(r.items);
-      })
-      .catch(() => {
-        if (live) setEntities([]);
-      });
-    return () => {
-      live = false;
-    };
-  }, [tab, capture.id, entities]);
-
-  // Lazy: flow membership + matching templates when the Flow tab opens.
-  useEffect(() => {
-    if (tab !== 'flow' || flowInfo !== null) return;
-    let live = true;
-    Promise.all([
-      fetchFlows({ limit: 100, app: capture.adapterId ?? undefined }),
-      fetchFlowTemplates({ limit: 100, app: capture.adapterId ?? undefined }),
-    ])
-      .then(([f, tmpl]) => {
-        if (live) setFlowInfo({ flows: f.flows, templates: tmpl.templates });
-      })
-      .catch(() => {
-        if (live) setFlowInfo({ flows: [], templates: [] });
-      });
-    return () => {
-      live = false;
-    };
-  }, [tab, capture.id, capture.adapterId, flowInfo]);
 
   const reqHeaders = fetched?.reqHeaders ?? capture.reqHeaders;
   const resHeaders = fetched?.resHeaders ?? capture.resHeaders;
@@ -391,7 +339,6 @@ function Diff({ pinnedLabel, left, right }: { pinnedLabel: string; left: string;
   );
 }
 
-
 function FlowPanel({
   capture,
   info,
@@ -402,7 +349,6 @@ function FlowPanel({
   if (info === null) return <div className="text-[12px] text-fg-mute">Loading…</div>;
 
   const memberships = indexFlowsByCapture(info.flows).get(capture.id) ?? [];
-  const primary = primaryMembership(memberships);
 
   if (memberships.length === 0) {
     return (
@@ -475,8 +421,8 @@ function FlowPanel({
                   sluice replay --flow {tmpl.id}
                 </pre>
                 <div className="mt-0.5 text-[10px] text-fg-mute">
-                  Or MCP tool <code className="font-mono">sluice_replay_flow</code> (read-only,
-                  budgeted). Multi-step run is not wired to the dashboard WebSocket yet.
+                  Or MCP tool <code className="font-mono">sluice_replay_flow</code> (replay rails,
+                  budgeted). You can also run it from Replay → Learned flows.
                 </div>
               </div>
             ) : (
@@ -488,7 +434,7 @@ function FlowPanel({
           </div>
         );
       })}
-      {primary && memberships.length > 1 ? (
+      {memberships.length > 1 ? (
         <p className="text-[11px] text-fg-mute">Showing all flows that include this capture.</p>
       ) : null}
     </div>

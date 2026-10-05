@@ -11,10 +11,10 @@
  */
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import type { EngineStatus } from '@sluice/core';
+import type { EngineStatus, SystemProxyReport } from '@sluice/core';
 import type { Supervisor } from '@sluice/interceptor';
 import { EngineController } from './engine-controller.js';
-import type { EngineControllerDeps, EngineHandle, SystemProxyReport } from './engine-controller.js';
+import type { EngineControllerDeps, EngineHandle } from './engine-controller.js';
 
 function fakeEngine(): EngineHandle & { starts: number; stops: number; state: EngineStatus['state'] } {
   const e = {
@@ -214,4 +214,29 @@ test('the supervisor giving up (terminal error) clears the proxy', async () => {
   fireError?.();
   await new Promise((r) => setTimeout(r, 5)); // let the async terminal handler run
   assert.equal(proxy.enabled, false, 'a dead engine must not keep the proxy up');
+});
+
+test('a LAN-bound runner refuses the system proxy, as `sluice proxy on` does', async () => {
+  // The CLI refused this; the dashboard's proxy.control went straight through.
+  const proxy = { on: 0 };
+  const ctrl = new EngineController({
+    buildEngine: () => fakeEngine(),
+    supervise: () => fakeSupervisor(),
+    proxy: {
+      async on() {
+        proxy.on += 1;
+      },
+      async off() {},
+      async state(): Promise<SystemProxyReport> {
+        return { supported: true, enabled: false, ours: false };
+      },
+    },
+    onStatus: () => {},
+    onEnvironment: () => {},
+    caInfo: () => ({ generated: true }),
+    lanProxy: true,
+  });
+  await ctrl.startEngine();
+  await assert.rejects(() => ctrl.proxyOn(), /--lan-proxy/);
+  assert.equal(proxy.on, 0, 'the OS proxy was never touched');
 });

@@ -1,0 +1,8 @@
+[mcp_servers.sluice_project]
+command = "pnpm"
+args = ["exec", "tsx", "packages/project-graph/src/cli.ts", "mcp", "--root", "."]
+cwd = "."
+enabled = true
+required = false
+startup_timeout_sec = 30
+tool_timeout_sec = 120

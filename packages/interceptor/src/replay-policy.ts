@@ -2,28 +2,32 @@
 /**
  * Replay safety rails.
  *
- * Sluice reads your own session. The single most important property is that it
- * cannot *act* as you — a replay should never post a message, invite someone,
- * delete a card, or touch an admin endpoint. Nothing enforced that before: the
- * replay path issued whatever URL and method it was handed.
+ * Sluice reads your own session, and a replay should never post a message,
+ * invite someone, delete a card, or touch an admin endpoint. Nothing enforced
+ * that before: the replay path issued whatever URL and method it was handed.
  *
  * These checks live here, below every caller (CLI, WS server, MCP tool), rather
  * than in the UI, precisely so a modified frontend or a creative tool argument
- * cannot route around them.
+ * cannot route around them. They are heuristics that refuse what looks like a
+ * write, NOT a proof that an allowed request does not mutate.
  *
- * Three independent limits:
+ * Independent limits:
  *   1. Method — mutating verbs are refused outright.
- *   2. Operation — a denylist of write/admin operation names, since services like
- *      Slack use POST for ordinary reads and the verb alone proves nothing.
- *   3. Budget — a token bucket plus single-flight concurrency, so a runaway loop
+ *   2. Operation — a best-effort denylist of write/admin operations (plus
+ *      method-override headers and fields), since services like Slack use POST
+ *      for ordinary reads and the verb alone proves nothing.
+ *   3. Host — the URL must be within the owning app's hosts (required by
+ *      `runReplay`).
+ *   4. Budget — a token bucket plus single-flight concurrency, so a runaway loop
  *      cannot hammer the service and get the account rate-limited or flagged.
  */
 import type { ReplayBudgetState, ReplayRequest } from '@sluice/core';
-import { looksLikeDeniedOperation } from '@sluice/core';
+import { isReplayMethodAllowed, looksLikeDeniedReplay, replayHostAllowed, replayRequestProbe } from '@sluice/core';
 
 export type ReplayDenialCode =
   | 'method_not_allowed'
   | 'operation_not_allowed'
+  | 'host_not_allowed'
   | 'rate_budget_exhausted';
 
 export class ReplayDeniedError extends Error {
@@ -35,16 +39,6 @@ export class ReplayDeniedError extends Error {
   }
 }
 
-/** Verbs that can only mutate. GET/HEAD are reads; POST is ambiguous (see below). */
-const ALLOWED_METHODS = new Set(['GET', 'HEAD', 'POST']);
-
-export interface ReplayBudgetOptions {
-  /** Requests permitted per window. */
-  capacity?: number;
-  /** Window length in ms over which the bucket fully refills. */
-  refillMs?: number;
-}
-
 const DEFAULT_CAPACITY = 60;
 const DEFAULT_REFILL_MS = 60_000;
 
@@ -54,23 +48,13 @@ const DEFAULT_REFILL_MS = 60_000;
  * care which of our code paths issued the call.
  */
 class ReplayBudget {
-  private capacity = DEFAULT_CAPACITY;
-  private refillMs = DEFAULT_REFILL_MS;
+  private readonly capacity = DEFAULT_CAPACITY;
+  private readonly refillMs = DEFAULT_REFILL_MS;
   private tokens = DEFAULT_CAPACITY;
   private lastRefill = Date.now();
 
-  configure(opts: ReplayBudgetOptions): void {
-    if (opts.capacity !== undefined && opts.capacity > 0) {
-      this.capacity = opts.capacity;
-      this.tokens = Math.min(this.tokens, opts.capacity);
-    }
-    if (opts.refillMs !== undefined && opts.refillMs > 0) this.refillMs = opts.refillMs;
-  }
-
   /** Restore this instance to its defaults — used by tests. */
   reset(): void {
-    this.capacity = DEFAULT_CAPACITY;
-    this.refillMs = DEFAULT_REFILL_MS;
     this.tokens = DEFAULT_CAPACITY;
     this.lastRefill = Date.now();
   }
@@ -98,11 +82,9 @@ class ReplayBudget {
   }
 
   /**
-   * How long until the bucket has a token again, in ms. 0 when it already does.
-   *
-   * Derived from `lastRefill` rather than from the window length, because a
-   * bucket that was drained 55 seconds into a 60-second window is one token away
-   * and a whole window is the wrong thing to tell someone waiting on it.
+   * How long until the bucket has a token again, in ms. Derived from `lastRefill`
+   * rather than the window length: a bucket drained 55s into a 60s window is one
+   * token away, not a whole window.
    */
   private msUntilNextToken(): number {
     if (this.tokens >= 1) return 0;
@@ -112,17 +94,8 @@ class ReplayBudget {
   }
 
   /**
-   * The budget as a value, for anything that has to SHOW it.
-   *
-   * The bucket was write-only: the single signal it produced was a thrown
-   * `ReplayDeniedError` at the moment it was already exhausted. That is the
-   * worst possible time to learn about a rate limit — an operator watching a
-   * meter drain slows down, and one who gets a refusal has already spent the
-   * budget on the request that got refused.
-   *
-   * `refill()` runs first so the snapshot is not stale by however long it has
-   * been since anything replayed, which on an idle dashboard is the whole
-   * session.
+   * The budget as a value for the UI meter, so an operator sees it drain before
+   * a refusal. `refill()` runs first so an idle dashboard's snapshot is not stale.
    */
   snapshot(): ReplayBudgetState {
     this.refill();
@@ -135,37 +108,51 @@ class ReplayBudget {
   }
 }
 
-
 export const replayBudget = new ReplayBudget();
 
 /**
- * Reject a request that would write. Throws `ReplayDeniedError`; callers surface
- * `err.code` so the UI and MCP can distinguish a policy refusal from a network
- * failure.
+ * Reject a request that looks like a write. Throws `ReplayDeniedError`; callers
+ * surface `err.code` so the UI and MCP can distinguish a policy refusal from a
+ * network failure.
+ *
+ * `allowedHosts` (the owning app's declared hosts) turns on the host rail: the
+ * URL's host must equal one of them or be a subdomain of one (`*.` is
+ * stripped). An empty list allows nothing. `runReplay` always passes the owning
+ * app's hosts; omitting it here (unit tests only) skips the host check.
  */
-export function assertReplayAllowed(req: ReplayRequest): void {
+export function assertReplayAllowed(
+  req: ReplayRequest,
+  opts: { allowedHosts?: readonly string[] } = {},
+): void {
   const method = (req.method || 'GET').toUpperCase();
-  if (!ALLOWED_METHODS.has(method)) {
+  if (!isReplayMethodAllowed(method)) {
     throw new ReplayDeniedError(
       'method_not_allowed',
-      `replay refused: ${method} can only mutate. Sluice replays reads only.`,
+      `replay refused: ${method} can only mutate; replay allows GET, HEAD and POST.`,
     );
   }
 
-  let probe = req.url;
-  try {
-    const u = new URL(req.url);
-    probe = `${u.pathname}?${u.searchParams.toString()}`;
-  } catch {
-    /* not a parseable URL — match against the raw string instead */
-  }
   // The operation name can also ride in a form body (Slack sends it in the path,
-  // but some services put it in the payload), so check both.
-  if (looksLikeDeniedOperation(probe, req.body)) {
+  // but some services put it in the payload), so the path, query and body are
+  // all checked — as sent and percent-decoded — plus method-override headers
+  // and `_method` fields. Method-aware: a POST to /api/orders places an order,
+  // while a GET of the same path reads them. The flow build gate runs the same
+  // core check, so the two cannot drift.
+  if (looksLikeDeniedReplay({ ...req, method })) {
     throw new ReplayDeniedError(
       'operation_not_allowed',
-      `replay refused: this looks like a write/admin operation. Sluice replays reads only.`,
+      'replay refused: this matches the write/admin operation denylist.',
     );
+  }
+
+  if (opts.allowedHosts) {
+    const { host } = replayRequestProbe(req.url);
+    if (!replayHostAllowed(host, opts.allowedHosts)) {
+      throw new ReplayDeniedError(
+        'host_not_allowed',
+        `replay refused: host "${host}" is outside the app's declared hosts.`,
+      );
+    }
   }
 }
 

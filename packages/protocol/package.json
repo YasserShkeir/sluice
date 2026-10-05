@@ -3,7 +3,7 @@
   "version": "0.0.0",
   "private": true,
   "type": "module",
-  "description": "Runtime validation for the runner↔webapp WebSocket protocol. Zod schemas both ends compile against, with no Node-only dependencies so the browser can use them too.",
+  "description": "Browser-safe runtime (zod) validation of client→runner WebSocket frames; the message types live in @sluice/core.",
   "exports": {
     ".": "./src/index.ts"
   },

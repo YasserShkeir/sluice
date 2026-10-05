@@ -1,24 +1,36 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 /**
- * Thin client for the runner's read-only HTTP API.
+ * Thin client for the runner's read-only HTTP API (GET only; every mutation
+ * goes over the WebSocket).
  *
  * The WebSocket carries the live stream; this carries everything that is too
  * large or too incidental to push — the materialized per-app tables, the derived
  * API map, and a capture body fetched on demand.
  *
- * The bearer token is the same one the socket uses, so it is read from the same
- * place rather than threaded through React.
+ * The bearer token is the same session token the socket uses (full dashboard
+ * control, not read-only), so it is read from the same place rather than
+ * threaded through React, and sent as an `Authorization` header.
  */
-import type { Capture, Container, Item, Workspace } from '@sluice/core';
+import type {
+  Capture,
+  Container,
+  FlowStepSummary,
+  FlowSummary as CoreFlowSummary,
+  FlowTemplateStepSummary,
+  FlowTemplateSummary as CoreTemplateSummary,
+  Item,
+  Workspace,
+} from '@sluice/core';
 import { runnerOrigin, sessionToken } from './ws.js';
 
 async function getJson<T>(path: string, params: Record<string, string | number | undefined> = {}): Promise<T> {
   const url = new URL(path, runnerOrigin());
-  url.searchParams.set('token', sessionToken());
   for (const [k, v] of Object.entries(params)) {
     if (v !== undefined && v !== '') url.searchParams.set(k, String(v));
   }
-  const res = await fetch(url.toString());
+  // A header, not `?token=`: a query string lands in server logs, history and
+  // devtools exports, and this token is full dashboard control.
+  const res = await fetch(url.toString(), { headers: { Authorization: `Bearer ${sessionToken()}` } });
   if (!res.ok) {
     let detail = `HTTP ${res.status}`;
     try {
@@ -34,26 +46,32 @@ async function getJson<T>(path: string, params: Record<string, string | number |
 
 export interface TableInfo {
   name: string;
-  app: string | null;
   rows: number;
   columns: string[];
 }
 
 export interface TablePage {
-  table: string;
   columns: string[];
   rows: Array<Record<string, unknown>>;
   total: number;
-  limit: number;
-  offset: number;
 }
 
-export interface ApiMapEndpoint {
+/**
+ * Narrowed mirror of @sluice/cartographer's ApiEndpoint/ApiMap — the webapp
+ * cannot depend on cartographer. Only what the catalog renders.
+ */
+export interface ApiEndpoint {
+  key: string;
   method: string;
   path: string;
-  host?: string;
-  count?: number;
-  [k: string]: unknown;
+  hosts: string[];
+  statuses: number[];
+  requestParams: string[];
+  sampleCount: number;
+}
+
+export interface ApiMap {
+  endpoints?: ApiEndpoint[];
 }
 
 export function listTables(): Promise<{ tables: TableInfo[] }> {
@@ -64,12 +82,11 @@ export function fetchTable(name: string, limit: number, offset: number): Promise
   return getJson(`/api/tables/${encodeURIComponent(name)}`, { limit, offset });
 }
 
-export function fetchApiDoc(app?: string): Promise<unknown> {
+export function fetchApiDoc(app?: string): Promise<ApiMap> {
   return getJson('/api/apidoc', { app });
 }
 
 export function fetchCaptureBody(id: string): Promise<{
-  id: string;
   reqBody: string | null;
   resBody: string | null;
   reqHeaders: Record<string, string>;
@@ -83,15 +100,7 @@ export function fetchCaptureEntities(id: string): Promise<{ items: Item[] }> {
   return getJson(`/api/captures/${encodeURIComponent(id)}/entities`);
 }
 
-/**
- * Full-text search over capture bodies, answered by the server's FTS index.
- *
- * The traffic table evaluates every other filter predicate locally, because
- * every other field is on a row it already holds. Bodies are not: the WS
- * backfill is a bounded window, so a `body:` search run against it would answer
- * "matches among the last few thousand captures" while presenting itself as
- * "matches" — a wrong answer that looks like a right one.
- */
+/** Full-text search over capture bodies via the server's FTS index (the client window is partial; see filter.ts serverSideTerms). */
 export function searchCaptureBodies(
   q: string,
   params: { limit?: number; app?: string; host?: string; tab?: string } = {},
@@ -111,16 +120,8 @@ export function fetchCapturesByIds(ids: string[]): Promise<{ captures: Capture[]
 
 // ── Normalized entities ─────────────────────────────────────────────────────────
 
-/**
- * The entity reads behind the explorer.
- *
- * Workspaces and containers also arrive over the socket, at subscribe time and
- * on every `entity.upsert` — and are still fetched here, because the socket
- * primes them once and a page opened later needs them without waiting for a
- * capture to arrive. Items are ONLY here: a mailbox holds tens of thousands, and
- * pushing them all down a socket to fill a list showing fifty is the kind of
- * thing that makes a local tool feel like a remote one.
- */
+/** Structure for the explorer, fetched over HTTP. Items are only ever paged here,
+ *  never pushed down the socket. */
 export function fetchWorkspaces(): Promise<{ workspaces: Workspace[] }> {
   return getJson('/api/workspaces');
 }
@@ -133,8 +134,6 @@ export interface ItemPage {
   items: Item[];
   /** In the CONTAINER, not in this page — what makes "is there more?" answerable. */
   total: number;
-  offset: number;
-  limit: number;
 }
 
 export function fetchItems(containerId: string, limit: number, offset: number): Promise<ItemPage> {
@@ -157,65 +156,14 @@ export function fetchStorage(): Promise<StorageInfo> {
 
 // ── Interaction flows ───────────────────────────────────────────────────────────
 
-export interface FlowSummary {
-  id: string;
-  adapterId: string;
-  label?: string;
-  source: string;
-  primaryCaptureId: string;
-  primaryOp?: string;
-  stepCount: number;
-  startedAt: number;
-  endedAt: number;
-  steps?: Array<{
-    seq: number;
-    role: string;
-    operation?: string;
-    required: boolean;
-    captureId: string;
-  }>;
-}
+/** What /api/flows and /api/flow-templates return: core's secret-free summaries plus their steps. */
+export type FlowSummary = CoreFlowSummary & { steps?: FlowStepSummary[] };
+export type FlowTemplateSummary = CoreTemplateSummary & { steps?: FlowTemplateStepSummary[] };
 
-export interface FlowTemplateSummary {
-  id: string;
-  adapterId: string;
-  primaryKey: string;
-  label?: string;
-  sampleCount: number;
-  stepCount: number;
-  flowParams: Array<{ name: string; required: boolean }>;
-  learnedAt: number;
-  version: number;
-  steps?: Array<{
-    seq: number;
-    role: string;
-    method: string;
-    path: string;
-    operation?: string;
-    required: boolean;
-    support: number;
-    delayMsP50?: number;
-    /** Median ms from primary start; preferred pacing for siblings. */
-    offsetFromPrimaryMsP50?: number;
-    offsetSpreadMs?: number;
-    unreproducible?: boolean;
-  }>;
-}
-
-export function fetchFlows(params: {
-  app?: string;
-  source?: string;
-  q?: string;
-  limit?: number;
-} = {}): Promise<{ flows: FlowSummary[] }> {
+export function fetchFlows(params: { app?: string; limit?: number } = {}): Promise<{ flows: FlowSummary[] }> {
   return getJson('/api/flows', params);
 }
 
-export function fetchFlowTemplates(params: {
-  app?: string;
-  primaryKey?: string;
-  q?: string;
-  limit?: number;
-} = {}): Promise<{ templates: FlowTemplateSummary[] }> {
+export function fetchFlowTemplates(params: { app?: string; limit?: number } = {}): Promise<{ templates: FlowTemplateSummary[] }> {
   return getJson('/api/flow-templates', params);
 }

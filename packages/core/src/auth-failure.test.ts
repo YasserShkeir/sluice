@@ -13,7 +13,7 @@
  */
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { authFailureReason, isAuthFailure } from './auth-failure.js';
+import { isAuthFailure, serviceError } from './auth-failure.js';
 
 const cap = (status: number | null, resBody: string | null = null) => ({ status, resBody });
 
@@ -65,7 +65,9 @@ test('classification never throws on a body that is not JSON', () => {
   }
 });
 
-test('the reason names the service code when there is one', () => {
-  assert.equal(authFailureReason(cap(200, '{"ok":false,"error":"not_authed"}')), 'not_authed');
-  assert.equal(authFailureReason(cap(401)), 'HTTP 401');
+test('serviceError reads an ok:false body, with or without an error string', () => {
+  const body = '{"ok":false,"error":"missing_scope","needed":"a","provided":"b"}';
+  assert.deepEqual(serviceError(body), { error: 'missing_scope', needed: 'a', provided: 'b' });
+  assert.deepEqual(serviceError('{"ok":false}'), { error: undefined, needed: undefined, provided: undefined });
+  assert.equal(serviceError('{"ok":true,"error":"x"}'), undefined);
 });

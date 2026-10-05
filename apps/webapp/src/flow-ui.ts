@@ -7,62 +7,34 @@
  * captures belong to which observed/pinned burst so the UI can collapse
  * companions under a primary without inventing structure the store does not have.
  */
-import type { Capture } from '@sluice/core';
+import type { Capture, FlowStepSummary } from '@sluice/core';
 import type { FlowSummary, FlowTemplateSummary } from './api.js';
-
-export interface FlowStepRef {
-  flowId: string;
-  seq: number;
-  role: string;
-  operation?: string;
-  required: boolean;
-  captureId: string;
-}
+import { groupBy } from './collections.js';
 
 export interface CaptureFlowMembership {
   flow: FlowSummary;
-  step: FlowStepRef;
+  step: FlowStepSummary & { flowId: string };
   /** True when this capture is the flow's primary seed. */
   isPrimary: boolean;
 }
 
 /** captureId → every flow step that references it (a capture can sit in >1 flow). */
 export function indexFlowsByCapture(flows: FlowSummary[]): Map<string, CaptureFlowMembership[]> {
-  const map = new Map<string, CaptureFlowMembership[]>();
-  for (const flow of flows) {
-    const steps = flow.steps ?? [];
-    for (const s of steps) {
-      const step: FlowStepRef = {
-        flowId: flow.id,
-        seq: s.seq,
-        role: s.role,
-        operation: s.operation,
-        required: s.required,
-        captureId: s.captureId,
-      };
-      const entry: CaptureFlowMembership = {
+  const entries = flows.flatMap((flow) =>
+    (flow.steps ?? []).map(
+      (s): CaptureFlowMembership => ({
         flow,
-        step,
+        step: { ...s, flowId: flow.id },
         isPrimary: s.captureId === flow.primaryCaptureId || s.role === 'primary',
-      };
-      const list = map.get(s.captureId);
-      if (list) list.push(entry);
-      else map.set(s.captureId, [entry]);
-    }
-  }
-  return map;
+      }),
+    ),
+  );
+  return groupBy(entries, (e) => e.step.captureId);
 }
 
 /** Prefer pinned, then observed, then others — for badges on a single row. */
-export function primaryMembership(
-  memberships: CaptureFlowMembership[] | undefined,
-): CaptureFlowMembership | undefined {
-  if (!memberships || memberships.length === 0) return undefined;
-  return (
-    memberships.find((m) => m.flow.source === 'pinned') ??
-    memberships.find((m) => m.flow.source === 'observed') ??
-    memberships[0]
-  );
+export function primaryMembership(memberships?: CaptureFlowMembership[]): CaptureFlowMembership | undefined {
+  return memberships?.find((m) => m.flow.source === 'pinned') ?? memberships?.find((m) => m.flow.source === 'observed') ?? memberships?.[0];
 }
 
 export type FlowDisplayRow =
@@ -118,20 +90,9 @@ export function buildFlowGroupedRows(
 
     const isOpen = expanded.has(flow.id);
     out.push({ kind: 'flow', flow, members, expanded: isOpen });
-    if (isOpen) {
-      for (const c of members) {
-        const mem = membership.get(c.id)?.find((m) => m.flow.id === flow.id);
-        out.push({ kind: 'capture', capture: c, nested: true, membership: mem });
-      }
-    } else {
-      // Collapsed: still surface the primary (or first present member) as a peek.
-      const primary =
-        members.find((c) => c.id === flow.primaryCaptureId) ?? members[0];
-      if (primary) {
-        const mem = membership.get(primary.id)?.find((m) => m.flow.id === flow.id);
-        out.push({ kind: 'capture', capture: primary, nested: true, membership: mem });
-      }
-    }
+    // Collapsed: still surface the primary (or first present member) as a peek.
+    const shown = isOpen ? members : [members.find((c) => c.id === flow.primaryCaptureId) ?? members[0]!];
+    for (const c of shown) out.push({ kind: 'capture', capture: c, nested: true, membership: membership.get(c.id)?.find((m) => m.flow.id === flow.id) });
   }
 
   const ungrouped = filtered.filter((c) => !claimed.has(c.id));

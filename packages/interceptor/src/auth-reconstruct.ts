@@ -10,10 +10,8 @@
  * itself has been masked, which is exactly what a reconstruction copilot needs.
  * `valuePreview` is always run through `previewSecret` — never the full secret.
  */
-import { previewSecret } from '@sluice/core';
+import { MASK, previewSecret } from '@sluice/core';
 import type { Adapter, Capture, CredentialHint } from '@sluice/core';
-
-const MASK = '«redacted»';
 
 export function reconstructCredentials(capture: Capture, adapters: Adapter[]): CredentialHint[] {
   const out: CredentialHint[] = [];

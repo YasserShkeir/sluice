@@ -2,12 +2,9 @@
 /**
  * Read an NDJSON fixture without ever holding it as one string.
  *
- * `parseNdjson(readFileSync(file, 'utf8'))` is the obvious spelling and it has
- * the same ~512 MB ceiling that `sluice record` used to hit from the other side:
- * V8 caps a single string there, so a 773 MB recording of one Notion crawl could
- * be written but not read back — a round trip that only failed at the size it
- * exists for. Chunked reads keep whole lines and hand each one to the same
- * parser, so line numbers in the skip report still match the file.
+ * Reading it as one string hits V8's ~512 MB single-string cap. Chunked reads
+ * keep whole lines for the same parser, so line numbers in the skip report still
+ * match the file.
  */
 import { closeSync, openSync, readSync } from 'node:fs';
 import { StringDecoder } from 'node:string_decoder';

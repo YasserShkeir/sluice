@@ -49,16 +49,10 @@ export interface Capture {
   tabId?: string | null;
   tabUrl?: string | null;
   /**
-   * Correlation across a single page load / navigation burst (F0.3).
-   *
-   * Engines fill what they know; all optional so older rows and MITM-only
-   * captures stay valid. Flow clustering prefers these over wall-clock gaps
-   * when present.
-   *
-   * - `loaderId` — CDP `Network.requestWillBeSent.loaderId` (Engine C)
-   * - `pageLoadId` — stable bucket for one document load (often = loaderId on CDP;
-   *   extension may use tab+navigation counter)
-   * - `navigationId` — coarser navigation epoch when the engine has one
+   * Page-load correlation, filled where the engine knows it; flow clustering
+   * prefers these over wall-clock gaps. `loaderId` is CDP's
+   * Network.requestWillBeSent.loaderId, `pageLoadId` one document load (often =
+   * loaderId), `navigationId` a coarser navigation epoch.
    */
   loaderId?: string | null;
   pageLoadId?: string | null;
@@ -73,22 +67,21 @@ export interface Capture {
   direction?: FrameDirection | null;
   wsId?: string | null;
   /**
-   * A stable name for what this exchange DOES — `conversations.history` rather
-   * than `POST /api/conversations.history`, `boards/:id/cards` rather than one
-   * distinct row per board.
-   *
-   * This is the traffic table's Operation column and what `op:` filters match,
-   * and deriving it once at ingest is what makes those cheap. It is populated
-   * for unclassified traffic too: "which endpoints does this service call?" is
-   * precisely the question being asked when no adapter exists yet.
+   * What this exchange DOES (`conversations.history`, `boards/:id/cards`): the
+   * traffic table's Operation column and what `op:` filters match. Derived once
+   * at ingest, for unclassified traffic too.
    */
   classification?: string | null;
-  /**
-   * Epoch ms when this capture was last parsed into entities; null means never.
-   * Parsing is resumable across restarts because of this column — the previous
-   * high-water mark lived in memory and reset with the process.
-   */
+  /** Epoch ms this capture was last parsed into entities; null means never (so parsing resumes after a restart). */
   parsedAt?: number | null;
+  /**
+   * Set only on a PREVIEW of a capture — a list or WebSocket copy whose
+   * `reqBody`/`resBody` were cut to 64 KiB so a backfill does not ship (and pin)
+   * up to 5 MB per row — so its presence marks the preview. Holds the full
+   * stored bodies' lengths in chars (0 for none). The stored row is always whole
+   * and fetched by id; the store never writes or reads this field.
+   */
+  bodyLengths?: { req: number; res: number };
 }
 
 /** Minimal shape an adapter needs to decide "is this mine?" */
@@ -99,18 +92,10 @@ export type RequestMatchInput = Pick<Capture, 'host' | 'path' | 'method' | 'url'
 // ─────────────────────────────────────────────────────────────────────────────
 
 /**
- * `thread` is the one that is not a place you browse to.
- *
- * A channel, a board, a label — those are structure: a reader picks one and
- * looks inside it. A thread is a container only because its messages need
- * somewhere to live, and there is one per conversation, so a store holding a few
- * hundred captured conversations has a few hundred of them. Listed as peers of
- * the labels they came from, they bury the structure completely: the recorded
- * mailbox showed 24 labels among 94 threads, alphabetically interleaved.
- *
- * So this exists to let a reader tell "somewhere to go" from "somewhere things
- * are", which no combination of the other kinds could express. Adapters that
- * emit one container per conversation should use it.
+ * `thread` is a container only because its messages need somewhere to live, not
+ * a place a reader browses to; marking it keeps hundreds of conversations from
+ * burying the real structure. Adapters emitting one container per conversation
+ * should use it.
  */
 export type ContainerKind =
   | 'channel'
@@ -151,18 +136,9 @@ export interface Container {
   isPrivate?: boolean;
   memberCount?: number;
   /**
-   * How many items the SERVICE says this container holds, and how many of them
-   * are unread — not how many Sluice has captured.
-   *
-   * The distinction is the whole point of storing them. A local store is always
-   * a sample: Gmail's Inbox reported 14,061 conversations against the 50 a single
-   * thread-list response carried. Without the service's own number there is
-   * nothing to compare a capture against, so "I have all of it" and "I have the
-   * first page" look identical — and the second one silently answers questions
-   * about a mailbox using a fiftieth of it.
-   *
-   * Distinct from `memberCount`, which counts PEOPLE. Both are optional and both
-   * mean "unknown" when absent; neither is ever inferred from what was captured.
+   * The SERVICE's own totals (items held, unread) — not what Sluice captured — so
+   * completeness is checkable against them. Absent means unknown; never inferred
+   * from captures. Distinct from `memberCount`, which counts people.
    */
   itemCount?: number;
   unreadCount?: number;
@@ -190,15 +166,9 @@ export interface Item {
 export type EntityKind = 'workspace' | 'actor' | 'container' | 'item';
 
 /**
- * A relationship between two entities — membership, authorship, a mention, a
- * reaction. Containment (item→container→workspace) is already a column on the
- * entity itself; an edge is for everything else, which previously had nowhere to
- * go at all.
- *
- * Endpoints are (kind, id) pairs, not foreign keys: an edge may point at any
- * entity table, and captures routinely name an entity Sluice has never seen — a
- * message mentioning a user whose profile appeared in no response. A dangling
- * edge is expected, not an error.
+ * A relationship beyond containment (membership, authorship, a mention, a
+ * reaction). Endpoints are (kind, id) pairs, not foreign keys: captures routinely
+ * name entities Sluice has never seen, so a dangling edge is expected.
  */
 export interface Edge {
   srcKind: EntityKind;
@@ -222,11 +192,7 @@ export interface ParseResult {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Store queries — what a reader asks for.
-//
-// These live here rather than next to the SQLite implementation because they are
-// part of the contract: {@link ReadOnlyStore} is what an app's MCP tools are
-// handed, and a type in the contract cannot be typed by one in the engine.
+// Store queries — part of the contract, since {@link ReadOnlyStore} is typed by them.
 // ─────────────────────────────────────────────────────────────────────────────
 
 export interface CaptureQuery {
@@ -243,32 +209,17 @@ export interface CaptureQuery {
   /** Only captures no adapter claimed (`adapter_id IS NULL`) — the pre-scoping noise. */
   unattributed?: boolean;
   /**
-   * Oldest-first instead of the default newest-first.
-   *
-   * It matters to anything that REBUILDS state from the capture log rather than
-   * displaying it. Entity upserts are last-writer-wins, so applying captures
-   * newest-first leaves the oldest observation of every row in the store — the
-   * opposite of what live ingest produces, where captures arrive in time order
-   * and a later observation supersedes an earlier one.
-   *
-   * Oldest-first also breaks ties on `id`, so `(ts, id)` is a total order that
-   * {@link CaptureQuery.after} can page through.
+   * Oldest-first instead of the default newest-first — what REBUILDING state from
+   * the log needs, since entity upserts are last-writer-wins. Ties break on `id`,
+   * so {@link CaptureQuery.after} can page it.
    */
   order?: 'asc' | 'desc';
   /**
    * Only captures strictly after this `(ts, id)` key: the keyset for paging an
-   * `order: 'asc'` walk. Pass the last row of the previous page.
-   *
-   * A `ts` bound alone cannot page. Rows share a millisecond, so an exclusive
-   * bound drops the rest of a tick, and an inclusive one hands back the same
-   * rows when a tick holds more of them than fit in a page.
+   * `order: 'asc'` walk (a `ts` bound alone cannot page — rows share a millisecond).
    */
   after?: { ts: number; id: string };
-  /**
-   * Look up these capture ids (order of results is not guaranteed to match).
-   * Used by the traffic UI to hydrate flow members outside the live WS ring.
-   * Capped by the store implementation.
-   */
+  /** Look up these capture ids (result order not guaranteed; capped by the store). */
   ids?: string[];
   /**
    * FTS5 query over request + response bodies. This is a MATCH expression, not a
@@ -282,13 +233,7 @@ export interface CaptureQuery {
 export interface ItemQuery {
   limit?: number;
   beforeTs?: number;
-  /**
-   * Skip this many rows. Deliberately alongside `beforeTs` rather than replacing
-   * it: a live feed walks backwards from a timestamp it already holds, but an
-   * agent asking for "the next 50" holds nothing but a page number, and telling
-   * it to synthesize a cursor from the last row it saw is how a reader ends up
-   * unable to walk past the first page at all.
-   */
+  /** Skip this many rows — for a reader holding a page number rather than a timestamp. */
   offset?: number;
 }
 
@@ -297,21 +242,12 @@ export interface ItemFilter extends ItemQuery {
   containerId?: string;
   adapterId?: string;
   workspaceId?: string;
-  /**
-   * One item's own id. Not a primary key on its own — items are keyed by
-   * `(containerId, id)`, so the same id can legitimately appear under two
-   * containers — which is exactly why this is a filter and not a `getItem`.
-   */
+  /** One item's id — a filter, not a key: items are keyed by `(containerId, id)`. */
   id?: string;
   /**
-   * `true` → only items carrying a `threadId`; `false` → only those without one.
-   * Omitted matches both.
-   *
-   * This is the one structural distinction a generic reader cannot make for
-   * itself, and adapters lean on it: Gmail's batch view emits one item per THREAD
-   * and sets no `threadId`, while its thread fetcher emits one per MESSAGE and
-   * sets the thread it belongs to. Counting them together reports a mailbox with
-   * more conversations than it has.
+   * `true` → only items with a `threadId`; `false` → only those without. Gmail
+   * emits one item per THREAD (no threadId) and one per MESSAGE (with one), so
+   * counting both overstates conversations.
    */
   threaded?: boolean;
 }
@@ -334,19 +270,10 @@ export interface EdgeQuery {
 }
 
 /**
- * A READ-ONLY projection of the capture store.
- *
- * There is no write method here and no way to reach a Session, and both are the
- * point: an app's MCP tool must be able to answer from what was captured without
- * being able to change it or to touch a credential. `readOnlyStore()` in
- * `@sluice/core` builds one by binding exactly these methods off a SqliteStore,
- * so handing over the store itself — which does have writers, and a raw `db`
- * handle — is a different act and not one that happens by accident.
- *
- * Nothing here returns a Capture. Coverage questions ("how much is captured, how
- * stale is it") are answerable with a count and a timestamp; handing over capture
- * BODIES would hand back the un-normalized traffic an adapter exists to
- * interpret, at up to 5 MB a row.
+ * A READ-ONLY projection of the capture store — what an app's MCP tools get: no
+ * writer, no Session, no capture bodies (counts and timestamps answer coverage).
+ * `readOnlyStore()` binds exactly these methods, so handing over the store itself
+ * never happens by accident.
  */
 export interface ReadOnlyStore {
   listWorkspaces(): Workspace[];
@@ -470,15 +397,12 @@ export function redactSession(s: Session): RedactedSession {
   };
 }
 
-/**
- * A candidate credential the auth-reconstructor spotted in a capture.
- * This is the seed of the Phase-B differentiator; Phase A only needs the type.
- */
+/** A candidate credential the auth-reconstructor spotted in a capture. */
 export interface CredentialHint {
   adapterId: string;
   location: 'header' | 'cookie' | 'query' | 'body' | 'localStorage' | 'keychain';
   name: string;
-  /** redacted preview, e.g. 'abc123…（40 more）' — never the full secret */
+  /** redacted preview from `previewSecret`, e.g. 'abc123…(+40)' — never the full secret */
   valuePreview: string;
   /** 0..1 */
   confidence: number;
@@ -520,31 +444,16 @@ export interface ReplayRequest {
 // Adapter — the pluggable per-service seam.
 // ─────────────────────────────────────────────────────────────────────────────
 
-/**
- * What a parser is allowed to know beyond the capture itself.
- *
- * Every adapter was re-deriving this per call: Slack lifts `channel` out of the
- * REQUEST because `conversations.history` responses do not contain it, and
- * re-guesses the team id per capture; Trello and Fast hardcode a workspace id.
- *
- * Optional everywhere, and `parse(capture)` still works without it — the three
- * shipped adapters and five call sites predate it.
- */
+/** What a parser may know beyond the capture itself. Optional everywhere. */
 export interface ParseContext {
   /**
-   * Request parameters, however the service sent them: query string, urlencoded
-   * form body, or JSON body. Slack's channel id exists ONLY here for
-   * `conversations.history` and `conversations.replies`, so a parser that loses
-   * the request silently produces zero items rather than an error.
+   * Request params from the query, a form body or a JSON body. Slack's channel id
+   * exists only here for `conversations.history`/`replies`.
    */
   reqParams?: Record<string, string>;
   /** The already-resolved workspace, when the caller knows it. */
   workspaceId?: string;
-  /**
-   * The clock to use. Exists so a fixture replay is deterministic: callers
-   * otherwise fall back to `Date.now()` whenever `capture.ts` is falsy, which
-   * defeats any snapshot assertion over a mock run.
-   */
+  /** The clock to use, so fixture replays are deterministic. */
   now?: number;
 }
 
@@ -573,14 +482,9 @@ export type CaptureClass =
   | 'unknown';
 
 /**
- * The store operations {@link Adapter.reconcile} is allowed, spelled out
- * structurally so an adapter can be tested against a few rows in memory and so
- * the contract is a list of what reconciliation may do rather than a handle to
- * everything. `SqliteStore` satisfies it as written.
- *
- * Note what is NOT here: no way to delete a capture. That is the guardrail —
- * entities are one reading of the evidence and can be rebuilt, the evidence
- * cannot.
+ * The store operations {@link Adapter.reconcile} may use, structural so it can be
+ * tested in memory. Deliberately no way to delete a capture: entities can be
+ * rebuilt, the evidence cannot.
  */
 export interface ReconcileStore {
   listWorkspaces(): Workspace[];
@@ -608,42 +512,18 @@ export interface Adapter {
   /** turn one capture into normalized entities (empty result if nothing useful) */
   parse(capture: Capture, ctx?: ParseContext): ParseResult;
   /**
-   * What kind of exchange this is, and what to call it — without parsing it.
-   *
-   * Cheap enough to run on every capture in the ingest funnel, which is what
-   * makes the traffic table's Operation column and `op:` filters possible, and
-   * what lets a recorder skip a 25 MB binary instead of storing it.
-   *
-   * Like `parse`, this MUST NOT throw: it runs for every capture, and a throw
-   * poisons the whole pipeline.
+   * What kind of exchange this is, and what to call it, without parsing it. Runs
+   * on every capture at ingest (the Operation column, `op:` filters, skipping
+   * binaries), so like `parse` it MUST NOT throw.
    */
   classify?(capture: Capture, ctx?: ParseContext): { class: CaptureClass; operation?: string };
-  /**
-   * More pages to fetch, given a response that was just parsed.
-   *
-   * Returning [] is a perfectly good answer and the common one — Trello has no
-   * opaque cursor anywhere in its REST API, and fast.com has no pagination at
-   * all. MUST NOT throw, same reason as `parse`.
-   */
+  /** More pages to fetch given a just-parsed response ([] is the common answer). MUST NOT throw. */
   nextCursors?(capture: Capture, ctx?: ParseContext): CursorSeed[];
   /**
-   * Settle identities that no single capture could establish, given the store.
-   *
-   * `parse` sees one exchange at a time, and some services do not put an
-   * identity in every exchange. Gmail is the case that forced this: it addresses
-   * accounts by a `/u/N/` path slot, the slot is reassigned whenever the
-   * signed-in set changes, and only the message-fetch endpoint names the mailbox
-   * behind it — so a thread-list response genuinely cannot say whose mail it is
-   * describing. Parsing it as though it could is how two mailboxes ended up
-   * merged into one workspace with nothing reporting a conflict.
-   *
-   * So the parser is allowed to say "unresolved", and this is where the answer
-   * is worked out from the neighbouring captures. Optional, and absent for the
-   * three shipped adapters that put a workspace id in every response.
-   *
-   * MUST be idempotent, and MUST NOT delete captures: it is run opportunistically
-   * (after a sync, on MCP startup) and the evidence has to outlive any reading
-   * of it, or a reconciliation that guesses wrong cannot be redone.
+   * Settle identities no single capture could establish, from the store — e.g.
+   * Gmail's `/u/N/` slots, which only the message-fetch endpoint ties to a
+   * mailbox. MUST be idempotent and MUST NOT delete captures: it runs
+   * opportunistically, and a wrong guess must stay redoable.
    */
   reconcile?(store: ReconcileStore): ReconcileOutcome;
   /** the parameterizable calls the webapp can re-issue */
@@ -655,7 +535,7 @@ export interface Adapter {
    * Data-learned templates always win over these at replay time.
    */
   listFlowHints?(): FlowHint[];
-  /** Phase-B seed: surface credential candidates seen in a capture */
+  /** Surface credential candidates seen in a capture. */
   extractCredentialHints?(capture: Capture): CredentialHint[];
 }
 
@@ -702,21 +582,9 @@ export interface CredentialProvider {
 }
 
 /**
- * An MCP tool an app contributes to the Sluice MCP server. `run` executes the
- * tool's action (which MAY touch the network) and returns a JSON-serializable
- * result; the server registers it under `name` and renders the result to the
- * client. Errors thrown from `run` are caught by the server and surfaced as tool
- * errors.
- */
-/**
- * What the MCP server hands an app tool so its network calls behave like every
- * other Sluice request.
- *
- * Without this, an app tool could only reach the network with a bare `fetch`:
- * its traffic bypassed the learned client fingerprint (making it MORE anomalous
- * than a normal replay) and never entered the capture store, so it was invisible
- * to the cartographer, the dashboard and the audit trail — while `sluice_replay`
- * calls were fully recorded.
+ * What the MCP server hands an app tool so its network calls get the learned
+ * fingerprint, the replay rails and capture recording like every other Sluice
+ * request, instead of a bare `fetch`.
  */
 export interface AppToolContext {
   /**
@@ -726,6 +594,19 @@ export interface AppToolContext {
    * Resolves with the stored, secret-redacted Capture.
    */
   replay(req: ReplayRequest): Promise<Capture>;
+  /**
+   * Run one of THIS app's declared replay actions (`listReplayActions()`) under
+   * a real session the host acquires, with the same rails and auth-failure
+   * retry as `sluice_replay`, and resolve with the stored, redacted Capture.
+   * Use it when the request needs the app's credentials: `replay` sends only
+   * what the tool built and injects no session. Optional — hosts that only
+   * wire `replay` may omit it; a tool that needs it must say so when absent.
+   */
+  replayAction?(
+    actionId: string,
+    params?: Record<string, string>,
+    opts?: { workspaceId?: string },
+  ): Promise<Capture>;
   /**
    * Run a learned multi-step flow template through the same rails as
    * `sluice_replay_flow`. Prefer this over chaining bare `fetch` calls.
@@ -737,22 +618,19 @@ export interface AppToolContext {
     opts?: { workspaceId?: string },
   ): Promise<unknown>;
   /**
-   * What this app has already captured, read-only.
-   *
-   * Without it, `replay` was the ONLY thing on this context — so an app tool that
-   * wanted to answer from the store had nowhere to live, and Gmail's four
-   * store-backed tools were written into the MCP server's own spine instead,
-   * where `@sluice/apps` is supposed to be the only module that names a concrete
-   * adapter. This is what let them move back.
-   *
-   * OPTIONAL, and it stays optional: the two apps that already implement
-   * `mcpTools()` and every existing caller that constructs a context compile
-   * unchanged. A tool that needs it must say so when it is absent rather than
-   * assume a host provides it.
+   * What this app has already captured, read-only. Optional: a tool that needs it
+   * must say so when absent.
    */
   readonly store?: ReadOnlyStore;
 }
 
+/**
+ * An MCP tool an app contributes to the Sluice MCP server. `run` executes the
+ * tool's action (which MAY touch the network) and returns a JSON-serializable
+ * result; the server registers it under `name` and renders the result to the
+ * client. Errors thrown from `run` are caught by the server and surfaced as tool
+ * errors.
+ */
 export interface AppMcpTool {
   name: string;
   description: string;
@@ -792,22 +670,9 @@ export interface App extends Adapter {
 
 export type EngineKind = 'mitm' | 'cdp' | 'replay';
 /**
- * `restarting` is the one that was missing, and its absence was not cosmetic.
- *
- * An engine that died and is being brought back is neither `starting` (which
- * reads as a first start, so the UI shows a fresh boot and nobody learns the
- * capture had a hole in it) nor `error` (which reads as given up, when it has
- * not). The supervisor needs to say "this fell over and I am retrying", because
- * the honest thing to report about a capture session is that it was interrupted.
- */
-/**
- * `stopping` is the deliberate-teardown signal. Without it a `stop()` that awaits
- * its async server shutdown still read `running` throughout, so a supervisor
- * health probe firing during teardown mistook the closing port for a crash and
- * restarted the engine the user had just stopped. `restarting` is the crash-then-
- * retry state (see the supervisor); the two are distinct and must not be
- * conflated — one is "I am winding down", the other "I fell over and am coming
- * back".
+ * `restarting`: crashed and being retried by the supervisor (the capture has a
+ * hole). `stopping`: deliberate teardown, so a health probe does not mistake the
+ * closing port for a crash and restart what the user stopped. Never conflate them.
  */
 export type EngineState =
   | 'stopped'
@@ -825,12 +690,9 @@ export interface EngineStatus {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Interaction flows — a primary capture + the companions that rode with it.
-//
-// Single-request faithful replay learns one method+path. Real clients fire a
-// burst: history + members + emoji, board + cards + members, etc. A flow is the
-// first-class name for that burst so clustering, UI grouping and (later)
-// multi-step replay share one model.
+// Interaction flows — a primary capture + the companions that rode with it: the
+// burst a real client fires (history + members + emoji), one model shared by
+// clustering, UI grouping and multi-step replay.
 // ─────────────────────────────────────────────────────────────────────────────
 
 /** How a capture participates in a flow. */
@@ -881,23 +743,13 @@ export interface FlowQuery {
 }
 
 /** What `upsertFlow` accepts — id optional (minted when omitted). */
-export interface FlowInput {
+export interface FlowInput extends Omit<InteractionFlow, 'id'> {
   id?: string;
-  adapterId: string;
-  label?: string;
-  primaryCaptureId: string;
-  startedAt: number;
-  endedAt: number;
-  source: FlowSource;
-  steps: FlowStep[];
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Flow templates — learned multi-step plans (Phase B).
-//
-// An InteractionFlow is one observed burst. A FlowTemplate is the stable shape
-// across many bursts that share a primary operation: which companions usually
-// ride along, in what order, with which request fingerprints and param bindings.
+// Flow templates — the stable shape across many observed bursts sharing a primary
+// operation: companions, order, request fingerprints and param bindings.
 // ─────────────────────────────────────────────────────────────────────────────
 
 /**
@@ -927,6 +779,12 @@ export interface FlowTemplateStep {
    * templates may still use `:id`.
    */
   path: string;
+  /**
+   * Most common request host observed for this step (e.g. `www.loom.com`).
+   * Build uses it when the path is relative and the adapter has no fixed host.
+   * Absent on templates learned before FLOW_TEMPLATE_VERSION 2.
+   */
+  host?: string;
   /** Semantic op when known. */
   operation?: string;
   /**
@@ -1004,14 +862,6 @@ export interface FlowTemplateQuery {
 }
 
 /** What `upsertFlowTemplate` accepts — id optional. */
-export interface FlowTemplateInput {
+export interface FlowTemplateInput extends Omit<FlowTemplate, 'id'> {
   id?: string;
-  adapterId: string;
-  primaryKey: string;
-  label?: string;
-  sampleCount: number;
-  version: number;
-  learnedAt: number;
-  steps: FlowTemplateStep[];
-  flowParams: Array<{ name: string; required: boolean }>;
 }

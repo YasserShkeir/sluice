@@ -101,15 +101,7 @@ CREATE TABLE IF NOT EXISTS sessions (
   credential_kinds TEXT NOT NULL DEFAULT '[]'
 );
 
--- Relationships between normalized entities. Everything before this table could
--- only express the containment already implied by a foreign-key column
--- (item→container→workspace); anything else — "this actor is a member of that
--- container", "this item mentions that actor" — had nowhere to go.
---
--- Endpoints are (kind, id) pairs rather than real foreign keys because an edge
--- may point at any entity table, and because a capture routinely names an entity
--- Sluice has not seen yet: a message mentioning a user whose profile never
--- appeared in any response. A dangling edge is normal and is not an error.
+-- Relationships between entities beyond containment; see Edge in types.ts.
 CREATE TABLE IF NOT EXISTS edges (
   src_kind     TEXT NOT NULL,
   src_id       TEXT NOT NULL,
@@ -125,14 +117,8 @@ CREATE TABLE IF NOT EXISTS edges (
 CREATE INDEX IF NOT EXISTS idx_edges_dst ON edges(dst_kind, dst_id, rel);
 CREATE INDEX IF NOT EXISTS idx_edges_ws  ON edges(workspace_id);
 
--- The pagination worklist. An adapter that sees a paged response emits the next
--- cursor here; 'sluice replay --all' drains it. Without this table there was
--- nothing for '--all' to drain and no way to know a container's history was
--- incomplete — four Slack replay actions declare a 'cursor' param and nothing in
--- the repo ever read a 'next_cursor'.
---
--- 'state' is the whole concurrency story: claiming flips pending→running inside
--- a transaction, so two drainers cannot take the same work item.
+-- The pagination worklist 'sluice replay --all' drains. Claiming flips
+-- pending→running in one transaction (see claimCursors).
 CREATE TABLE IF NOT EXISTS cursors (
   id           TEXT PRIMARY KEY,
   adapter_id   TEXT NOT NULL,
@@ -197,6 +183,14 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_flow_templates_primary
 CREATE INDEX IF NOT EXISTS idx_flow_templates_adapter
   ON flow_templates(adapter_id, learned_at);
 
+-- Runner bookkeeping that must outlive a process but is not domain data (the
+-- materialize watermark). A table, not a column, so no ADDITIVE_COLUMNS entry.
+-- NEVER a place for a secret.
+CREATE TABLE IF NOT EXISTS meta (
+  key   TEXT PRIMARY KEY,
+  value TEXT NOT NULL
+);
+
 -- Full-text search over capture bodies (the U1 'body:"…"' predicate and
 -- /api/captures/search) and over item text.
 --
@@ -206,10 +200,7 @@ CREATE INDEX IF NOT EXISTS idx_flow_templates_adapter
 -- >= 3.43; better-sqlite3 bundles 3.49) is what makes DELETE work at all on a
 -- contentless table, which pruneCaptures needs.
 --
--- Consequence of contentless: the indexed columns read back as NULL, so results
--- are joined back to the source table on rowid. That is why insertCapture upserts
--- with ON CONFLICT rather than INSERT OR REPLACE — REPLACE assigns a NEW rowid
--- and would silently orphan every indexed body.
+-- Contentless columns read back as NULL, so results join back on rowid (see insertCapture).
 CREATE VIRTUAL TABLE IF NOT EXISTS captures_fts USING fts5(
   body,
   tokenize = 'unicode61',
@@ -225,13 +216,35 @@ CREATE VIRTUAL TABLE IF NOT EXISTS items_fts USING fts5(
 `;
 
 /**
- * Indexes that reference a column from ADDITIVE_COLUMNS, applied AFTER those
- * columns exist.
+ * Every table SCHEMA_SQL creates (FTS5 shadow tables excluded), children before
+ * parents — the order `wipe()` clears them in.
  *
- * They cannot live in SCHEMA_SQL: on a database that already has the table, the
- * `CREATE TABLE IF NOT EXISTS` above is a no-op, so the index statement would run
- * against the old column set and fail with "no such column" — breaking startup
- * for exactly the users who already have captured data.
+ * The one list of what core owns. The cartographer's per-app tables share this
+ * database under `<adapterId>_<name>` names, so an adapter id such as
+ * `interaction` or `flow` would otherwise reach a core table by prefix; code
+ * that creates, writes or drops derived tables refuses these names. A test
+ * checks it against the live schema, so a new table cannot drift out of it.
+ */
+export const CORE_TABLE_NAMES = [
+  'captures_fts',
+  'items_fts',
+  'edges',
+  'items',
+  'containers',
+  'actors',
+  'workspaces',
+  'cursors',
+  'interaction_flow_steps',
+  'interaction_flows',
+  'flow_templates',
+  'sessions',
+  'captures',
+  'meta',
+] as const;
+
+/**
+ * Indexes on ADDITIVE_COLUMNS, applied after those columns exist: in SCHEMA_SQL
+ * they would fail with "no such column" on an existing database.
  */
 export const ADDITIVE_INDEXES: string[] = [
   // Composite filters used by dashboard/list + materialize windows.
@@ -241,9 +254,7 @@ export const ADDITIVE_INDEXES: string[] = [
   `CREATE INDEX IF NOT EXISTS idx_items_workspace_ts ON items(workspace_id, ts)`,
 
   'CREATE INDEX IF NOT EXISTS idx_captures_tab ON captures(tab_id)',
-  // Drives the "what still needs parsing?" query that replaced the in-memory
-  // watermark. `parsed_at IS NULL` is the hot predicate, so the partial index is
-  // both smaller and the one SQLite actually picks.
+  // `parsed_at IS NULL` is the hot predicate; the partial index is smaller and the one SQLite picks.
   'CREATE INDEX IF NOT EXISTS idx_captures_unparsed ON captures(ts) WHERE parsed_at IS NULL',
   'CREATE INDEX IF NOT EXISTS idx_captures_classification ON captures(classification)',
   // F0.3 — cluster companions that share a document load without wall-clock alone.
@@ -280,14 +291,9 @@ export const ADDITIVE_COLUMNS: Record<string, Record<string, string>> = {
     // WebSocket frames: direction of travel, and the socket they belong to.
     direction: 'TEXT',
     ws_id: 'TEXT',
-    // The adapter's semantic name for this exchange — `conversations.history`
-    // rather than `POST /api/conversations.history`. It is what the traffic
-    // table's Operation column shows and what `op:conversations.*` filters on,
-    // and it is derived once at ingest instead of re-derived per render.
+    // The adapter's semantic operation name (see Capture.classification).
     classification: 'TEXT',
-    // When this capture was last turned into entities. NULL means "never", which
-    // is what makes parsing resumable across a restart: the previous watermark
-    // lived in memory and reset every time the process did.
+    // When last parsed into entities; NULL = never (see Capture.parsedAt).
     parsed_at: 'INTEGER',
     // NULL = the body column holds plain text (which is true of every row
     // written before compression existed). See body-codec.ts.

@@ -13,11 +13,11 @@
  * also tolerate a URL query string and a JSON body when hunting for `channel`.
  *
  * Three readers of the same payload live here rather than in three files, so
- * `slackMethod` and `safeJson` stay single copies: `parseSlackCapture` (entities),
+ * `slackMethod` stays a single copy: `parseSlackCapture` (entities),
  * `classifySlackCapture` (what kind of exchange this was) and `slackNextCursors`
  * (what to fetch next).
  */
-import { requestParams } from '@sluice/adapter-sdk';
+import { requestParams, safeJsonObject } from '@sluice/adapter-sdk';
 import type {
   Actor,
   Capture,
@@ -49,35 +49,10 @@ function compact<T>(items: (T | undefined)[]): T[] {
   return items.filter((x): x is T => x !== undefined);
 }
 
-/** Parse a JSON object body; returns null for empty / non-object / invalid input. */
-function safeJson(text: string | null | undefined): Record<string, unknown> | null {
-  if (!text) return null;
-  try {
-    const v: unknown = JSON.parse(text);
-    return v !== null && typeof v === 'object' ? (v as Record<string, unknown>) : null;
-  } catch {
-    return null;
-  }
-}
-
 /** Extract the Slack method name from a path like `/api/conversations.history`. */
 export function slackMethod(path: string): string | undefined {
   const m = /\/api\/([A-Za-z0-9._]+)/.exec(path);
   return m ? m[1] : undefined;
-}
-
-/**
- * What the request was made WITH. `channel` (history), `ts` (replies) and
- * `types`/`limit` (conversations.list) appear NOWHERE in the response, so
- * anything that has to name or re-issue the call reads them here. They are not
- * secrets, so they survive redaction untouched.
- *
- * `ctx.reqParams` wins when the caller already did the decoding; this used to be
- * a private three-encoding scanner, which is exactly the copy the adapter SDK
- * exists to delete.
- */
-function reqParamsOf(capture: Capture, ctx?: ParseContext): Record<string, string> {
-  return ctx?.reqParams ?? requestParams(capture);
 }
 
 /**
@@ -108,11 +83,8 @@ function resolveTeamId(
     if (t) return t;
   }
 
-  // `members[].team_id` is the ONLY carrier of the team on a `users.list`
-  // response. Without it those actors were filed under `slack:<host>` while
-  // containers from the SAME workspace were filed under `T…`, so the webapp's
-  // `listActors(container.workspaceId)` returned [] and every message rendered
-  // as a bare `U…` with no handle — despite users.list having been captured.
+  // `members[].team_id` is the only team carrier on `users.list`; without it actors
+  // land under `slack:<host>`, apart from their channels.
   for (const raw of arr(body.members)) {
     const t = str(obj(raw).team_id);
     if (t) return t;
@@ -259,7 +231,7 @@ export function parseSlackCapture(capture: Capture, ctx?: ParseContext): ParseRe
   const method = slackMethod(capture.path);
   if (!method) return {};
 
-  const body = safeJson(capture.resBody);
+  const body = safeJsonObject(capture.resBody);
   if (!body || body.ok === false) return {};
 
   const teamId = resolveTeamId(capture, body, ctx);
@@ -285,7 +257,7 @@ export function parseSlackCapture(capture: Capture, ctx?: ParseContext): ParseRe
 
     case 'conversations.history':
     case 'conversations.replies': {
-      const channel = reqParamsOf(capture, ctx).channel;
+      const channel = (ctx?.reqParams ?? requestParams(capture)).channel; // only in the request
       if (!channel) return {};
       const items = compact(
         arr(body.messages).map((m) => messageToItem(obj(m), channel, teamId, capture.id)),
@@ -294,23 +266,20 @@ export function parseSlackCapture(capture: Capture, ctx?: ParseContext): ParseRe
     }
 
     case 'client.boot':
-    case 'client.userBoot': {
-      const ws = workspaceFromTeam(obj(body.team), teamId);
-      const containers = collectBootContainers(body, teamId);
-      const result: ParseResult = {};
-      if (ws) result.workspaces = [ws];
-      if (containers.length) result.containers = containers;
-      return result;
-    }
-
+    case 'client.userBoot':
     case 'client.counts': {
       // Counts payloads carry channel ids but usually no names — only surface a
       // container when it has a real name, so we never clobber a good name (from
       // conversations.list) with a bare id on upsert.
-      const named = [...arr(body.channels), ...arr(body.mpims), ...arr(body.ims)]
-        .map((c) => obj(c))
-        .filter((c) => str(c.name) !== undefined);
-      const containers = compact(named.map((c) => channelToContainer(c, teamId)));
+      const containers =
+        method === 'client.counts'
+          ? compact(
+              [...arr(body.channels), ...arr(body.mpims), ...arr(body.ims)]
+                .map((c) => obj(c))
+                .filter((c) => str(c.name) !== undefined)
+                .map((c) => channelToContainer(c, teamId)),
+            )
+          : collectBootContainers(body, teamId);
       const ws = workspaceFromTeam(obj(body.team), teamId);
       const result: ParseResult = {};
       if (ws) result.workspaces = [ws];
@@ -364,7 +333,7 @@ export function classifySlackCapture(capture: Capture): {
   operation?: string;
 } {
   const method = slackMethod(capture.path);
-  const body = safeJson(capture.resBody);
+  const body = safeJsonObject(capture.resBody);
   const status = capture.status;
 
   if ((typeof status === 'number' && status >= 400) || body?.ok === false) {
@@ -389,11 +358,8 @@ export function classifySlackCapture(capture: Capture): {
  * merely broader: `conversations.history` with no channel is not a wider query,
  * it is an error.
  *
- * A Map, not an object literal, because `method` is attacker-supplied path text.
- * `ROUTES['__proto__']` on a literal returns `Object.prototype` — truthy, so the
- * route branch was taken — and `for (const name of route.carry)` then threw
- * `carry is not iterable` out of a hook forbidden to throw. `/api/constructor`,
- * `/api/toString`, `/api/valueOf` and `/api/hasOwnProperty` did the same.
+ * A Map, not an object literal, because `method` is attacker-supplied path text:
+ * `__proto__`/`constructor` on a literal return truthy non-routes that then throw.
  */
 const CURSOR_ROUTES = new Map<
   string,
@@ -441,7 +407,7 @@ export function slackNextCursors(capture: Capture, ctx?: ParseContext): CursorSe
   const method = slackMethod(capture.path);
   if (!method) return [];
 
-  const body = safeJson(capture.resBody);
+  const body = safeJsonObject(capture.resBody);
   // A failed call's cursor is not a page, it is whatever the previous call said.
   if (!body || body.ok === false) return [];
 
@@ -451,7 +417,7 @@ export function slackNextCursors(capture: Capture, ctx?: ParseContext): CursorSe
     const cursor = str(obj(body.response_metadata).next_cursor);
     if (!cursor) return [];
 
-    const params = reqParamsOf(capture, ctx);
+    const params = ctx?.reqParams ?? requestParams(capture);
     const carried: Record<string, string> = {};
     for (const name of route.carry) {
       const v = str(params[name]);

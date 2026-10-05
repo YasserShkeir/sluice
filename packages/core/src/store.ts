@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
-import { mkdirSync } from 'node:fs';
+import { chmodSync, closeSync, existsSync, mkdirSync, openSync, statSync } from 'node:fs';
 import { dirname } from 'node:path';
 import Database from 'better-sqlite3';
 import { decodeBody, encodeBody } from './body-codec.js';
-import { ADDITIVE_COLUMNS, ADDITIVE_INDEXES, SCHEMA_SQL } from './schema.js';
+import { ADDITIVE_COLUMNS, ADDITIVE_INDEXES, CORE_TABLE_NAMES, SCHEMA_SQL } from './schema.js';
 import type {
   Actor,
   Capture,
@@ -32,27 +32,14 @@ import type {
   WorkItem,
   Workspace,
 } from './types.js';
-import { newId } from './util.js';
+import { newId, safeJsonParse } from './util.js';
 
 type DB = InstanceType<typeof Database>;
 
 const j = (v: unknown): string | null => (v === undefined ? null : JSON.stringify(v));
 
-/**
- * Parse a JSON column back into a value. A malformed row must never take down a
- * read: `listCaptures` feeds the WS backfill, the cartographer and the api-map,
- * so one truncated write (or a hand-edited `--db`) would otherwise throw out of
- * every one of those paths. Undefined is the same answer the column being empty
- * gives, and every caller already handles it.
- */
-const unj = <T>(v: unknown): T | undefined => {
-  if (typeof v !== 'string' || v.length === 0) return undefined;
-  try {
-    return JSON.parse(v) as T;
-  } catch {
-    return undefined;
-  }
-};
+/** Parse a JSON column; empty or malformed reads as undefined, never a throw (see decodeBody). */
+const unj = <T>(v: unknown): T | undefined => (typeof v === 'string' ? (safeJsonParse(v) as T | undefined) : undefined);
 
 export interface UpsertCounts {
   workspaces: number;
@@ -103,6 +90,28 @@ const whereOf = (parts: string[], params: Record<string, unknown>): Where => ({
 });
 
 /**
+ * Push `column = @key` for each listed field present on `q`. Columns are
+ * compile-time literals at the call site, never caller input.
+ */
+function addEquals<Q extends object>(
+  parts: string[],
+  params: Record<string, unknown>,
+  q: Q,
+  fields: ReadonlyArray<readonly [key: keyof Q & string, column: string]>,
+  present: (v: unknown) => boolean = (v) => v !== undefined,
+): void {
+  for (const [key, column] of fields) {
+    const value = q[key];
+    if (!present(value)) continue;
+    parts.push(`${column} = @${key}`);
+    params[key] = value;
+  }
+}
+
+/** Truthiness filter: '' / 0 / undefined mean "no filter" (the historical semantics of these sites). */
+const truthy = (v: unknown): boolean => Boolean(v);
+
+/**
  * The capture filter, built once for the three reads that share it.
  *
  * It used to live inline in `listCaptures`, which meant a count or a max over the
@@ -112,14 +121,7 @@ const whereOf = (parts: string[], params: Record<string, unknown>): Where => ({
 function captureWhere(q: CaptureQuery): Where {
   const parts: string[] = [];
   const params: Record<string, unknown> = {};
-  if (q.adapterId) {
-    parts.push('adapter_id = @adapterId');
-    params.adapterId = q.adapterId;
-  }
-  if (q.host) {
-    parts.push('host = @host');
-    params.host = q.host;
-  }
+  addEquals(parts, params, q, [['adapterId', 'adapter_id'], ['host', 'host']], truthy);
   if (q.sinceTs !== undefined) {
     parts.push('ts >= @sinceTs');
     params.sinceTs = q.sinceTs;
@@ -131,14 +133,7 @@ function captureWhere(q: CaptureQuery): Where {
     params.afterTs = q.after.ts;
     params.afterId = q.after.id;
   }
-  if (q.tabId) {
-    parts.push('tab_id = @tabId');
-    params.tabId = q.tabId;
-  }
-  if (q.classification) {
-    parts.push('classification = @classification');
-    params.classification = q.classification;
-  }
+  addEquals(parts, params, q, [['tabId', 'tab_id'], ['classification', 'classification']], truthy);
   if (q.unparsed) parts.push('parsed_at IS NULL');
   // `unattributed` is the pre-scoping noise: captures no adapter claimed
   // (adapter_id IS NULL). It is the ~100 MB of chatgpt/telemetry/CDN traffic
@@ -147,7 +142,7 @@ function captureWhere(q: CaptureQuery): Where {
   // predicate from `adapterId` (which requires a value), so a delete and the
   // count shown beside it can share this exact WHERE — see deleteCaptures.
   if (q.unattributed) parts.push('adapter_id IS NULL');
-    if (q.ids && q.ids.length === 0) {
+  if (q.ids && q.ids.length === 0) {
     parts.push('1=0'); // match-none: empty id list is not "no filter"
   } else if (q.ids && q.ids.length > 0) {
     // Bound the IN list so a huge hydrate request cannot blow the query planner
@@ -170,22 +165,12 @@ function captureWhere(q: CaptureQuery): Where {
 function itemWhere(q: ItemFilter): Where {
   const parts: string[] = [];
   const params: Record<string, unknown> = {};
-  if (q.id !== undefined) {
-    parts.push('id = @id');
-    params.id = q.id;
-  }
-  if (q.containerId !== undefined) {
-    parts.push('container_id = @containerId');
-    params.containerId = q.containerId;
-  }
-  if (q.adapterId !== undefined) {
-    parts.push('adapter_id = @adapterId');
-    params.adapterId = q.adapterId;
-  }
-  if (q.workspaceId !== undefined) {
-    parts.push('workspace_id = @workspaceId');
-    params.workspaceId = q.workspaceId;
-  }
+  addEquals(parts, params, q, [
+    ['id', 'id'],
+    ['containerId', 'container_id'],
+    ['adapterId', 'adapter_id'],
+    ['workspaceId', 'workspace_id'],
+  ]);
   if (q.beforeTs !== undefined) {
     parts.push('ts < @beforeTs');
     params.beforeTs = q.beforeTs;
@@ -197,20 +182,58 @@ function itemWhere(q: ItemFilter): Where {
   return whereOf(parts, params);
 }
 
+/** Escape `%`, `_`, and `\\` for SQLite LIKE with ESCAPE '\\'. */
+function escapeLike(s: string): string {
+  return s.replace(/[\\%_]/g, (ch) => `\\${ch}`);
+}
+
+/** What a capture contributes to captures_fts: its non-empty bodies, newline-joined. */
+function captureFtsText(...bodies: Array<string | null | undefined>): string {
+  return bodies.filter((b): b is string => b != null && b.length > 0).join('\n');
+}
+
+/** Indexed column per FTS table — a constant, never caller input. */
+const FTS_COLUMN = { captures_fts: 'body', items_fts: 'text' } as const;
+type FtsTable = keyof typeof FTS_COLUMN;
+
+/**
+ * Drop a file's or directory's group/other bits (0644 → 0600, 0755 → 0700),
+ * best-effort. Never adds a bit, and leaves anything that is not a regular file
+ * or directory alone — `--out /dev/stdout` must not chmod the user's terminal.
+ * A no-op on win32 and on a path that is missing or not ours.
+ */
+export function restrictToOwner(path: string): void {
+  if (process.platform === 'win32') return;
+  try {
+    const st = statSync(path);
+    if (!st.isFile() && !st.isDirectory()) return;
+    const mode = st.mode & 0o777;
+    if ((mode & 0o077) !== 0) chmodSync(path, mode & 0o700);
+  } catch {
+    /* missing, or not ours to chmod */
+  }
+}
+
 /**
  * The single SQLite sink for captures + normalized entities. There is no method
  * to persist a secret: the store simply has nowhere to put one.
  */
-/** Escape `%`, `_`, and `\\` for SQLite LIKE with ESCAPE '\\'. */
-function escapeLike(s: string): string {
-  return s.replace(/[\\%_]/g, (ch) => '\\' + ch);
-}
-
 export class SqliteStore {
   readonly db: DB;
 
   constructor(dbPath: string) {
-    if (dbPath !== ':memory:') mkdirSync(dirname(dbPath), { recursive: true });
+    const onDisk = dbPath !== ':memory:' && dbPath !== ''; // '' is a SQLite temp database
+    if (onDisk) {
+      // `mode` applies only to directories this call creates; an existing parent
+      // (say, the directory of an arbitrary `--db` path) is left as it is.
+      mkdirSync(dirname(dbPath), { recursive: true, mode: 0o700 });
+      // The store holds full bodies (mail, messages). Create the file owner-only
+      // BEFORE SQLite opens it — its -wal/-shm take the main file's mode — and
+      // only when missing: closing any fd on an open SQLite file drops this
+      // process's POSIX locks on it. The loop tightens files an older run left.
+      if (!existsSync(dbPath)) closeSync(openSync(dbPath, 'a', 0o600));
+      for (const p of [dbPath, `${dbPath}-wal`, `${dbPath}-shm`]) restrictToOwner(p);
+    }
     this.db = new Database(dbPath);
     this.db.pragma('journal_mode = WAL');
     this.db.pragma('foreign_keys = ON');
@@ -240,57 +263,34 @@ export class SqliteStore {
    * rebuild on every open would be a large cost paid for nothing.
    */
   private backfillFtsIfEmpty(): void {
-    const pending: Array<{ fts: string; src: string; column: string }> = [
-      { fts: 'captures_fts', src: 'captures', column: 'body' },
-      { fts: 'items_fts', src: 'items', column: 'text' },
-    ];
-    for (const { fts, src, column } of pending) {
+    for (const [fts, src] of [['captures_fts', 'captures'], ['items_fts', 'items']] as const) {
       const indexed = (this.db.prepare(`SELECT COUNT(*) AS n FROM ${fts}`).get() as { n: number }).n;
       if (indexed > 0) continue;
       const rows = (this.db.prepare(`SELECT COUNT(*) AS n FROM ${src}`).get() as { n: number }).n;
       if (rows === 0) continue;
 
-      const insert = this.db.prepare(`INSERT INTO ${fts}(rowid, ${column}) VALUES (?, ?)`);
-      const tx = this.db.transaction(() => {
+      const insert = this.db.prepare(`INSERT INTO ${fts}(rowid, ${FTS_COLUMN[fts]}) VALUES (?, ?)`);
+      this.db.transaction(() => {
         if (src === 'captures') {
           const all = this.db
-            .prepare(
-              `SELECT rowid AS rid, req_body, req_body_encoding, res_body, res_body_encoding
-                 FROM captures`,
-            )
-            .all() as Array<{
-            rid: number;
-            req_body: string | Buffer | null;
-            req_body_encoding: string | null;
-            res_body: string | Buffer | null;
-            res_body_encoding: string | null;
-          }>;
+            .prepare(`SELECT rowid AS rid, req_body, req_body_encoding, res_body, res_body_encoding FROM captures`)
+            .all() as Array<Pick<CaptureRow, 'req_body' | 'req_body_encoding' | 'res_body' | 'res_body_encoding'> & { rid: number }>;
           for (const r of all) {
-            const body = [
+            const body = captureFtsText(
               decodeBody(r.req_body, r.req_body_encoding),
               decodeBody(r.res_body, r.res_body_encoding),
-            ]
-              .filter((b) => b != null && b.length > 0)
-              .join('\n');
+            );
             if (body.length > 0) insert.run(r.rid, body);
           }
         } else {
-          const all = this.db.prepare(`SELECT rowid AS rid, text FROM items`).all() as Array<{
-            rid: number;
-            text: string;
-          }>;
+          const all = this.db.prepare(`SELECT rowid AS rid, text FROM items`).all() as Array<{ rid: number; text: string }>;
           for (const r of all) if (r.text.length > 0) insert.run(r.rid, r.text);
         }
-      });
-      tx();
+      })();
     }
   }
 
-  /**
-   * Bring an existing database up to the current column set. `CREATE TABLE IF
-   * NOT EXISTS` does nothing to a table that already exists, so without this a
-   * new column would only ever appear in freshly-created stores.
-   */
+  /** Bring an existing database up to the current column set (see ADDITIVE_COLUMNS). */
   private applyAdditiveColumns(): void {
     for (const [table, columns] of Object.entries(ADDITIVE_COLUMNS)) {
       const present = new Set(
@@ -321,7 +321,7 @@ export class SqliteStore {
   insertCapture(c: Capture): void {
     const req = encodeBody(c.reqBody);
     const res = encodeBody(c.resBody);
-    const tx = this.db.transaction(() => {
+    this.db.transaction(() => {
       this.db
         .prepare(
           `INSERT INTO captures
@@ -385,20 +385,68 @@ export class SqliteStore {
       // compressed on its way into the row. A gzip BLOB cannot be tokenized, and
       // anything read from upstream of the redactor would put a searchable
       // plaintext copy of a secret in the database.
-      this.db.prepare(`DELETE FROM captures_fts WHERE rowid = ?`).run(rowid);
-      const body = [c.reqBody, c.resBody].filter((b) => b != null && b.length > 0).join('\n');
-      if (body.length > 0) {
-        this.db.prepare(`INSERT INTO captures_fts(rowid, body) VALUES (?, ?)`).run(rowid, body);
-      }
-    });
-    tx();
+      this.reindexFts('captures_fts', rowid, captureFtsText(c.reqBody, c.resBody));
+    })();
   }
 
   private captureRowid(id: string): number | undefined {
-    const row = this.db.prepare(`SELECT rowid AS rid FROM captures WHERE id = ?`).get(id) as
-      | { rid: number }
-      | undefined;
-    return row?.rid;
+    return (this.db.prepare(`SELECT rowid AS rid FROM captures WHERE id = ?`).get(id) as { rid: number } | undefined)?.rid;
+  }
+
+  /**
+   * Drop FTS rows by source rowid. Must run BEFORE the source rows go: the index
+   * is contentless and joined on rowid, so deleting the source row first leaves
+   * an orphaned entry that keeps matching — a `body:` search would return rowids
+   * with nothing behind them for as long as the database lives, since nothing
+   * would ever revisit them.
+   */
+  private dropFts(table: FtsTable, rows: Iterable<{ rid: number }>): void {
+    const del = this.db.prepare(`DELETE FROM ${table} WHERE rowid = ?`);
+    for (const { rid } of rows) del.run(rid);
+  }
+
+  /** The rows a `SELECT rowid AS rid …` returns. */
+  private rowids(sql: string, ...args: unknown[]): Array<{ rid: number }> {
+    return this.db.prepare(sql).all(...args) as Array<{ rid: number }>;
+  }
+
+  /** Replace one row's indexed text: delete, then insert when non-empty. */
+  private reindexFts(table: FtsTable, rowid: number, text: string): void {
+    this.db.prepare(`DELETE FROM ${table} WHERE rowid = ?`).run(rowid);
+    if (text.length > 0) {
+      this.db.prepare(`INSERT INTO ${table}(rowid, ${FTS_COLUMN[table]}) VALUES (?, ?)`).run(rowid, text);
+    }
+  }
+
+  /**
+   * Delete a MATERIALIZED set of captures by rowid, FTS first. The set is fixed
+   * before anything goes, so an FTS-dependent filter (`bodyMatch`) is never
+   * re-evaluated against a half-dropped index. The caller owns the transaction,
+   * `gcOrphanFlows` and any VACUUM.
+   */
+  private removeCaptureRows(rows: ReadonlyArray<{ rid: number }>): number {
+    if (rows.length === 0) return 0;
+    this.dropFts('captures_fts', rows);
+    const del = this.db.prepare(`DELETE FROM captures WHERE rowid = ?`);
+    let n = 0;
+    for (const { rid } of rows) n += del.run(rid).changes;
+    return n;
+  }
+
+  /**
+   * Delete flows and their steps by id. The steps go explicitly rather than by
+   * the FK cascade alone, so a connection without `foreign_keys = ON` cannot
+   * leave them behind. Opens no transaction: it runs inside callers' ones.
+   */
+  private dropFlowIds(ids: Iterable<string>): number {
+    const dropSteps = this.db.prepare(`DELETE FROM interaction_flow_steps WHERE flow_id = ?`);
+    const dropFlow = this.db.prepare(`DELETE FROM interaction_flows WHERE id = ?`);
+    let n = 0;
+    for (const id of ids) {
+      dropSteps.run(id);
+      n += dropFlow.run(id).changes;
+    }
+    return n;
   }
 
   /**
@@ -459,39 +507,18 @@ export class SqliteStore {
    */
   pruneCaptures(opts: { maxAgeMs?: number; maxRows?: number; vacuum?: boolean } = {}): number {
     let removed = 0;
-    // The FTS rows must go FIRST, while their rowids still resolve. Deleting the
-    // capture first leaves an orphaned index entry that keeps matching, so a
-    // `body:` search would return rowids with no row behind them — for as long as
-    // the database lives, since nothing would ever revisit them.
-    const dropFts = this.db.prepare(`DELETE FROM captures_fts WHERE rowid = ?`);
-    const forget = (rowids: Array<{ rid: number }>): void => {
-      for (const { rid } of rowids) dropFts.run(rid);
-    };
-    const tx = this.db.transaction(() => {
+    this.db.transaction(() => {
       if (opts.maxAgeMs !== undefined && opts.maxAgeMs > 0) {
-        const cutoff = Date.now() - opts.maxAgeMs;
-        forget(
-          this.db.prepare(`SELECT rowid AS rid FROM captures WHERE ts < ?`).all(cutoff) as Array<{
-            rid: number;
-          }>,
-        );
-        removed += this.db.prepare(`DELETE FROM captures WHERE ts < ?`).run(cutoff).changes;
+        removed += this.removeCaptureRows(this.rowids(`SELECT rowid AS rid FROM captures WHERE ts < ?`, Date.now() - opts.maxAgeMs));
       }
       if (opts.maxRows !== undefined && opts.maxRows >= 0) {
-        // idx_captures_ts makes the ORDER BY / OFFSET cheap.
-        const doomed = `SELECT id, rowid AS rid FROM captures ORDER BY ts DESC LIMIT -1 OFFSET ?`;
-        forget(this.db.prepare(doomed).all(opts.maxRows) as Array<{ rid: number }>);
-        removed += this.db
-          .prepare(
-            `DELETE FROM captures WHERE id IN (
-               SELECT id FROM captures ORDER BY ts DESC LIMIT -1 OFFSET ?
-             )`,
-          )
-          .run(opts.maxRows).changes;
+        // idx_captures_ts makes the ORDER BY / OFFSET cheap. Evaluated ONCE, so the
+        // index rows and the capture rows dropped are provably the same set even
+        // when timestamps tie across the cut.
+        removed += this.removeCaptureRows(this.rowids(`SELECT rowid AS rid FROM captures ORDER BY ts DESC LIMIT -1 OFFSET ?`, opts.maxRows));
       }
       if (removed > 0) this.gcOrphanFlows();
-    });
-    tx();
+    })();
     // VACUUM cannot run inside a transaction, and it rewrites the whole file —
     // so it is opt-in rather than automatic on a live capture path.
     if (opts.vacuum && removed > 0) this.db.exec('VACUUM');
@@ -504,15 +531,11 @@ export class SqliteStore {
    * Built on the SAME `captureWhere` that `countCaptures` uses, so a confirm
    * dialog can show `countCaptures(q)` and then `deleteCaptures(q)` delete exactly
    * that set — no host-heuristic-vs-adapter-id mismatch where the button deletes
-   * a different set than it names. FTS rows go first (rowids still resolve), like
-   * `pruneCaptures`. VACUUM is the caller's separate, disk-checked step.
+   * a different set than it names. VACUUM is the caller's separate, disk-checked step.
    *
    * Refuses an EMPTY query: `deleteCaptures({})` would delete everything, which is
    * `wipe()`'s job and must be asked for by name, not reachable by forgetting a
    * filter.
-   *
-   * When `bodyMatch` is set, rowids are materialized first and deletes use that
-   * fixed id set — never re-evaluate an FTS-dependent WHERE after FTS rows drop.
    */
   deleteCaptures(q: CaptureQuery): number {
     const { clause, params } = captureWhere(q);
@@ -520,16 +543,7 @@ export class SqliteStore {
       throw new Error('deleteCaptures needs a filter; use wipe() to remove everything.');
     }
     return this.db.transaction(() => {
-      const rows = this.db
-        .prepare(`SELECT id, rowid AS rid FROM captures ${clause}`)
-        .all(params) as Array<{ id: string; rid: number }>;
-      if (rows.length === 0) return 0;
-      const dropFts = this.db.prepare(`DELETE FROM captures_fts WHERE rowid = ?`);
-      for (const { rid } of rows) dropFts.run(rid);
-      // Delete by materialized ids so bodyMatch/FTS filters cannot see a half-deleted index.
-      const del = this.db.prepare(`DELETE FROM captures WHERE id = ?`);
-      let n = 0;
-      for (const { id } of rows) n += del.run(id).changes;
+      const n = this.removeCaptureRows(this.rowids(`SELECT rowid AS rid FROM captures ${clause}`, params));
       if (n > 0) this.gcOrphanFlows();
       return n;
     })();
@@ -604,21 +618,8 @@ export class SqliteStore {
   wipe(): { captures: number } {
     return this.db.transaction(() => {
       const captures = (this.db.prepare(`SELECT COUNT(*) AS n FROM captures`).get() as { n: number }).n;
-      for (const t of [
-        'captures_fts',
-        'items_fts',
-        'edges',
-        'items',
-        'containers',
-        'actors',
-        'workspaces',
-        'cursors',
-        'interaction_flow_steps',
-        'interaction_flows',
-        'flow_templates',
-        'sessions',
-        'captures',
-      ]) {
+      // `meta` is bookkeeping, not captured data; the caller resets what it owns there.
+      for (const t of CORE_TABLE_NAMES.filter((n) => n !== 'meta')) {
         try {
           this.db.exec(`DELETE FROM ${t}`);
         } catch {
@@ -632,10 +633,7 @@ export class SqliteStore {
   /** How many captures are stored, narrowed by the same query `listCaptures` takes. */
   countCaptures(q: CaptureQuery = {}): number {
     const { clause, params } = captureWhere(q);
-    const row = this.db.prepare(`SELECT COUNT(*) AS n FROM captures ${clause}`).get(params) as
-      | { n: number }
-      | undefined;
-    return row?.n ?? 0;
+    return (this.db.prepare(`SELECT COUNT(*) AS n FROM captures ${clause}`).get(params) as { n: number }).n;
   }
 
   /**
@@ -648,10 +646,7 @@ export class SqliteStore {
    */
   newestCaptureTs(q: CaptureQuery = {}): number | null {
     const { clause, params } = captureWhere(q);
-    const row = this.db.prepare(`SELECT MAX(ts) AS ts FROM captures ${clause}`).get(params) as
-      | { ts: number | null }
-      | undefined;
-    return row?.ts ?? null;
+    return (this.db.prepare(`SELECT MAX(ts) AS ts FROM captures ${clause}`).get(params) as { ts: number | null }).ts;
   }
 
   // ── Entities ───────────────────────────────────────────────────────────────
@@ -776,10 +771,7 @@ export class SqliteStore {
       .prepare(`SELECT rowid AS rid FROM items WHERE container_id = ? AND id = ?`)
       .get(i.containerId, i.id) as { rid: number } | undefined;
     if (row === undefined) return;
-    this.db.prepare(`DELETE FROM items_fts WHERE rowid = ?`).run(row.rid);
-    if (i.text.length > 0) {
-      this.db.prepare(`INSERT INTO items_fts(rowid, text) VALUES (?, ?)`).run(row.rid, i.text);
-    }
+    this.reindexFts('items_fts', row.rid, i.text);
   }
 
   /**
@@ -810,24 +802,19 @@ export class SqliteStore {
       });
   }
 
-  /** Edges touching an entity, in either direction unless `direction` narrows it. */
+  /** Edges matching every given endpoint, rel and workspace field, most recently updated first. */
   listEdges(q: EdgeQuery = {}): Edge[] {
-    const where: string[] = [];
+    const parts: string[] = [];
     const params: Record<string, unknown> = {};
-    for (const [key, column] of [
+    addEquals(parts, params, q, [
       ['srcKind', 'src_kind'],
       ['srcId', 'src_id'],
       ['dstKind', 'dst_kind'],
       ['dstId', 'dst_id'],
       ['rel', 'rel'],
       ['workspaceId', 'workspace_id'],
-    ] as const) {
-      const value = q[key];
-      if (value === undefined) continue;
-      where.push(`${column} = @${key}`);
-      params[key] = value;
-    }
-    const clause = where.length ? `WHERE ${where.join(' AND ')}` : '';
+    ]);
+    const { clause } = whereOf(parts, params);
     const rows = this.db
       .prepare(`SELECT * FROM edges ${clause} ORDER BY updated_ts DESC LIMIT @limit`)
       .all({ ...params, limit: q.limit ?? 1000 }) as EdgeRow[];
@@ -836,31 +823,15 @@ export class SqliteStore {
 
   /** Apply a whole ParseResult in one transaction; returns per-kind counts. */
   applyParseResult(pr: ParseResult, ts: number): UpsertCounts {
-    const counts: UpsertCounts = { workspaces: 0, actors: 0, containers: 0, items: 0, edges: 0 };
-    const tx = this.db.transaction(() => {
-      for (const w of pr.workspaces ?? []) {
-        this.upsertWorkspace(w, ts);
-        counts.workspaces++;
-      }
-      for (const a of pr.actors ?? []) {
-        this.upsertActor(a, ts);
-        counts.actors++;
-      }
-      for (const c of pr.containers ?? []) {
-        this.upsertContainer(c, ts);
-        counts.containers++;
-      }
-      for (const i of pr.items ?? []) {
-        this.upsertItem(i);
-        counts.items++;
-      }
-      for (const e of pr.edges ?? []) {
-        this.upsertEdge(e, ts);
-        counts.edges++;
-      }
-    });
-    tx();
-    return counts;
+    this.db.transaction(() => {
+      for (const w of pr.workspaces ?? []) this.upsertWorkspace(w, ts);
+      for (const a of pr.actors ?? []) this.upsertActor(a, ts);
+      for (const c of pr.containers ?? []) this.upsertContainer(c, ts);
+      for (const i of pr.items ?? []) this.upsertItem(i);
+      for (const e of pr.edges ?? []) this.upsertEdge(e, ts);
+    })();
+    const n = (xs: unknown[] | undefined): number => xs?.length ?? 0;
+    return { workspaces: n(pr.workspaces), actors: n(pr.actors), containers: n(pr.containers), items: n(pr.items), edges: n(pr.edges) };
   }
 
   // ── Cursors — the pagination worklist ──────────────────────────────────────
@@ -883,7 +854,7 @@ export class SqliteStore {
          DO NOTHING`,
     );
     let added = 0;
-    const tx = this.db.transaction(() => {
+    this.db.transaction(() => {
       for (const s of seeds) {
         added += stmt.run({
           id: newId('cur'),
@@ -897,8 +868,7 @@ export class SqliteStore {
           depth: s.depth ?? null,
         }).changes;
       }
-    });
-    tx();
+    })();
     return added;
   }
 
@@ -942,25 +912,41 @@ export class SqliteStore {
   }
 
   /**
-   * Return anything left `running` to `pending`.
+   * Return claims left `running` to `pending` once untouched for `olderThanMs`.
    *
    * A drainer that is killed mid-flight leaves its claims stranded, and nothing
-   * would ever pick them up again — the worklist would look busy forever. Called
-   * at startup, where "running" cannot legitimately mean anything else.
+   * would ever pick them up again. The lease means a drainer starting up never
+   * steals the live claims of one still running.
    */
-  releaseStaleCursors(): number {
-    return this.db.prepare(`UPDATE cursors SET state = 'pending' WHERE state = 'running'`).run()
-      .changes;
+  releaseStaleCursors(olderThanMs: number): number {
+    return this.db
+      .prepare(`UPDATE cursors SET state = 'pending' WHERE state = 'running' AND updated_ts < @cutoff`)
+      .run({ cutoff: Date.now() - olderThanMs }).changes;
+  }
+
+  /**
+   * Return these claims to `pending`. Ids already settled or unknown are left
+   * alone. An id whose lease expired and was re-taken by another drainer is
+   * still `running` and WILL be reset, so pass only your own live claims.
+   */
+  releaseCursors(ids: readonly string[]): number {
+    const release = this.db.prepare(`UPDATE cursors SET state = 'pending' WHERE id = @id AND state = 'running'`);
+    const tx = this.db.transaction((list: readonly string[]) => {
+      let n = 0;
+      for (const id of list) n += release.run({ id }).changes;
+      return n;
+    });
+    return tx(ids);
   }
 
   listCursors(q: { state?: CursorState; adapterId?: string; limit?: number } = {}): WorkItem[] {
-    const where: string[] = [];
-    if (q.state) where.push('state = @state');
-    if (q.adapterId) where.push('adapter_id = @adapterId');
-    const clause = where.length ? `WHERE ${where.join(' AND ')}` : '';
+    const parts: string[] = [];
+    const params: Record<string, unknown> = { limit: q.limit ?? 500 };
+    addEquals(parts, params, q, [['state', 'state'], ['adapterId', 'adapter_id']], truthy);
+    const { clause } = whereOf(parts, params);
     const rows = this.db
       .prepare(`SELECT * FROM cursors ${clause} ORDER BY created_ts LIMIT @limit`)
-      .all({ state: q.state, adapterId: q.adapterId, limit: q.limit ?? 500 }) as CursorRow[];
+      .all(params) as CursorRow[];
     return rows.map(rowToWorkItem);
   }
 
@@ -1009,7 +995,7 @@ export class SqliteStore {
       );
     }
 
-    const tx = this.db.transaction(() => {
+    this.db.transaction(() => {
       this.db
         .prepare(
           `INSERT INTO interaction_flows
@@ -1051,8 +1037,7 @@ export class SqliteStore {
           required: s.required ? 1 : 0,
         });
       }
-    });
-    tx();
+    })();
 
     const got = this.getFlow(id);
     if (!got) throw new Error(`upsertFlow failed to read back ${id}`);
@@ -1063,21 +1048,13 @@ export class SqliteStore {
     const row = this.db
       .prepare(`SELECT * FROM interaction_flows WHERE id = ?`)
       .get(id) as FlowRow | undefined;
-    if (!row) return undefined;
-    return this.flowFromRow(row);
+    return row ? this.flowFromRow(row) : undefined;
   }
 
   listFlows(q: FlowQuery = {}): InteractionFlow[] {
     const parts: string[] = [];
     const params: Record<string, unknown> = { limit: q.limit ?? 200 };
-    if (q.adapterId) {
-      parts.push('adapter_id = @adapterId');
-      params.adapterId = q.adapterId;
-    }
-    if (q.source) {
-      parts.push('source = @source');
-      params.source = q.source;
-    }
+    addEquals(parts, params, q, [['adapterId', 'adapter_id'], ['source', 'source']], truthy);
     if (q.sinceTs !== undefined) {
       parts.push('started_at >= @sinceTs');
       params.sinceTs = q.sinceTs;
@@ -1096,10 +1073,10 @@ export class SqliteStore {
       )`);
       params.qq = `%${escapeLike(q.q.trim())}%`;
     }
-    const where = parts.length ? `WHERE ${parts.join(' AND ')}` : '';
+    const { clause } = whereOf(parts, params);
     const rows = this.db
       .prepare(
-        `SELECT * FROM interaction_flows ${where}
+        `SELECT * FROM interaction_flows ${clause}
           ORDER BY started_at DESC LIMIT @limit`,
       )
       .all(params) as FlowRow[];
@@ -1108,8 +1085,7 @@ export class SqliteStore {
 
   /** Drop a flow and its steps. Captures are never touched. */
   deleteFlow(id: string): boolean {
-    const n = this.db.prepare(`DELETE FROM interaction_flows WHERE id = ?`).run(id).changes;
-    return n > 0;
+    return this.db.transaction(() => this.dropFlowIds([id]))() > 0;
   }
 
   /**
@@ -1146,8 +1122,8 @@ export class SqliteStore {
       ? input.captureIds.slice()
       : [input.primaryCaptureId, ...input.captureIds];
     // Dedupe while preserving order — duplicate ids violate UNIQUE(flow_id, capture_id).
-    const seen = new Set<string>();
-    const ids = raw.filter((id) => (seen.has(id) ? false : (seen.add(id), true)));
+    // A Set iterates in first-insertion order.
+    const ids = [...new Set(raw)];
     const caps = ids.map((cid) => {
       const c = this.getCapture(cid);
       if (!c) throw new Error(`unknown capture "${cid}"`);
@@ -1182,8 +1158,7 @@ export class SqliteStore {
     const n = this.db
       .prepare(`UPDATE interaction_flows SET source = ? WHERE id = ?`)
       .run(source, id).changes;
-    if (n === 0) return undefined;
-    return this.getFlow(id);
+    return n === 0 ? undefined : this.getFlow(id);
   }
 
   private flowFromRow(row: FlowRow): InteractionFlow {
@@ -1227,17 +1202,7 @@ export class SqliteStore {
         .prepare(`SELECT id FROM interaction_flows WHERE adapter_id = ?`)
         .all(opts.adapterId) as Array<{ id: string }>
     ).map((r) => r.id);
-    if (ids.length === 0) return 0;
-    const dropSteps = this.db.prepare(`DELETE FROM interaction_flow_steps WHERE flow_id = ?`);
-    const dropFlow = this.db.prepare(`DELETE FROM interaction_flows WHERE id = ?`);
-    return this.db.transaction(() => {
-      let n = 0;
-      for (const id of ids) {
-        dropSteps.run(id);
-        n += dropFlow.run(id).changes;
-      }
-      return n;
-    })();
+    return this.db.transaction(() => this.dropFlowIds(ids))();
   }
 
   /**
@@ -1258,15 +1223,8 @@ export class SqliteStore {
              OR id NOT IN (SELECT DISTINCT flow_id FROM interaction_flow_steps)`,
       )
       .all() as Array<{ id: string }>;
-    if (doomed.length === 0) return 0;
-    const dropSteps = this.db.prepare(`DELETE FROM interaction_flow_steps WHERE flow_id = ?`);
-    const dropFlow = this.db.prepare(`DELETE FROM interaction_flows WHERE id = ?`);
-    let n = 0;
-    for (const { id } of doomed) {
-      dropSteps.run(id);
-      n += dropFlow.run(id).changes;
-    }
-    return n;
+    // No transaction of its own: it runs inside prune/delete ones and standalone.
+    return this.dropFlowIds(doomed.map((r) => r.id));
   }
 
   // ── Flow templates ─────────────────────────────────────────────────────────
@@ -1332,22 +1290,15 @@ export class SqliteStore {
   listFlowTemplates(q: FlowTemplateQuery = {}): FlowTemplate[] {
     const parts: string[] = [];
     const params: Record<string, unknown> = { limit: q.limit ?? 200 };
-    if (q.adapterId) {
-      parts.push('adapter_id = @adapterId');
-      params.adapterId = q.adapterId;
-    }
-    if (q.primaryKey) {
-      parts.push('primary_key = @primaryKey');
-      params.primaryKey = q.primaryKey;
-    }
+    addEquals(parts, params, q, [['adapterId', 'adapter_id'], ['primaryKey', 'primary_key']], truthy);
     if (q.q && q.q.trim().length > 0) {
       parts.push(`(IFNULL(label, '') LIKE @qq ESCAPE '\\' OR primary_key LIKE @qq ESCAPE '\\')`);
       params.qq = `%${escapeLike(q.q.trim())}%`;
     }
-    const where = parts.length ? `WHERE ${parts.join(' AND ')}` : '';
+    const { clause } = whereOf(parts, params);
     const rows = this.db
       .prepare(
-        `SELECT * FROM flow_templates ${where}
+        `SELECT * FROM flow_templates ${clause}
           ORDER BY learned_at DESC LIMIT @limit`,
       )
       .all(params) as FlowTemplateRow[];
@@ -1392,15 +1343,8 @@ export class SqliteStore {
    */
   deleteWorkspace(workspaceId: string): { containers: number; items: number; actors: number; edges: number } {
     return this.db.transaction(() => {
-      // FTS first, and via the rowid join, because `items_fts` is contentless:
-      // it cannot find its own rows by value, so once the `items` rows are gone
-      // their index entries are unreachable and stay in the index forever,
-      // matching searches with nothing behind them.
-      const orphans = this.db
-        .prepare(`SELECT rowid AS rid FROM items WHERE workspace_id = ?`)
-        .all(workspaceId) as Array<{ rid: number }>;
-      const dropFts = this.db.prepare(`DELETE FROM items_fts WHERE rowid = ?`);
-      for (const { rid } of orphans) dropFts.run(rid);
+      // FTS first (see dropFts): items_fts is contentless.
+      this.dropFts('items_fts', this.rowids(`SELECT rowid AS rid FROM items WHERE workspace_id = ?`, workspaceId));
 
       const del = (table: string): number =>
         this.db.prepare(`DELETE FROM ${table} WHERE workspace_id = ?`).run(workspaceId).changes;
@@ -1414,21 +1358,13 @@ export class SqliteStore {
   }
 
   listContainers(workspaceId?: string): Container[] {
-    const rows = workspaceId
-      ? (this.db
-          .prepare(`SELECT * FROM containers WHERE workspace_id = ? ORDER BY name`)
-          .all(workspaceId) as ContainerRow[])
-      : (this.db.prepare(`SELECT * FROM containers ORDER BY name`).all() as ContainerRow[]);
-    return rows.map(rowToContainer);
+    const where = workspaceId ? 'WHERE workspace_id = @workspaceId' : '';
+    return (this.db.prepare(`SELECT * FROM containers ${where} ORDER BY name`).all({ workspaceId }) as ContainerRow[]).map(rowToContainer);
   }
 
   listActors(workspaceId?: string): Actor[] {
-    const rows = workspaceId
-      ? (this.db
-          .prepare(`SELECT * FROM actors WHERE workspace_id = ? ORDER BY handle`)
-          .all(workspaceId) as ActorRow[])
-      : (this.db.prepare(`SELECT * FROM actors ORDER BY handle`).all() as ActorRow[]);
-    return rows.map(rowToActor);
+    const where = workspaceId ? 'WHERE workspace_id = @workspaceId' : '';
+    return (this.db.prepare(`SELECT * FROM actors ${where} ORDER BY handle`).all({ workspaceId }) as ActorRow[]).map(rowToActor);
   }
 
   /** Items in one container, newest first. */
@@ -1464,7 +1400,7 @@ export class SqliteStore {
    * the LIMIT caps the work. Only `items` carry the capture linkage today.
    */
   itemsForCapture(captureId: string, limit = 200): Item[] {
-    const esc = captureId.replace(/[\\%_]/g, (c) => `\\${c}`);
+    const esc = escapeLike(captureId);
     const rows = this.db
       .prepare(
         `SELECT * FROM items WHERE source_capture_ids LIKE @needle ESCAPE '\\' ORDER BY ts DESC LIMIT @limit`,
@@ -1476,10 +1412,7 @@ export class SqliteStore {
   /** How many items match, ignoring `limit`/`offset` — the total behind a page. */
   countItems(q: ItemFilter = {}): number {
     const { clause, params } = itemWhere(q);
-    const row = this.db.prepare(`SELECT COUNT(*) AS n FROM items ${clause}`).get(params) as
-      | { n: number }
-      | undefined;
-    return row?.n ?? 0;
+    return (this.db.prepare(`SELECT COUNT(*) AS n FROM items ${clause}`).get(params) as { n: number }).n;
   }
 
   /**
@@ -1499,21 +1432,12 @@ export class SqliteStore {
   searchItems(text: string, q: ItemSearchQuery = {}): Item[] {
     const match = ftsQuery(text);
     if (match === undefined) return [];
-    const where = ['rowid IN (SELECT rowid FROM items_fts WHERE items_fts MATCH @match)'];
-    if (q.containerId) where.push('container_id = @containerId');
-    if (q.adapterId) where.push('adapter_id = @adapterId');
+    const parts = ['rowid IN (SELECT rowid FROM items_fts WHERE items_fts MATCH @match)'];
+    const params: Record<string, unknown> = { match, limit: q.limit ?? 200, offset: q.offset ?? 0 };
+    addEquals(parts, params, q, [['containerId', 'container_id'], ['adapterId', 'adapter_id']], truthy);
     const rows = this.db
-      .prepare(
-        `SELECT * FROM items WHERE ${where.join(' AND ')}
-          ORDER BY ts DESC LIMIT @limit OFFSET @offset`,
-      )
-      .all({
-        match,
-        containerId: q.containerId,
-        adapterId: q.adapterId,
-        limit: q.limit ?? 200,
-        offset: q.offset ?? 0,
-      }) as ItemRow[];
+      .prepare(`SELECT * FROM items ${whereOf(parts, params).clause} ORDER BY ts DESC LIMIT @limit OFFSET @offset`)
+      .all(params) as ItemRow[];
     return rows.map(rowToItem);
   }
 
@@ -1552,6 +1476,28 @@ export class SqliteStore {
       discoveredAt: r.discovered_at,
       credentialKinds: (unj<string[]>(r.credential_kinds) ?? []) as string[],
     }));
+  }
+
+  // ── meta (runner bookkeeping) ────────────────────────────────────────────────
+
+  /**
+   * A numeric `meta` value, or undefined when it is missing or not a finite
+   * number. A corrupted watermark reads as "never ran": one extra full rebuild.
+   */
+  getMetaNumber(key: string): number | undefined {
+    const row = this.db.prepare(`SELECT value FROM meta WHERE key = ?`).get(key) as { value: string } | undefined;
+    const n = row === undefined ? Number.NaN : Number(row.value);
+    return Number.isFinite(n) ? n : undefined;
+  }
+
+  setMetaNumber(key: string, value: number): void {
+    this.db
+      .prepare(`INSERT INTO meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value`)
+      .run(key, String(value));
+  }
+
+  deleteMeta(key: string): void {
+    this.db.prepare(`DELETE FROM meta WHERE key = ?`).run(key);
   }
 
   close(): void {
@@ -1769,8 +1715,7 @@ function rowToFlowTemplate(r: FlowTemplateRow): FlowTemplate {
     version: r.version,
     learnedAt: r.learned_at,
     steps: (unj<FlowTemplate['steps']>(r.steps_json) ?? []) as FlowTemplate['steps'],
-    flowParams: (unj<FlowTemplate['flowParams']>(r.flow_params_json) ??
-      []) as FlowTemplate['flowParams'],
+    flowParams: unj<FlowTemplate['flowParams']>(r.flow_params_json) ?? [],
   };
 }
 function rowToWorkspace(r: WorkspaceRow): Workspace {
@@ -1825,13 +1770,9 @@ function rowToItem(r: ItemRow): Item {
 }
 
 /**
- * Project a store down to {@link ReadOnlyStore} — the view an app's MCP tools get.
- *
- * A fresh object with bound methods rather than the store itself. `SqliteStore`
- * already satisfies `ReadOnlyStore` structurally, so passing it directly would
- * type-check and would hand an app tool `insertCapture`, `pruneCaptures` and the
- * raw `db` handle along with the reads. Narrowing by TYPE alone is a promise the
- * receiver can walk straight through with a cast; narrowing by VALUE is not.
+ * Project a store down to {@link ReadOnlyStore}: a fresh object of bound reads,
+ * because passing the store itself would type-check and hand over its writers
+ * and raw `db` — a type-only narrowing is one cast from undone.
  */
 export function readOnlyStore(store: SqliteStore): ReadOnlyStore {
   return {

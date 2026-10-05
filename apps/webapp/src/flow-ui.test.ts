@@ -110,4 +110,21 @@ describe('flow-ui', () => {
     ];
     assert.equal(matchTemplateForFlow(flow, tmpls)?.id, 't1');
   });
+
+  it('renders a capture shared by two expanded flows once per flow, each with its own membership', () => {
+    // The traffic grid keys rows by flow + capture; a key from the capture alone
+    // collided exactly here.
+    const other: FlowSummary = { ...flow, id: 'flow-2', endedAt: 150 };
+    const rows = buildFlowGroupedRows(
+      [cap({ id: 'c-primary' }), cap({ id: 'c-comp' })],
+      [flow, other],
+      new Set(['flow-1', 'flow-2']),
+    );
+    const shared = rows.filter((r) => r.kind === 'capture' && r.capture.id === 'c-primary');
+    assert.equal(shared.length, 2);
+    assert.deepEqual(
+      shared.map((r) => (r.kind === 'capture' ? r.membership?.flow.id : undefined)),
+      ['flow-1', 'flow-2'],
+    );
+  });
 });

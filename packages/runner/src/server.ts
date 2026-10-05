@@ -4,26 +4,33 @@
  *
  * Security posture (see §2.3 / §15.2 of the plans):
  *   - binds 127.0.0.1 only;
- *   - a random per-session bearer token gates every WS upgrade;
- *   - the WS upgrade also requires a loopback `Host` (anti DNS-rebinding) and,
- *     when present, a loopback `Origin` (a browser always sends one, so this
- *     blocks any other website / tab from subscribing);
+ *   - a random per-session bearer token gates `/api/*` and every WS upgrade. It
+ *     is the SESSION token, not a read token: holding it is full dashboard
+ *     control — reads, replay and flows against live accounts, sync, engine and
+ *     system-proxy control, and every destructive `data.*` operation;
+ *   - both also require a loopback `Host` (anti DNS-rebinding) and, when
+ *     present, an `Origin` that is this runner's own (or the pinned dev UI's) —
+ *     a browser always sends one, so no other website, and no other local port,
+ *     can drive it;
  *   - every capture is re-run through the core redactors before it is persisted
  *     or streamed, so a secret cannot leave the capture path even by accident;
  *   - only a RedactedSession is ever streamed.
  */
 import { randomBytes, timingSafeEqual } from 'node:crypto';
-import { existsSync, readFileSync, statSync } from 'node:fs';
+import { existsSync, readFileSync, statfsSync, statSync } from 'node:fs';
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import { extname, join, normalize, sep } from 'node:path';
 import type { Duplex } from 'node:stream';
 import { WebSocket, WebSocketServer, type RawData } from 'ws';
 
 import {
-  operationName,
-  redactHeaders,
+  redactedErrorMessage as errMsg,
+  matchAdapter,
+  newId,
+  persistCapture,
   redactSession,
-  redactText,
+  workspaceOfParams,
+  workspaceOfValues,
   WS_PROTOCOL_VERSION,
 } from '@sluice/core';
 import { parseClientFrame } from '@sluice/protocol';
@@ -38,11 +45,10 @@ import type {
   EnvironmentMsg,
   ExportMsg,
   FlowRunMsg,
-  ParseResult,
   PtyClientFrame,
   PtyServerFrame,
-  ReplayAction,
   OpProgress,
+  PersistResult,
   ReplayRunMsg,
   ServerMsg,
   Session,
@@ -52,13 +58,17 @@ import type {
   SubscribeMsg,
 } from '@sluice/core';
 import type { TerminalHooks, TerminalSession } from './claude-terminal.js';
-import { ReplayDeniedError, replayBudget, runFlowReplay, runReplay, resolveJsonPath } from '@sluice/interceptor';
+import { ReplayDeniedError, replayBudget, runFlowReplay } from '@sluice/interceptor';
+import { listMaterializedTables, materializeIncremental, rebuildMaterialized } from '@sluice/cartographer';
 import {
-  buildFlowStepRequest,
-  dropMaterialized,
-  faithfulReplayRequest,
-  materialize,
-} from '@sluice/cartographer';
+  anonymousSession,
+  defaultParams,
+  findReplayAction,
+  flowReplayIo,
+  pickSession,
+  runReplayAction,
+  structureActions,
+} from './replay-actions.js';
 
 /** Any capture engine, structurally — only its status() is consumed here. */
 interface EngineLike {
@@ -72,7 +82,7 @@ interface Subscription {
 }
 
 import { APP_VERSION, LOOPBACK_HOST, webappDistDir } from './config.js';
-import { handleApi } from './api.js';
+import { handleApi, json, previewCapture } from './api.js';
 
 /** Pull a bearer token out of an Authorization header, if present. */
 function bearerFrom(header: string | undefined): string {
@@ -86,13 +96,9 @@ const BACKFILL_LIMIT = 2000;
 /** Captures per backfill frame — one frame per capture melted the socket. */
 const BACKFILL_CHUNK = 250;
 /**
- * How many recent broadcast frames are held for resume.
- *
- * Deliberately modest. A `capture.new` frame pins its bodies — up to 5 MB each —
- * in memory for as long as it sits in the ring, and SQLite is still the durable
- * copy: a client that falls off the end gets a full backfill, which is slower
- * but never wrong. This covers a page reload and a laptop-lid reconnect, which
- * is what resume exists for; it is not a replication log.
+ * Broadcast frames held for resume. Modest because each `capture.new` frame pins
+ * preview-capped bodies in memory; SQLite is the durable copy, and a client past
+ * the end gets a full backfill. It covers a reload or reconnect, not replication.
  */
 const RESUME_RING = 500;
 
@@ -173,23 +179,32 @@ export interface StartServerResult {
   broadcastEngineStatus: (s: EngineStatus) => void;
   /** Re-read and broadcast the runner environment (proxy + CA). Wire to the controller. */
   broadcastEnvironment: () => Promise<void>;
+  /**
+   * Send every dashboard these sessions (redacted), for a scan that finishes after
+   * they subscribed — subscribe alone would leave their pickers empty.
+   */
+  announceSessions: (sessions: readonly Session[]) => void;
 }
 
 export async function startServer(opts: StartServerOpts): Promise<StartServerResult> {
   const { store, adapters, port, getSessions, engine, control, terminal } = opts;
+  // The SESSION token gates `/api/*` and `/ws`, and every WS mutation rides it, so
+  // a leak of it is full dashboard control. None of the three secrets is ever
+  // embedded in the served page.
   const token = randomBytes(32).toString('hex');
-  // A THIRD capability secret (after the read token and the pty token), minted
-  // only with `--ingest`. It gates the sole POST the API accepts; the read token
-  // cannot substitute for it, and it is never embedded in any served page.
+  // Only with `--ingest`: gates the sole POST; the session token cannot substitute.
   const ingestToken = opts.ingest ? randomBytes(32).toString('hex') : '';
-  // A SECOND capability secret, minted only when the terminal is enabled and kept
-  // distinct from `token`. Holding the read/mutation token does not let a caller
-  // open a shell: `/pty` checks this one. It rides the URL fragment (`&p=`) the
-  // same way `token` rides `#k=`, so it is never sent to the server on an ordinary
-  // request and never embedded in the served document.
+  // Only with the terminal: `/pty` checks it, so the session token cannot open a
+  // shell. It rides the URL fragment as `&p=`.
   const ptyToken = terminal ? randomBytes(32).toString('hex') : '';
 
-  const clients = new Set<WebSocket>();
+  /** Positive allowlist for caller-supplied adapter ids that reach DDL or deletes (AGENTS.md). */
+  const installedIds = new Set(adapters.map((a) => a.id));
+  function requireInstalled(id: string): string {
+    if (!installedIds.has(id)) throw new Error(`Unknown app "${id}".`);
+    return id;
+  }
+
   /** Every subscribed connection and what it asked to be shown. */
   const subscribers = new Map<WebSocket, Subscription>();
 
@@ -208,82 +223,32 @@ export async function startServer(opts: StartServerOpts): Promise<StartServerRes
    * `ingestCapture`, so pausing silences live traffic without also silencing
    * replay and sync, which are things the user explicitly asked for while paused.
    *
-   * Server-side because the previous pause was not: the UI said "paused" while
-   * the engine went on writing every request to disk. On a capture tool that is
-   * a privacy bug, not a cosmetic one — you pause precisely when you are about
-   * to do something you would rather not record.
+   * Server-side because a pause must actually stop writes: it is a privacy control.
    */
   let capturePaused = false;
 
   // ── one ingest funnel — live captures AND replay results flow through here ──
 
-  function sanitizeCapture(c: Capture): Capture {
-    // Belt-and-suspenders: engines already redact, but a stray secret must never
-    // reach SQLite or the wire, so we redact again right before either happens.
-    return {
-      ...c,
-      reqHeaders: redactHeaders(c.reqHeaders ?? {}),
-      resHeaders: redactHeaders(c.resHeaders ?? {}),
-      reqBody: c.reqBody == null ? c.reqBody : redactText(c.reqBody),
-      resBody: c.resBody == null ? c.resBody : redactText(c.resBody),
-    };
+  /** The app a capture belongs to: its stated (installed) adapter, else whichever one claims it. */
+  function adapterFor(c: Capture): App | undefined {
+    return (c.adapterId ? adapters.find((a) => a.id === c.adapterId) : undefined) ?? matchAdapter(adapters, c);
   }
 
-  function adapterFor(c: Capture): Adapter | undefined {
-    if (c.adapterId) {
-      const byId = adapters.find((a) => a.id === c.adapterId);
-      if (byId) return byId;
+  /**
+   * Persist one capture through the shared funnel (core persistCapture — redact,
+   * attribute, classify, store, parse, seed), then stream it. Replay paths pass
+   * the adapter they replayed for, so attribution never depends on matching.
+   */
+  function ingestCapture(raw: Capture, adapter: Adapter | undefined = adapterFor(raw)): PersistResult {
+    const r = persistCapture(store, raw, adapter);
+    if (r.parseError !== undefined) {
+      console.error(`sluice: ${adapter?.id ?? '?'} parse failed on ${r.capture.id}: ${errMsg(r.parseError)}`);
     }
-    return adapters.find((a) =>
-      a.matchRequest({ host: c.host, path: c.path, method: c.method, url: c.url }),
-    );
-  }
-
-  function ingestCapture(raw: Capture): { capture: Capture; parsed: ParseResult } {
-    const capture = sanitizeCapture(raw);
-    const adapter = adapterFor(capture);
-    if (adapter && !capture.adapterId) capture.adapterId = adapter.id; // attribute to its app
-    // Prefer the adapter's semantic op (cards/:id, not card/SynCard1). Generic
-    // operationName is the fallback for unattributed traffic and adapters without
-    // classify — calling only operationName was how Trello shortLinks and gateway
-    // paths never collapsed and polluted flow templates.
-    if (capture.classification == null && adapter?.classify) {
-      try {
-        const named = adapter.classify(capture);
-        if (named.operation) capture.classification = named.operation;
-      } catch {
-        // classify is contractually non-throwing; never lose a capture to one that does.
-      }
-    }
-    capture.classification ??= operationName(capture.path);
-    // Parsing happens immediately below, so this row is done before it lands.
-    // Writing it here rather than in a second UPDATE keeps it one statement.
-    capture.parsedAt ??= Date.now();
-    store.insertCapture(capture);
-    const parsed: ParseResult = adapter ? adapter.parse(capture) : {};
-    store.applyParseResult(parsed, capture.ts || Date.now());
-    // Seed the worklist from what this response says is still unfetched.
-    //
-    // The cursors table existed and was written by exactly one caller — the CLI
-    // drainer, from inside its own loop — so on a live `sluice start` it was
-    // empty and stayed empty, and `sluice replay --all` had nothing to drain
-    // unless you had already drained something. Every response knows what comes
-    // after it; this is the only place every response passes through.
-    //
-    // Enqueue only, never execute. Seeding is free and bounded (the unique index
-    // dedupes a page seen twice), while replaying is a real call against a real
-    // account and stays behind an explicit command.
-    if (adapter?.nextCursors !== undefined) {
-      try {
-        const seeds = adapter.nextCursors(capture);
-        if (seeds.length > 0) store.enqueueCursors(seeds);
-      } catch {
-        // `nextCursors` is contractually not allowed to throw, and a capture is
-        // not worth losing to one that does anyway.
-      }
-    }
-    broadcast({ type: 'capture.new', capture });
-    if (hasEntities(parsed)) {
+    const { capture, parsed } = r;
+    // A preview: the frame (and the resume ring that holds it) never carries a
+    // multi-MB body; the inspector fetches the whole one by id.
+    broadcast({ type: 'capture.new', capture: previewCapture(capture) });
+    if (parsed.workspaces?.length || parsed.actors?.length || parsed.containers?.length || parsed.items?.length) {
       broadcast({
         type: 'entity.upsert',
         workspaces: parsed.workspaces,
@@ -294,12 +259,12 @@ export async function startServer(opts: StartServerOpts): Promise<StartServerRes
     }
     scheduleBroadcastApps(); // keep the launcher's per-app stats live during capture
     scheduleMaterialize(); // dynamically (re)build the per-app DB as traffic flows
-    return { capture, parsed };
+    return r;
   }
 
   // ── WS send helpers ─────────────────────────────────────────────────────────
 
-  function send(ws: WebSocket, msg: ServerMsg): void {
+  function send(ws: WebSocket, msg: ServerMsg | PtyServerFrame): void {
     if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(msg));
   }
 
@@ -311,26 +276,17 @@ export async function startServer(opts: StartServerOpts): Promise<StartServerRes
   }
 
   /**
-   * Report one operation's progress to every dashboard.
-   *
-   * `fanOut`, not `broadcast`: op progress is transient status, and putting a
-   * finished op in the resume ring would replay it on the next reconnect as if
-   * it had just happened. It carries no `seq` for the same reason `status` does
-   * not — there is nothing to resume.
+   * One operation's progress, to every dashboard. `fanOut`, not `broadcast`:
+   * transient op progress must not be replayed from the resume ring, so no `seq`.
    */
   function emitOp(op: OpProgress): void {
     fanOut({ type: 'op.progress', op });
   }
 
   /**
-   * Write one frame to every subscriber it belongs to.
-   *
-   * ONE `JSON.stringify` shared by all of them. That matters: a capture body can
-   * be 5 MB, and serializing per subscriber made a second dashboard cost as much
-   * as the first. Per-connection filters do not break it, because a filter only
-   * ever DROPS a frame — it never rewrites one — so every connection that
-   * receives this frame receives byte-identical output. The serialization is
-   * lazy, so a frame no connection wants costs nothing at all.
+   * Write one frame to every subscriber it belongs to, with one lazy
+   * `JSON.stringify` shared by all of them (bodies can be 5 MB). Valid because a
+   * filter only DROPS frames and never rewrites them.
    */
   function fanOut(msg: ServerMsg): void {
     let payload: string | undefined;
@@ -342,22 +298,20 @@ export async function startServer(opts: StartServerOpts): Promise<StartServerRes
     }
   }
 
+  /** Seq floor after wipe/delete — clients with sinceSeq below this must full-backfill. */
+  let resumeFloorSeq = 0;
+
   /**
    * Can this client resume from `sinceSeq`, or must it be re-primed from SQLite?
    *
    * Two ways the answer is no, and both must fall back to a full backfill: the
    * ring no longer reaches back that far, or the client names a seq this runner
-   * never issued. The type checks that used to be here as well are now the
-   * schema's job (`@sluice/protocol`), which is why `sinceSeq` arrives as a
-   * non-negative integer or not at all.
+   * never issued.
    *
    * A seq from a PREVIOUS runner cannot get here: a restart mints a new session
    * token, so the stale tab's socket fails the upgrade gate rather than resuming
    * against a counter that has been rewound.
    */
-  /** Seq floor after wipe/delete — clients with sinceSeq below this must full-backfill. */
-  let resumeFloorSeq = 0;
-
   function canResume(sinceSeq: unknown): sinceSeq is number {
     if (typeof sinceSeq !== 'number' || !Number.isInteger(sinceSeq) || sinceSeq < 0) return false;
     if (sinceSeq > seq) return false;
@@ -380,7 +334,6 @@ export async function startServer(opts: StartServerOpts): Promise<StartServerRes
   // ── app catalog (the launcher) ────────────────────────────────────────────────
 
   const PLANNED_APPS: Array<{ id: string; displayName: string }> = [
-    { id: 'notion', displayName: 'Notion' },
     { id: 'linear', displayName: 'Linear' },
     { id: 'jira', displayName: 'Jira' },
     { id: 'discord', displayName: 'Discord' },
@@ -407,10 +360,7 @@ export async function startServer(opts: StartServerOpts): Promise<StartServerRes
 
   /** True once the Cartographer has materialized per-app tables (e.g. <app>_channel). */
   function hasPerAppDb(adapterId: string): boolean {
-    const row = store.db
-      .prepare(`SELECT COUNT(*) AS n FROM sqlite_master WHERE type='table' AND name LIKE ? ESCAPE '\\'`)
-      .get(`${adapterId}\\_%`) as { n: number };
-    return row.n > 0;
+    return listMaterializedTables(store, [adapterId]).length > 0;
   }
 
   /**
@@ -425,11 +375,8 @@ export async function startServer(opts: StartServerOpts): Promise<StartServerRes
       return (a.mcpTools?.() ?? []).map((t) => ({
         name: t.name,
         description: t.description,
-        // `inputSchema` is a zod RAW SHAPE here — a plain object keyed by
-        // parameter name. The MCP SDK converts it to a ZodObject at
-        // registration, and reading keys off THAT yields ZodObject's own
-        // members instead; packages/mcp's test carries the same warning,
-        // having once asserted exactly that and passed for the wrong reason.
+        // `inputSchema` is a zod RAW SHAPE keyed by param name; reading keys off
+        // the converted ZodObject would yield its own members instead.
         params: Object.keys(t.inputSchema ?? {}),
       }));
     } catch {
@@ -444,16 +391,8 @@ export async function startServer(opts: StartServerOpts): Promise<StartServerRes
         id: r.id,
         label: r.label,
         method: r.method,
-        // Every field, not a subset. The UI generates a form from this, so a
-        // dropped `label` shows a raw param name and a dropped `default` makes
-        // the adapter's own sensible starting value unreachable.
-        params: r.params.map((p) => ({
-          name: p.name,
-          kind: p.kind,
-          required: p.required,
-          label: p.label,
-          default: p.default,
-        })),
+        // Every field, not a subset: the UI builds its form from label and default too.
+        params: r.params.map(({ name, kind, required, label, default: def }) => ({ name, kind, required, label, default: def })),
       }));
     } catch {
       return [];
@@ -499,8 +438,7 @@ export async function startServer(opts: StartServerOpts): Promise<StartServerRes
     broadcast({ type: 'apps', apps: computeCatalog() });
   }
 
-  // Debounced so a capture burst produces one catalog refresh rather than one
-  // per request — this used to run inline on every single captured exchange.
+  // Debounced so a capture burst produces one catalog refresh rather than one per request.
   let appsTimer: ReturnType<typeof setTimeout> | undefined;
   function scheduleBroadcastApps(): void {
     if (appsTimer || subscribers.size === 0) return;
@@ -510,31 +448,20 @@ export async function startServer(opts: StartServerOpts): Promise<StartServerRes
     }, 1000);
   }
 
-  // Dynamic DB: debounce a materialize so the per-app tables rebuild after a
-  // capture burst settles, then refresh the catalog so "Local DB" stays live.
-  //
-  // The watermark keeps this incremental. The first pass covers everything
-  // already in the store; each later pass only sees captures that arrived since,
-  // so the cost tracks new traffic instead of total store size. Upserts are
-  // idempotent and keyed, so the resulting tables are identical either way.
+  // Debounced so the per-app tables rebuild after a capture burst settles, then the
+  // catalog refreshes so "Local DB" stays live. Incremental via the watermark, which
+  // the store holds, so a restart resumes rather than rescans; upserts are idempotent.
   let matTimer: ReturnType<typeof setTimeout> | undefined;
-  let materializedThroughTs: number | undefined;
   function scheduleMaterialize(): void {
     if (matTimer) clearTimeout(matTimer);
     matTimer = setTimeout(() => {
       matTimer = undefined;
       try {
-        const startedAt = Date.now();
-        materialize(store, { sinceTs: materializedThroughTs });
-        // Rewind slightly so a capture written while we were scanning is not
-        // skipped by the next pass; re-processing a few rows is free.
-        materializedThroughTs = startedAt - 5_000;
+        materializeIncremental(store);
         broadcastApps();
       } catch (e) {
-        // materialize runs real DDL driven by arbitrary response-body keys, so a
-        // type/name collision is a plausible throw. Swallowing it left the only
-        // symptom as "Local DB: false" with no diagnostic anywhere.
-        const text = `Per-app DB build failed: ${redactText(errMsg(e))}`;
+        // Materialize runs DDL driven by arbitrary response keys, so a throw is plausible: surface it.
+        const text = `Per-app DB build failed: ${errMsg(e)}`;
         console.error(`sluice: ${text}`);
         broadcast({ type: 'notice', level: 'error', text });
       }
@@ -588,8 +515,7 @@ export async function startServer(opts: StartServerOpts): Promise<StartServerRes
 
   /**
    * Prime a client with recent captures (oldest-first) so a page reload does not
-   * wipe the recorder — a capture tool must survive a refresh. Sent in chunks:
-   * one frame per capture meant 2000 serializations and socket writes per reload.
+   * wipe the recorder — a capture tool must survive a refresh. Sent in chunks.
    *
    * Every chunk says `mode: 'full'`, including the empty one. A client that asked
    * to resume and got this instead must replace its buffer rather than fold these
@@ -601,7 +527,7 @@ export async function startServer(opts: StartServerOpts): Promise<StartServerRes
       adapterId: filter?.adapterId,
       tabId: filter?.tabId,
     });
-    const oldestFirst = recent.slice().reverse();
+    const oldestFirst = recent.reverse().map((c) => previewCapture(c));
     for (let i = 0; i < oldestFirst.length; i += BACKFILL_CHUNK) {
       const chunk = oldestFirst.slice(i, i + BACKFILL_CHUNK);
       send(ws, {
@@ -616,12 +542,23 @@ export async function startServer(opts: StartServerOpts): Promise<StartServerRes
     }
   }
 
-  function findAction(actionId: string): { adapter: Adapter; action: ReplayAction } | undefined {
-    for (const adapter of adapters) {
-      const action = adapter.listReplayActions().find((a) => a.id === actionId);
-      if (action) return { adapter, action };
+  /**
+   * The session a dashboard replay or flow acts as — never silently another
+   * account. An explicit `sessionId` must exist; otherwise the workspace the
+   * request's own params imply picks it; otherwise it has to be the app's only
+   * session. Several sessions and nothing to choose between them is an error.
+   */
+  function sessionFor(app: App, sessionId: string | undefined, workspaceId: string | undefined): Session {
+    const mine = getSessions().filter((s) => s.adapterId === app.id);
+    // fast.com, OLX, Gmail: no provider, so no session to find — the same stand-in
+    // the CLI and the MCP server use. A credential-free request carries nothing.
+    if (mine.length === 0 && sessionId === undefined && !app.credentials) return anonymousSession(app.id);
+    if (mine.length === 0 && sessionId === undefined) {
+      throw new Error(`No active ${app.displayName} session — run \`sluice extract-token\` first.`);
     }
-    return undefined;
+    const choice = pickSession(mine, { sessionId, workspaceId }, app.displayName);
+    if (!choice.ok) throw new Error(choice.error);
+    return choice.session;
   }
 
   /**
@@ -642,42 +579,31 @@ export async function startServer(opts: StartServerOpts): Promise<StartServerRes
 
   async function onReplayRun(ws: WebSocket, msg: ReplayRunMsg): Promise<void> {
     try {
-      const match = findAction(msg.actionId);
+      const match = findReplayAction(adapters, msg.actionId);
       if (!match) throw new Error(`Unknown replay action "${msg.actionId}".`);
-      // The action FIRST, then a session belonging to its adapter. It used to be
-      // the other way round, falling back to `sessions[0]` whatever app that
-      // was for — the same defect `onSync` documents and guards against below,
-      // where a Trello session reached Slack's request builder and emitted a
-      // literal `Cookie: cookieHeader`. Here it was worse than noise: the
-      // request went out authenticated as the WRONG ACCOUNT.
-      const sessions = getSessions().filter((s) => s.adapterId === match.adapter.id);
-      const session =
-        (msg.sessionId ? sessions.find((s) => s.id === msg.sessionId) : undefined) ?? sessions[0];
-      if (!session) {
-        throw new Error(
-          `No active ${match.adapter.displayName} session — run \`sluice extract-token\` first.`,
-        );
-      }
-      const req = faithfulReplayRequest(
-        store,
-        match.adapter.buildReplayRequest(match.action, msg.params ?? {}, session),
+      // The action FIRST, then a session belonging to its adapter — a session
+      // handed to another app's builder goes out as the wrong account (see
+      // `onSync`), and so does one picked from the wrong workspace (sessionFor).
+      const session = sessionFor(
+        match.adapter,
+        msg.sessionId,
+        workspaceOfParams(store, match.action, msg.params),
       );
-      // runReplay enforces the safety rails (method / operation / rate budget)
-      // below this layer, so a modified frontend cannot route around them.
-      const result = await runReplay(req); // returns a normalized, secret-redacted Capture
-      const { capture, parsed } = ingestCapture(result);
+      // runReplayAction sends only through runReplay, which enforces the safety
+      // rails (method / operation / host / rate budget) below this layer, so a
+      // modified frontend cannot route around them.
+      const result = await runReplayAction(store, match.adapter, match.action, msg.params ?? {}, session);
+      const { capture, parsed } = ingestCapture(result, match.adapter);
       send(ws, { type: 'replay.result', requestId: msg.requestId, capture, parsed });
-      // The budget moved, so everyone's meter has to. Broadcast rather than
-      // answer: the bucket is process-global — shared with sync, the MCP tools
-      // and the CLI drainer — so a second dashboard's meter is wrong the moment
-      // this one spends a token.
+      // Broadcast rather than answer: the budget bucket is shared by every dashboard,
+      // flow and sync in this process (sluice-mcp and each CLI invocation have their own).
       broadcast(statusFrame());
     } catch (e) {
       const code = e instanceof ReplayDeniedError ? `[${e.code}] ` : '';
       send(ws, {
         type: 'replay.error',
         requestId: msg.requestId,
-        error: `${code}${redactText(errMsg(e))}`,
+        error: `${code}${errMsg(e)}`,
       });
       // A refusal spends nothing, but a denial for `rate_budget_exhausted` is
       // exactly when the meter matters most.
@@ -686,9 +612,11 @@ export async function startServer(opts: StartServerOpts): Promise<StartServerRes
   }
 
   /**
-   * Multi-step flow run from the dashboard (F7.3). Same pipeline as CLI
-   * `sluice replay --flow` and MCP `sluice_replay_flow`: learn template →
-   * buildFlowStepRequest (with app.hosts) → runFlowReplay → per-step runReplay.
+   * Multi-step flow run from the dashboard, the same pipeline as `replay --flow`
+   * and MCP: template → flowStepBuilder (host and read-action rails) →
+   * runFlowReplay → per-step runReplay. No `refresh` hook: sessions here are in
+   * memory, so a refresh could only restart as the same stale session or as
+   * another workspace's.
    */
   async function onFlowRun(ws: WebSocket, msg: FlowRunMsg): Promise<void> {
     try {
@@ -702,40 +630,17 @@ export async function startServer(opts: StartServerOpts): Promise<StartServerRes
       if (!app) {
         throw new Error(`No installed app for adapter "${tmpl.adapterId}".`);
       }
-      const sessions = getSessions().filter((s) => s.adapterId === app.id);
-      const session =
-        (msg.sessionId ? sessions.find((s) => s.id === msg.sessionId) : undefined) ?? sessions[0];
-      if (!session) {
-        throw new Error(
-          `No active ${app.displayName} session — run \`sluice extract-token\` first.`,
-        );
-      }
+      const params = msg.params ?? {};
+      const session = sessionFor(app, msg.sessionId, workspaceOfValues(store, Object.values(params)));
 
       const result = await runFlowReplay({
         template: tmpl,
-        params: msg.params ?? {},
+        params,
         session,
-        io: {
-          build: (step, s, ctx) =>
-            buildFlowStepRequest(tmpl, step, s, {
-              params: ctx.params,
-              priorResponses: ctx.priorResponses,
-              resolvePath: resolveJsonPath,
-              allowedHosts: app.hosts,
-            }),
-          run: (req) => runReplay(req),
-          record: (c) => {
-            c.adapterId = app.id;
-            // Same funnel as single replay: attribute, store, stream, materialize.
-            ingestCapture(c);
-          },
-          refresh: app.credentials
-            ? async () => {
-                const again = getSessions().filter((s) => s.adapterId === app.id);
-                return again[0];
-              }
-            : undefined,
-        },
+        // Same funnel as single replay: attribute, store, stream, materialize.
+        io: flowReplayIo(tmpl, app, (c) => {
+          ingestCapture(c, app);
+        }),
       });
 
       if (result.flow) {
@@ -754,19 +659,9 @@ export async function startServer(opts: StartServerOpts): Promise<StartServerRes
         primaryKey: tmpl.primaryKey,
         flowId: result.flow?.id,
         refreshed: result.refreshed || undefined,
-        error: result.error ? redactText(result.error) : undefined,
-        steps: result.steps.map((s) => ({
-          seq: s.seq,
-          role: s.role,
-          operation: s.operation,
-          method: s.method,
-          path: s.path,
-          status: s.status,
-          captureId: s.captureId,
-          httpStatus: s.httpStatus,
-          detail: s.detail ? redactText(s.detail) : undefined,
-          durationMs: s.durationMs,
-        })),
+        // Already redacted: runFlowReplay's stepFailed scrubs every free text.
+        error: result.error,
+        steps: result.steps,
       });
       broadcast(statusFrame());
     } catch (e) {
@@ -774,7 +669,7 @@ export async function startServer(opts: StartServerOpts): Promise<StartServerRes
       send(ws, {
         type: 'flow.error',
         requestId: msg.requestId,
-        error: `${code}${redactText(errMsg(e))}`,
+        error: `${code}${errMsg(e)}`,
       });
       broadcast(statusFrame());
     }
@@ -809,16 +704,10 @@ export async function startServer(opts: StartServerOpts): Promise<StartServerRes
     }
   }
 
-  // The global Sync button: reconstruct structure for every session/workspace by
-  // replaying each adapter's no-argument "structure" actions (conversations.list,
-  // users.list, …). Results flow through the same ingest funnel (attributed,
-  // stored, streamed, materialized).
-  // No `ws` param: sync progress is BROADCAST via op.progress (every dashboard
-  // watching one runner should see the sync), not answered to the requester.
+  // The global Sync button: replay each adapter's no-arg "structure" actions for
+  // every session through the ingest funnel. Progress is BROADCAST as one keyed
+  // op.progress, so every dashboard sees it, rather than a toast per failure.
   async function onSync(): Promise<void> {
-    // One operation, keyed, so its many steps update a single row instead of
-    // firing (and clobbering) a toast per failed action — the exact failure of
-    // the old notice-per-action loop.
     const requestId = randomBytes(8).toString('hex');
     const sessions = getSessions();
     if (sessions.length === 0) {
@@ -833,22 +722,17 @@ export async function startServer(opts: StartServerOpts): Promise<StartServerRes
         // Only ever hand a session to ITS OWN adapter. Without this a Trello
         // session reached Slack's request builder (emitting a literal
         // `Cookie: cookieHeader` header) and a Slack session reached Trello's
-        // (firing unauthenticated). The CLI's `sluice sync` has always had this
-        // guard; the WS path did not.
+        // (firing unauthenticated).
         if (session.adapterId !== adapter.id) continue;
-        for (const action of adapter.listReplayActions()) {
-          if (action.params.some((p) => p.required)) continue; // only no-arg structure actions
-          const params: Record<string, string> = {};
-          for (const p of action.params) if (p.default != null) params[p.name] = p.default;
+        for (const action of structureActions(adapter)) {
           try {
-            const req = faithfulReplayRequest(store, adapter.buildReplayRequest(action, params, session));
-            const { parsed } = ingestCapture(await runReplay(req));
+            const result = await runReplayAction(store, adapter, action, defaultParams(action), session);
+            const { parsed } = ingestCapture(result, adapter);
             entities +=
               (parsed.containers?.length ?? 0) + (parsed.actors?.length ?? 0) + (parsed.items?.length ?? 0);
             emitOp({ requestId, kind: 'sync', state: 'running', detail: `${session.label} ${action.id}`, count: entities });
           } catch (e) {
-            // Accumulated, not each-a-toast: five failures now leave five lines
-            // in ONE op's detail, all of which survive, instead of one 4.5s toast.
+            // One op's detail accumulates every failure; redacted (errMsg) because it is broadcast to every dashboard.
             failures.push(`${session.label} ${action.id}: ${errMsg(e)}`);
           }
         }
@@ -874,7 +758,7 @@ export async function startServer(opts: StartServerOpts): Promise<StartServerRes
       broadcast({ type: 'environment', ...(await control.environment()) });
     } catch (e) {
       // Advisory; a failure to read the environment must not break control.
-      send0(`environment read failed: ${redactText(errMsg(e))}`);
+      broadcast({ type: 'notice', level: 'error', text: `environment read failed: ${errMsg(e)}` });
     }
   }
 
@@ -892,7 +776,7 @@ export async function startServer(opts: StartServerOpts): Promise<StartServerRes
       // completion for the activity surface.
       emitOp({ requestId, kind: `engine.${action}`, state: 'ok', detail: `Capture ${action === 'start' ? 'started' : 'stopped'}.` });
     } catch (e) {
-      emitOp({ requestId, kind: `engine.${action}`, state: 'error', detail: redactText(errMsg(e)) });
+      emitOp({ requestId, kind: `engine.${action}`, state: 'error', detail: errMsg(e) });
     }
   }
 
@@ -910,13 +794,8 @@ export async function startServer(opts: StartServerOpts): Promise<StartServerRes
     } catch (e) {
       // setProxy on macOS can need admin rights and throws copyable sudo commands;
       // surfacing the message verbatim (redacted) is what makes it actionable.
-      emitOp({ requestId, kind: `proxy.${action}`, state: 'error', detail: redactText(errMsg(e)) });
+      emitOp({ requestId, kind: `proxy.${action}`, state: 'error', detail: errMsg(e) });
     }
-  }
-
-  /** A standalone info notice — used where there is no single client to answer. */
-  function send0(text: string): void {
-    broadcast({ type: 'notice', level: 'error', text });
   }
 
   /**
@@ -935,29 +814,16 @@ export async function startServer(opts: StartServerOpts): Promise<StartServerRes
       emitOp({ requestId, kind, state: 'ok', detail, count });
       scheduleBroadcastApps(); // stats moved; refresh the app catalog
     } catch (e) {
-      emitOp({ requestId, kind, state: 'error', detail: redactText(errMsg(e)) });
+      emitOp({ requestId, kind, state: 'error', detail: errMsg(e) });
     }
   }
 
-  /**
-   * Drop + fully rebuild the derived tables for the given adapters.
-   *
-   * The integrity rule: `materialize` is INSERT-OR-REPLACE only, so it never
-   * removes rows for captures that were just deleted. After ANY capture delete,
-   * the derived tables must be dropped and rebuilt from scratch — an incremental
-   * re-materialize would leave the deleted captures' rows behind.
-   */
-  function rebuildDerived(adapterIds: string[]): number {
-    dropMaterialized(store, adapterIds);
-    // A full rebuild (no sinceTs watermark), and clear the debounce so a pending
-    // incremental pass cannot race in with the stale watermark.
-    if (matTimer) {
-      clearTimeout(matTimer);
-      matTimer = undefined;
-    }
-    const { tables } = materialize(store);
-    materializedThroughTs = Date.now() - 5_000; // full rebuild done; incremental resumes from here
-    return tables.length;
+  /** Drop + fully rebuild the derived tables for the given adapters (see rebuildMaterialized). */
+  function rebuildDerived(adapterIds: readonly string[]): number {
+    // Clear the debounce so a pending incremental pass cannot race in with the
+    // watermark the rebuild is about to reset.
+    clearTimeout(matTimer);
+    return rebuildMaterialized(store, adapterIds).length;
   }
 
   /** Called after any capture delete: reconcile derived tables + drop zombie flows. */
@@ -979,25 +845,20 @@ export async function startServer(opts: StartServerOpts): Promise<StartServerRes
    */
   async function vacuumGuarded(): Promise<void> {
     const dbPath = store.db.name;
+    let free: number | undefined;
+    let dbBytes = 0;
     try {
-      const { statSync } = await import('node:fs');
-      const { statfsSync } = await import('node:fs');
-      const dbBytes = existsSync(dbPath) ? statSync(dbPath).size : 0;
-      try {
-        const fs = statfsSync(dbPath);
-        const free = fs.bavail * fs.bsize;
-        if (free < dbBytes) {
-          throw new Error(
-            `VACUUM needs ~${Math.ceil(dbBytes / 1e6)} MB free but only ${Math.floor(free / 1e6)} MB is available.`,
-          );
-        }
-      } catch (e) {
-        // statfsSync is newer Node; if it is unavailable, skip the pre-check
-        // rather than block the VACUUM — but re-throw a real space error.
-        if (e instanceof Error && e.message.includes('VACUUM needs')) throw e;
-      }
-    } catch (e) {
-      if (e instanceof Error && e.message.includes('VACUUM needs')) throw e;
+      dbBytes = existsSync(dbPath) ? statSync(dbPath).size : 0;
+      const fs = statfsSync(dbPath);
+      free = fs.bavail * fs.bsize;
+    } catch {
+      // ':memory:', or a filesystem that cannot report free space — skip the
+      // pre-check rather than block the VACUUM.
+    }
+    if (free !== undefined && free < dbBytes) {
+      throw new Error(
+        `VACUUM needs ~${Math.ceil(dbBytes / 1e6)} MB free but only ${Math.floor(free / 1e6)} MB is available.`,
+      );
     }
     broadcast({ type: 'notice', level: 'info', text: 'Reclaiming space — the server pauses briefly.' });
     store.vacuum();
@@ -1044,12 +905,7 @@ export async function startServer(opts: StartServerOpts): Promise<StartServerRes
    * same-origin. Honours the pause switch, exactly like live capture.
    */
   async function handleIngest(req: IncomingMessage, res: ServerResponse): Promise<void> {
-    const reply = (status: number, body: unknown): void => {
-      res.statusCode = status;
-      res.setHeader('Content-Type', 'application/json; charset=utf-8');
-      res.setHeader('Cache-Control', 'no-store');
-      res.end(JSON.stringify(body));
-    };
+    const reply = (status: number, body: unknown): void => json(res, status, body);
     if (!ingestToken) return reply(404, { error: 'ingest_disabled', detail: 'Start with --ingest.' });
     if (req.method !== 'POST') return reply(405, { error: 'method_not_allowed' });
     const supplied =
@@ -1062,7 +918,7 @@ export async function startServer(opts: StartServerOpts): Promise<StartServerRes
     try {
       parsed = JSON.parse((await readBody(req, INGEST_MAX_BYTES)).toString('utf8'));
     } catch (e) {
-      return reply(413, { error: 'bad_body', detail: redactText(errMsg(e)) });
+      return reply(413, { error: 'bad_body', detail: errMsg(e) });
     }
     const list = Array.isArray((parsed as { captures?: unknown })?.captures)
       ? ((parsed as { captures: unknown[] }).captures)
@@ -1109,10 +965,26 @@ export async function startServer(opts: StartServerOpts): Promise<StartServerRes
   ].join('; ');
 
   function handleHttp(req: IncomingMessage, res: ServerResponse): void {
+    // Nothing a request carries may take the runner down: a crash here strands a
+    // system proxy pointed at a port nothing listens on.
+    try {
+      routeHttp(req, res);
+    } catch {
+      if (!res.headersSent) res.statusCode = 500;
+      res.end();
+    }
+  }
+
+  function routeHttp(req: IncomingMessage, res: ServerResponse): void {
     res.setHeader('X-Content-Type-Options', 'nosniff');
     res.setHeader('Referrer-Policy', 'no-referrer');
     res.setHeader('Content-Security-Policy', CSP);
-    const url = new URL(req.url ?? '/', `http://${req.headers.host ?? LOOPBACK_HOST}`);
+    const url = parseReqUrl(req);
+    if (!url) {
+      res.statusCode = 400;
+      res.end('Bad Request');
+      return;
+    }
     if (url.pathname === '/ws') {
       res.statusCode = 426;
       res.end('Upgrade Required');
@@ -1121,7 +993,7 @@ export async function startServer(opts: StartServerOpts): Promise<StartServerRes
 
     // The one authenticated POST: passive-capture ingest (Engine C). Handled
     // BEFORE the GET-only `/api/*` gate below, and on its OWN secret — so the
-    // read API stays read-only and the read token cannot post captures.
+    // HTTP API stays read-only and the session token cannot post captures.
     if (url.pathname === '/api/ingest') {
       void handleIngest(req, res);
       return;
@@ -1129,13 +1001,11 @@ export async function startServer(opts: StartServerOpts): Promise<StartServerRes
 
     if (url.pathname.startsWith('/api/')) {
       // The API reads the whole capture store, so it carries exactly the same
-      // gate as the WebSocket upgrade: loopback Host (anti DNS-rebinding), a
-      // loopback Origin when the caller sent one, and the per-session token.
-      // Static assets stay unauthenticated — and now genuinely contain nothing
-      // secret: the token is no longer injected into the served document (see
-      // injectConfig), so a fetch of `/` cannot disclose it.
+      // gate as the WebSocket upgrade: loopback Host (anti DNS-rebinding), our
+      // own Origin when the caller sent one, and the per-session token.
+      // Static assets stay unauthenticated; they hold no secret (the token is never injected, see injectConfig).
       const okHost = isLoopbackHost(req.headers.host, port);
-      const okOrigin = isLoopbackOrigin(req.headers.origin);
+      const okOrigin = isOwnOrigin(req.headers.origin, port);
       const supplied = url.searchParams.get('token') ?? bearerFrom(req.headers.authorization);
       if (!okHost || !okOrigin || !safeEqual(supplied, token)) {
         res.statusCode = 403;
@@ -1161,19 +1031,11 @@ export async function startServer(opts: StartServerOpts): Promise<StartServerRes
   }
 
   function injectConfig(html: string): string {
-    // Injects the NON-SECRET bootstrap config only — the port and WS path — never
-    // the token.
-    //
-    // The token used to be injected here too, and that was a real disclosure: the
-    // static document is served WITHOUT auth (only `/api/*` is gated), so any
-    // local user or process could `curl http://127.0.0.1:<port>/` and read
-    // `window.__SLUICE_TOKEN__` with no credential at all — then use it on `/ws`
-    // and `/api`. The token now travels in the URL FRAGMENT (`/#k=<token>`, the
-    // same path the dev flow already used): the fragment is never sent to the
-    // server, so a fetch of the document cannot contain it, and the client moves
-    // it into sessionStorage and strips it on load (see the webapp's readToken).
-    // The port matters because the webapp once hardcoded 7788, so `--port`
-    // produced a UI that could never connect.
+    // Only the NON-SECRET port and WS path. The static document is served WITHOUT
+    // auth, so an injected token could be read by any local process with curl. The
+    // token travels in the URL fragment (`/#k=`, never sent to the server); the
+    // client moves it to sessionStorage and strips it (the webapp's readToken). The
+    // port is injected so `--port` works.
     const tag =
       `<script>window.__SLUICE_WS_PATH__=${JSON.stringify('/ws')};` +
       `window.__SLUICE_PORT__=${JSON.stringify(port)};</script>`;
@@ -1244,10 +1106,6 @@ export async function startServer(opts: StartServerOpts): Promise<StartServerRes
   let ptyBufferBytes = 0;
   const PTY_BUFFER_MAX = 256 * 1024;
 
-  function sendPty(ws: WebSocket, frame: PtyServerFrame): void {
-    if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(frame));
-  }
-
   /** Buffer output (for re-attach) and forward it to whichever tab is attached now. */
   function ptyOnData(d: string): void {
     ptyBuffer.push(d);
@@ -1255,7 +1113,7 @@ export async function startServer(opts: StartServerOpts): Promise<StartServerRes
     while (ptyBufferBytes > PTY_BUFFER_MAX && ptyBuffer.length > 1) {
       ptyBufferBytes -= (ptyBuffer.shift() ?? '').length;
     }
-    if (ptyWs) sendPty(ptyWs, { t: 'data', d });
+    if (ptyWs) send(ptyWs, { t: 'data', d });
   }
 
   function killPtySession(): void {
@@ -1290,19 +1148,19 @@ export async function startServer(opts: StartServerOpts): Promise<StartServerRes
           ptySession = session;
           session.onData(ptyOnData);
           session.onExit((code) => {
-            if (ptyWs) sendPty(ptyWs, { t: 'exit', code });
+            if (ptyWs) send(ptyWs, { t: 'exit', code });
             if (ptySession === session) killPtySession();
           });
         } catch (e) {
-          sendPty(ws, { t: 'error', message: redactText(errMsg(e)) });
+          send(ws, { t: 'error', message: errMsg(e) });
           ws.close();
           return;
         }
       }
 
-      sendPty(ws, { t: 'ready' });
+      send(ws, { t: 'ready' });
       // Replay recent output so a reloaded tab shows the session as it stands.
-      if (ptyBuffer.length > 0) sendPty(ws, { t: 'data', d: ptyBuffer.join('') });
+      if (ptyBuffer.length > 0) send(ws, { t: 'data', d: ptyBuffer.join('') });
 
       ws.on('message', (data: RawData) => {
         const frame = parsePtyFrame(toText(data));
@@ -1322,15 +1180,28 @@ export async function startServer(opts: StartServerOpts): Promise<StartServerRes
   }
 
   httpServer.on('upgrade', (req: IncomingMessage, socket: Duplex, head: Buffer) => {
-    const url = new URL(req.url ?? '', `http://${req.headers.host ?? LOOPBACK_HOST}`);
+    try {
+      routeUpgrade(req, socket, head);
+    } catch {
+      socket.destroy(); // a malformed handshake must not become an uncaught throw
+    }
+  });
+
+  function routeUpgrade(req: IncomingMessage, socket: Duplex, head: Buffer): void {
+    const url = parseReqUrl(req);
+    if (!url) {
+      socket.write('HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n');
+      socket.destroy();
+      return;
+    }
     const okHost = isLoopbackHost(req.headers.host, port);
 
     if (url.pathname === '/pty') {
       // Stricter than /ws by design. `/ws` tolerates a missing Origin so non-browser
       // clients (tests, CLIs) can connect on the bearer token alone; nothing but the
       // dashboard should ever speak `/pty`, so an absent Origin FAILS CLOSED here.
-      // And it is gated by the SEPARATE pty secret, so the read token cannot open it.
-      const okOrigin = isLoopbackOriginStrict(req.headers.origin);
+      // And it is gated by the SEPARATE pty secret, so the session token cannot open it.
+      const okOrigin = Boolean(req.headers.origin) && isOwnOrigin(req.headers.origin, port);
       const okPtyToken = ptyToken !== '' && safeEqual(url.searchParams.get('token') ?? '', ptyToken);
       if (!ptyWss || !okHost || !okOrigin || !okPtyToken) {
         socket.write('HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n');
@@ -1342,7 +1213,7 @@ export async function startServer(opts: StartServerOpts): Promise<StartServerRes
     }
 
     const okPath = url.pathname === '/ws';
-    const okOrigin = isLoopbackOrigin(req.headers.origin);
+    const okOrigin = isOwnOrigin(req.headers.origin, port);
     const okToken = safeEqual(url.searchParams.get('token') ?? '', token);
     if (!okPath || !okHost || !okOrigin || !okToken) {
       socket.write('HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n');
@@ -1350,10 +1221,9 @@ export async function startServer(opts: StartServerOpts): Promise<StartServerRes
       return;
     }
     wss.handleUpgrade(req, socket, head, (ws) => wss.emit('connection', ws));
-  });
+  }
 
   wss.on('connection', (ws: WebSocket) => {
-    clients.add(ws);
     ws.on('error', () => {
       /* swallow — a dropped local tab is not an error worth crashing on */
     });
@@ -1365,27 +1235,18 @@ export async function startServer(opts: StartServerOpts): Promise<StartServerRes
       terminalEnabled: Boolean(terminal),
     });
     ws.on('message', (data: RawData) => {
-      // Validated, not merely narrowed. This used to be a `type`-string check
-      // and nothing else, so `subscribe.sinceSeq` could be a string, a
-      // `subscribe.filter` could be a number, and `replay.run` handed its
-      // `params` to an adapter's request builder without anyone having looked
-      // at them. Every handler below was written to coerce defensively around
-      // that, which is a rule that has to be remembered at each new call site.
+      // Validated at the trust boundary (@sluice/protocol), not merely narrowed.
       const frame = parseClientFrame(toText(data));
       if (!frame.ok) {
-        // Said out loud rather than dropped. A silently discarded frame presents
-        // as "the socket went quiet", which is diagnosed by reading the runner's
-        // source; a notice puts the reason in the UI that sent it.
+        // Reported as a notice rather than silently dropped.
         send(ws, { type: 'notice', level: 'error', text: `Ignored a malformed message — ${frame.reason}.` });
         return;
       }
       const parsed = frame.msg;
       switch (parsed.type) {
         case 'hello.ok':
-          // The other half of the version handshake. A skew is otherwise
-          // invisible — both ends keep talking, and whatever field one of them
-          // gained is silently absent on the other — so name it here rather
-          // than leave someone debugging an empty panel after a partial upgrade.
+          // The other half of the version handshake: name a protocol skew, because
+          // otherwise both ends keep talking with fields silently missing.
           if (parsed.protocolVersion !== WS_PROTOCOL_VERSION) {
             send(ws, {
               type: 'notice',
@@ -1459,14 +1320,16 @@ export async function startServer(opts: StartServerOpts): Promise<StartServerRes
           break;
         case 'data.rematerialize':
           void onData(parsed.requestId, 'rematerialize', async () => {
-            const ids = parsed.adapterId ? [parsed.adapterId] : adapters.map((a) => a.id);
+            // A caller-supplied id becomes a DROP TABLE prefix, so only an installed app's id is accepted.
+            const ids = parsed.adapterId ? [requireInstalled(parsed.adapterId)] : [...installedIds];
             const rebuilt = rebuildDerived(ids);
             return { detail: `Rebuilt ${rebuilt} table(s).` };
           });
           break;
         case 'data.clearApp':
           void onData(parsed.requestId, 'clearApp', async () => {
-            const app = parsed.adapterId;
+            // Validated before ANY delete, not just before the drop.
+            const app = requireInstalled(parsed.adapterId);
             let removed = 0;
             for (const w of store.listWorkspaces().filter((x) => x.adapterId === app)) {
               store.deleteWorkspace(w.id);
@@ -1495,7 +1358,9 @@ export async function startServer(opts: StartServerOpts): Promise<StartServerRes
           void onData(parsed.requestId, 'wipe', async () => {
             if (parsed.confirm !== 'wipe') throw new Error('Wipe not confirmed.');
             const { captures } = store.wipe();
-            dropMaterialized(store, adapters.map((a) => a.id));
+            // wipe() leaves meta alone; the rebuild drops the tables and resets
+            // the watermark, and over an empty store derives nothing.
+            rebuildDerived(adapters.map((a) => a.id));
             invalidateRing();
             await vacuumGuarded();
             return { count: captures, detail: `Wiped ${captures} capture(s) and all derived data.` };
@@ -1505,7 +1370,6 @@ export async function startServer(opts: StartServerOpts): Promise<StartServerRes
     });
     ws.on('close', () => {
       subscribers.delete(ws);
-      clients.delete(ws);
     });
   });
 
@@ -1521,17 +1385,15 @@ export async function startServer(opts: StartServerOpts): Promise<StartServerRes
   });
 
   async function close(): Promise<void> {
-    if (appsTimer) {
-      clearTimeout(appsTimer);
-      appsTimer = undefined;
-    }
-    if (matTimer) clearTimeout(matTimer);
+    clearTimeout(appsTimer);
+    appsTimer = undefined;
+    clearTimeout(matTimer);
     // Take the terminal down first so its child dies with the server, not orphaned.
     // This is where the persistent session is reclaimed — the runner exiting is
     // its lifetime bound, not a dropped socket.
     killPtySession();
     if (ptyWs) ptyWs.terminate();
-    for (const ws of clients) ws.terminate();
+    for (const ws of wss.clients) ws.terminate();
     await new Promise<void>((resolve) => wss.close(() => resolve()));
     if (ptyWss) await new Promise<void>((resolve) => ptyWss.close(() => resolve()));
     (httpServer as Server & { closeAllConnections?: () => void }).closeAllConnections?.();
@@ -1550,6 +1412,9 @@ export async function startServer(opts: StartServerOpts): Promise<StartServerRes
     },
     broadcastEngineStatus,
     broadcastEnvironment,
+    announceSessions: (list) => {
+      for (const s of list) broadcast({ type: 'session.discovered', session: redactSession(s) });
+    },
   };
 }
 
@@ -1569,20 +1434,22 @@ function frameMatchesFilter(msg: ServerMsg, f: SubscribeFilter): boolean {
   return true;
 }
 
-function hasEntities(pr: ParseResult): boolean {
-  return Boolean(
-    pr.workspaces?.length || pr.actors?.length || pr.containers?.length || pr.items?.length,
-  );
-}
-
 /**
  * Validate + normalize one exchange POSTed to `/api/ingest` into a Capture.
  *
- * Untrusted input, so it is defensive: it requires a method and URL, derives host
- * and path from the URL when the poster omits them, keeps only string header
- * values, and stamps `source: 'ext'`. It does NOT redact — the ingest funnel's
- * `sanitizeCapture` does that for every path, so an extension's own redaction is
- * belt to the server's braces rather than the only line of defence.
+ * Untrusted input — page script can post through the extension bridge — so the
+ * poster decides as little as possible:
+ *   - the id is always minted here: `insertCapture` upserts on id, so a
+ *     caller-chosen id could overwrite any row it names;
+ *   - host and path come only from the (absolute, http/https) URL, never from
+ *     separate `host`/`path` fields, so a post cannot claim `slack.com` for a URL
+ *     on another host. Path is the pathname, as every engine records it;
+ *   - a timestamp from the future is clamped to now;
+ *   - tab fields are not accepted: the extension never sends them.
+ * It keeps only string header values and stamps `source: 'ext'`. It does NOT
+ * redact — the ingest funnel's `redactCapture` does that for every path,
+ * URL-like fields included, so an extension's own redaction is belt to the
+ * server's braces rather than the only line of defence.
  */
 function toExtCapture(raw: unknown): Capture | null {
   if (typeof raw !== 'object' || raw === null) return null;
@@ -1590,17 +1457,14 @@ function toExtCapture(raw: unknown): Capture | null {
   const method = typeof o.method === 'string' ? o.method : null;
   const url = typeof o.url === 'string' ? o.url : null;
   if (!method || !url) return null;
-  let host = typeof o.host === 'string' ? o.host : '';
-  let path = typeof o.path === 'string' ? o.path : '';
-  if (!host || !path) {
-    try {
-      const u = new URL(url);
-      host ||= u.host;
-      path ||= u.pathname + u.search;
-    } catch {
-      /* a non-absolute URL keeps whatever the poster gave */
-    }
+  let u: URL;
+  try {
+    u = new URL(url);
+  } catch {
+    return null; // the extension always posts absolute URLs
   }
+  if (u.protocol !== 'https:' && u.protocol !== 'http:') return null;
+  const now = Date.now();
   const str = (v: unknown): string | null => (typeof v === 'string' ? v : null);
   const headers = (v: unknown): Record<string, string> => {
     const out: Record<string, string> = {};
@@ -1612,27 +1476,34 @@ function toExtCapture(raw: unknown): Capture | null {
     return out;
   };
   return {
-    id: str(o.id) ?? randomBytes(12).toString('hex'),
-    ts: typeof o.ts === 'number' ? o.ts : Date.now(),
+    id: newId('cap'),
+    ts: typeof o.ts === 'number' && Number.isFinite(o.ts) && o.ts > 0 ? Math.min(o.ts, now) : now,
     source: 'ext',
     adapterId: null,
     method,
     url,
-    host,
-    path,
+    host: u.host,
+    path: u.pathname,
     status: typeof o.status === 'number' ? o.status : null,
     durationMs: typeof o.durationMs === 'number' ? o.durationMs : null,
     reqHeaders: headers(o.reqHeaders),
     reqBody: str(o.reqBody),
     resHeaders: headers(o.resHeaders),
     resBody: str(o.resBody),
-    tabUrl: str(o.tabUrl) ?? undefined,
-    tabId: str(o.tabId) ?? undefined,
   };
 }
 
-function errMsg(e: unknown): string {
-  return e instanceof Error ? e.message : String(e);
+/**
+ * The request's URL, or null when it cannot be parsed. Resolved against a
+ * constant base: building it from the `Host` header, before Host was validated,
+ * let one `Host: [` request throw ERR_INVALID_URL and kill the runner.
+ */
+function parseReqUrl(req: IncomingMessage): URL | null {
+  try {
+    return new URL(req.url ?? '/', `http://${LOOPBACK_HOST}`);
+  } catch {
+    return null;
+  }
 }
 
 function toText(data: RawData): string {
@@ -1655,27 +1526,29 @@ function isLoopbackHost(host: string | undefined, port: number): boolean {
   return h === `127.0.0.1:${port}` || h === `localhost:${port}` || h === `[::1]:${port}`;
 }
 
-function isLoopbackOrigin(origin: string | undefined): boolean {
-  // A browser always sends an Origin on a WS handshake, so requiring it to be
-  // loopback blocks any other site. Non-browser clients (tests, CLIs) omit it;
-  // the bearer token is still the hard gate there.
+/** The webapp dev server's pinned port (apps/webapp/vite.config.ts, strictPort). */
+const DEV_UI_PORT = 5273;
+
+/**
+ * Is this Origin the dashboard itself? A browser always sends one, so an exact
+ * allowlist — loopback, http, and THIS runner's port or the pinned dev UI's —
+ * blocks every other website and every other local port, so a compromised dev
+ * server on another port cannot drive the runner with a leaked token.
+ * Non-browser clients (tests, CLIs) omit Origin; the bearer token is still the
+ * hard gate there, and `/pty` refuses an absent one.
+ */
+function isOwnOrigin(origin: string | undefined, port: number): boolean {
   if (!origin) return true;
   try {
-    const { hostname } = new URL(origin);
-    return hostname === '127.0.0.1' || hostname === 'localhost' || hostname === '::1';
+    const u = new URL(origin);
+    if (u.protocol !== 'http:') return false;
+    // WHATWG keeps the brackets on an IPv6 hostname, so this is '[::1]', not '::1'.
+    if (u.hostname !== '127.0.0.1' && u.hostname !== 'localhost' && u.hostname !== '[::1]') return false;
+    const p = u.port === '' ? 80 : Number(u.port);
+    return p === port || p === DEV_UI_PORT;
   } catch {
     return false;
   }
-}
-
-/**
- * Like {@link isLoopbackOrigin} but FAILS CLOSED on an absent Origin. Used only
- * for `/pty`: the terminal is a browser-only feature, so a handshake with no
- * Origin is not a CLI we should accommodate — it is something we should refuse.
- */
-function isLoopbackOriginStrict(origin: string | undefined): boolean {
-  if (!origin) return false;
-  return isLoopbackOrigin(origin);
 }
 
 /**
@@ -1700,44 +1573,29 @@ function parsePtyFrame(text: string): PtyClientFrame | null {
   return null;
 }
 
+const CONTENT_TYPES: Record<string, string> = {
+  '.html': 'text/html; charset=utf-8',
+  '.js': 'text/javascript; charset=utf-8',
+  '.mjs': 'text/javascript; charset=utf-8',
+  '.css': 'text/css; charset=utf-8',
+  '.json': 'application/json; charset=utf-8',
+  '.map': 'application/json; charset=utf-8',
+  '.svg': 'image/svg+xml',
+  '.png': 'image/png',
+  '.jpg': 'image/jpeg',
+  '.jpeg': 'image/jpeg',
+  '.gif': 'image/gif',
+  '.webp': 'image/webp',
+  '.ico': 'image/x-icon',
+  '.woff2': 'font/woff2',
+  '.woff': 'font/woff',
+  '.ttf': 'font/ttf',
+  '.wasm': 'application/wasm',
+  '.txt': 'text/plain; charset=utf-8',
+};
+
 function contentType(file: string): string {
-  switch (extname(file).toLowerCase()) {
-    case '.html':
-      return 'text/html; charset=utf-8';
-    case '.js':
-    case '.mjs':
-      return 'text/javascript; charset=utf-8';
-    case '.css':
-      return 'text/css; charset=utf-8';
-    case '.json':
-    case '.map':
-      return 'application/json; charset=utf-8';
-    case '.svg':
-      return 'image/svg+xml';
-    case '.png':
-      return 'image/png';
-    case '.jpg':
-    case '.jpeg':
-      return 'image/jpeg';
-    case '.gif':
-      return 'image/gif';
-    case '.webp':
-      return 'image/webp';
-    case '.ico':
-      return 'image/x-icon';
-    case '.woff2':
-      return 'font/woff2';
-    case '.woff':
-      return 'font/woff';
-    case '.ttf':
-      return 'font/ttf';
-    case '.wasm':
-      return 'application/wasm';
-    case '.txt':
-      return 'text/plain; charset=utf-8';
-    default:
-      return 'application/octet-stream';
-  }
+  return CONTENT_TYPES[extname(file).toLowerCase()] ?? 'application/octet-stream';
 }
 
 function placeholderHtml(port: number): string {

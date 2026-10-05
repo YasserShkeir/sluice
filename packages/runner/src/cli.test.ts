@@ -10,35 +10,81 @@
  * Every command exercised here returns before it would touch a credential: an
  * unknown `--adapter` is rejected up front, `--list` never acquires a session,
  * and the worklist seeds fed to `replay --all` are deliberately unresolvable, so
- * the drain settles them before it would ask for one. The suite therefore runs
- * on any machine and raises no Keychain prompt.
+ * the drain settles them before it would ask for one — or belong to Toters,
+ * which has nothing to extract. The suite therefore runs on any machine and
+ * raises no Keychain prompt.
  */
 import assert from 'node:assert/strict';
-import { execFile } from 'node:child_process';
-import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync } from 'node:fs';
+import { execFile, execFileSync, spawn } from 'node:child_process';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 import test, { after } from 'node:test';
-import { SqliteStore } from '@sluice/core';
+import { KEYCHAIN_ALLOW_ADVICE, SqliteStore } from '@sluice/core';
+import type { Capture, CredentialHint } from '@sluice/core';
 import { readNdjsonFile } from './ndjson-file.js';
 
 const execFileAsync = promisify(execFile);
 const CLI = fileURLToPath(new URL('./cli.ts', import.meta.url));
+/** tsx resolved from here: a bare `--import tsx` resolves from the CWD, which a test may move. */
+const TSX = import.meta.resolve('tsx');
+
+/**
+ * A throwaway HOME for every spawned CLI. Commands that open a store create and
+ * tighten `~/.sluice`; a test run must never touch the real one — nor read the
+ * real config's app allow-list. Paste-in env vars are cleared for the same
+ * reason: the machine's own environment must not change what a test asserts.
+ */
+const HOME = mkdtempSync(join(tmpdir(), 'sluice-cli-home-'));
+function cliEnv(extra: Record<string, string> = {}): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = { ...process.env, HOME, ...extra };
+  if (!('SLUICE_TOKEN' in extra)) delete env.SLUICE_TOKEN;
+  if (!('SLUICE_COOKIE' in extra)) delete env.SLUICE_COOKIE;
+  return env;
+}
 
 async function run(...args: string[]): Promise<{ code: number; out: string; err: string }> {
-  try {
-    const { stdout, stderr } = await execFileAsync(
-      process.execPath,
-      ['--import', 'tsx', CLI, ...args],
-      { timeout: 60_000 },
-    );
-    return { code: 0, out: stdout, err: stderr };
-  } catch (e) {
-    const x = e as { code?: number; stdout?: string; stderr?: string };
-    return { code: x.code ?? 1, out: x.stdout ?? '', err: x.stderr ?? '' };
+  return runWith({}, ...args);
+}
+
+async function runWith(
+  opts: { env?: Record<string, string>; stdin?: string; cwd?: string },
+  ...args: string[]
+): Promise<{ code: number; out: string; err: string }> {
+  if (opts.stdin === undefined) {
+    try {
+      const { stdout, stderr } = await execFileAsync(process.execPath, ['--import', TSX, CLI, ...args], {
+        timeout: 60_000,
+        env: cliEnv(opts.env),
+        cwd: opts.cwd,
+      });
+      return { code: 0, out: stdout, err: stderr };
+    } catch (e) {
+      const x = e as { code?: number; stdout?: string; stderr?: string };
+      return { code: x.code ?? 1, out: x.stdout ?? '', err: x.stderr ?? '' };
+    }
   }
+  // execFile cannot feed stdin, which `--token -` reads.
+  return new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, ['--import', TSX, CLI, ...args], { env: cliEnv(opts.env), cwd: opts.cwd });
+    let out = '';
+    let err = '';
+    child.stdout.on('data', (d) => {
+      out += String(d);
+    });
+    child.stderr.on('data', (d) => {
+      err += String(d);
+    });
+    const timer = setTimeout(() => child.kill(), 60_000);
+    child.on('error', reject);
+    child.on('close', (code) => {
+      clearTimeout(timer);
+      resolve({ code: code ?? 1, out, err });
+    });
+    child.stdin.end(opts.stdin);
+  });
 }
 
 // ── on-disk fixtures ─────────────────────────────────────────────────────────
@@ -51,6 +97,7 @@ const scratchDirs: string[] = [];
 
 after(() => {
   for (const dir of scratchDirs) rmSync(dir, { recursive: true, force: true });
+  rmSync(HOME, { recursive: true, force: true });
 });
 
 function scratch(): string {
@@ -216,6 +263,7 @@ test('start --help documents the host scoping flags', async () => {
   assert.equal(code, 0);
   assert.match(out, /--host/);
   assert.match(out, /--all-hosts/);
+  assert.match(out, /--lan-proxy/);
   assert.match(out, /default when no --host/i);
 });
 
@@ -223,7 +271,25 @@ test('serve --help documents default all-host decrypt', async () => {
   const { code, out } = await run('serve', '--help');
   assert.equal(code, 0);
   assert.match(out, /--host/);
+  assert.match(out, /--lan-proxy/);
+  assert.match(out, /--lan-allow/);
   assert.match(out, /every host is decrypted/i);
+});
+
+test('--lan-proxy is refused without a --lan-allow client, before anything binds', async () => {
+  // Each of these fails at argument validation, so no store opens and no port
+  // or proxy is bound.
+  for (const cmd of ['serve', 'start']) {
+    const bare = await run(cmd, '--lan-proxy', '--db', join(scratch(), 's.db'));
+    assert.equal(bare.code, 1, `${cmd} --lan-proxy alone`);
+    assert.match(bare.err, /--lan-proxy needs --lan-allow/);
+  }
+  const notIp = await run('serve', '--lan-proxy', '--lan-allow', 'my-phone', '--db', join(scratch(), 's.db'));
+  assert.equal(notIp.code, 1);
+  assert.match(notIp.err, /takes an IP address, not "my-phone"/);
+  const withoutLan = await run('start', '--lan-allow', '192.168.1.50', '--db', join(scratch(), 's.db'));
+  assert.equal(withoutLan.code, 1);
+  assert.match(withoutLan.err, /only applies with --lan-proxy/);
 });
 
 // ── export formats ───────────────────────────────────────────────────────────
@@ -409,12 +475,22 @@ test('replay --all --container leaves the other containers’ work queued', asyn
   }
 });
 
+/** Make a claim look an hour old — past the drainer's lease, so it reads as stranded. */
+function backdateClaim(store: SqliteStore, id: string): void {
+  store.db.prepare(`UPDATE cursors SET updated_ts = @ts WHERE id = @id`).run({ ts: Date.now() - 3_600_000, id });
+}
+
 test('replay --all releases claims a killed drainer stranded', async () => {
   const db = seededDb();
   const store = new SqliteStore(db);
-  store.enqueueCursors([{ adapterId: 'not-an-app', actionId: 'whatever' }]);
-  store.claimCursors(1); // simulate a drainer that died holding the claim
-  assert.equal(store.countCursors().running, 1);
+  store.enqueueCursors([
+    { adapterId: 'not-an-app', actionId: 'whatever', cursor: 'dead' },
+    { adapterId: 'not-an-app', actionId: 'whatever', cursor: 'live' },
+  ]);
+  const [dead] = store.claimCursors(1); // a drainer that died holding the claim an hour ago
+  backdateClaim(store, dead!.id);
+  store.claimCursors(1); // a drainer still running, inside its lease
+  assert.equal(store.countCursors().running, 2);
   store.close();
 
   const { code, err } = await run('replay', '--all', '--db', db);
@@ -423,7 +499,8 @@ test('replay --all releases claims a killed drainer stranded', async () => {
 
   const after = new SqliteStore(db);
   try {
-    assert.equal(after.countCursors().running, 0);
+    assert.equal(after.countCursors().running, 1, "the live drainer's claim is not stolen");
+    assert.equal(after.listCursors({ state: 'running' })[0]?.cursor, 'live');
   } finally {
     after.close();
   }
@@ -433,6 +510,21 @@ test('replay refuses an action id together with --all', async () => {
   const { code, err } = await run('replay', 'slack.users.list', '--all');
   assert.equal(code, 1);
   assert.match(err, /either an action id or --all/);
+});
+
+test('replay --all drains the store the config file names, as every other command does', async () => {
+  // It used to open `--db` or the default only, so a sluice.config.json `db`
+  // was honoured by `replay <action>` and ignored by `replay --all`.
+  const db = seededDb();
+  const store = new SqliteStore(db);
+  store.enqueueCursors([{ adapterId: 'not-an-app', actionId: 'whatever' }]);
+  store.close();
+  const dir = scratch();
+  writeFileSync(join(dir, 'sluice.config.json'), JSON.stringify({ db }));
+
+  const { code, out } = await runWith({ cwd: dir }, 'replay', '--all', '--dry-run');
+  assert.equal(code, 0);
+  assert.match(out, /Would replay 1 item/);
 });
 
 
@@ -535,30 +627,205 @@ const PASTED = ['--token', 'xoxc-not-a-real-token', '--cookie', 'd=not-a-real-co
 test('replay --workspace that matches nothing fails and names the workspaces there are', async () => {
   const { code, err } = await run('replay', 'slack.conversations.list', '--workspace', 'no-such-team', ...PASTED);
   assert.equal(code, 1);
-  assert.match(err, /No workspace matching "no-such-team"\. Have: Slack \(paste-in\)/);
+  // Anchored: the pasted pair made exactly ONE session, not one per app.
+  assert.match(err, /No workspace matching "no-such-team"\. Have: Slack \(paste-in\)$/m);
 });
 
 test('replay --workspace matches a label substring, ignoring case', async () => {
-  // Past the selector, the malformed --param is the next thing to fail, which
-  // shows the workspace was accepted without sending anything.
+  // Past the selector, opening the store is the next step, and this --db cannot
+  // be opened: its parent is a file. Failing there shows the workspace was
+  // accepted, and it fails before any request is built, so nothing is sent.
+  const blocker = join(scratch(), 'not-a-dir');
+  writeFileSync(blocker, '');
   const { code, err } = await run(
     'replay',
     'slack.conversations.list',
     '--workspace',
     'PASTE-IN',
-    '--param',
-    'noequals',
+    '--db',
+    join(blocker, 'x.db'),
     ...PASTED,
   );
   assert.equal(code, 1);
   assert.doesNotMatch(err, /No workspace matching/);
-  assert.match(err, /Bad --param "noequals"/);
+  assert.match(err, /EEXIST|ENOTDIR|not a directory|unable to open/i);
+});
+
+test('replay rejects a malformed --param before acquiring any session', async () => {
+  // No pasted credentials: acquiring a session first would run the extractors
+  // (and, on macOS, could raise a Keychain prompt) only to report a typo.
+  const { code, err } = await run('replay', 'slack.users.list', '--param', 'bad');
+  assert.equal(code, 1);
+  assert.match(err, /Bad --param "bad"/);
+  assert.doesNotMatch(err, /No session/);
+  assert.ok(!err.includes(KEYCHAIN_ALLOW_ADVICE), 'no extraction was started');
 });
 
 test('sync --workspace shares the matcher and the miss message', async () => {
   const { code, err } = await run('sync', '--workspace', 'no-such-team', ...PASTED);
   assert.equal(code, 1);
-  assert.match(err, /No workspace matching "no-such-team"\. Have: Slack \(paste-in\)/);
+  assert.match(err, /No workspace matching "no-such-team"\. Have: Slack \(paste-in\)$/m);
+});
+
+test('replay --flow redacts the error and step detail it prints', async () => {
+  // A step whose built URL carries a token-shaped value in its host is refused
+  // at build time, and the refusal quotes the host. Refused before the network,
+  // so nothing is sent; the value is assembled at runtime so no scanner sees one.
+  const fake = `${['xo', 'xb-'].join('')}1234567890-${'a'.repeat(24)}`;
+  const db = join(scratch(), 'flow-redact.db');
+  const store = new SqliteStore(db);
+  store.upsertFlowTemplate({
+    id: 'tmpl-redact',
+    adapterId: 'slack',
+    primaryKey: 'conversations.history',
+    sampleCount: 1,
+    version: 1,
+    learnedAt: 1_700_000_000_000,
+    flowParams: [],
+    steps: [
+      {
+        seq: 0,
+        role: 'primary',
+        method: 'GET',
+        path: 'https://{h}.example.test/api/x',
+        params: { h: { kind: 'literal', value: fake } },
+        required: true,
+        support: 1,
+        delayMsP50: 0,
+      },
+    ],
+  });
+  store.close();
+
+  const { code, out, err } = await run('replay', '--flow', 'tmpl-redact', '--db', db, ...PASTED);
+  assert.equal(code, 1);
+  assert.match(out, /FAILED/);
+  assert.match(out, /denied/);
+  assert.ok(!`${out}${err}`.includes(fake), 'the token-shaped value is masked');
+});
+
+// ── pasted credentials name ONE app ──────────────────────────────────────────
+
+test('a pasted Slack pair becomes a Slack session only — never another app’s', async () => {
+  // Offered to every provider, the same xoxc-/d= pair also minted a Toters
+  // session, and `sync` sent the Slack token to api.toters-api.com as a Bearer.
+  const { code, err } = await run('sync', '--workspace', 'no-such-team', ...PASTED);
+  assert.equal(code, 1);
+  assert.doesNotMatch(err, /Toters/, 'the pair must not reach another app’s provider');
+});
+
+/** Not Slack-shaped, so only the env/flag binding — not Toters' own xox refusal — keeps it from Toters. */
+const TOTERS_PASTE = ['--token', 'not-a-real-toters-token'];
+
+test('--adapter names the app pasted credentials are for', async () => {
+  const { code, err } = await run('sync', '--adapter', 'toters', '--workspace', 'no-such-team', ...TOTERS_PASTE);
+  assert.equal(code, 1);
+  assert.match(err, /Have: Toters \(pasted token\)$/m);
+  assert.doesNotMatch(err, /Slack/);
+
+  const replay = await run('replay', 'toters.user.info', '--adapter', 'toters', '--workspace', 'no-such-team', ...TOTERS_PASTE);
+  assert.match(replay.err, /Have: Toters \(pasted token\)$/m);
+});
+
+test('a pasted token never reaches the app a replay targets unless --adapter names it', async () => {
+  // SLUICE_TOKEN may be ambient in the shell: `replay <toters action>` used to
+  // hand it to Toters as a Bearer. --workspace keeps every run offline.
+  const env = { SLUICE_TOKEN: 'not-a-real-toters-token' };
+  const r = await runWith({ env }, 'replay', 'toters.user.info', '--workspace', 'no-such-team');
+  assert.equal(r.code, 1);
+  assert.doesNotMatch(r.err, /Toters \(pasted token\)/);
+  assert.match(r.err, /pass --adapter toters/);
+});
+
+test('replay --all never offers a paste to another app’s queued work', async () => {
+  // A resolvable Toters page, so the drain does ask for a session. Missing its
+  // storeId, so even a regression dies in the builder and sends nothing.
+  const db = seededDb();
+  const store = new SqliteStore(db);
+  store.enqueueCursors([{ adapterId: 'toters', actionId: 'toters.store.popular-items' }]);
+  store.close();
+
+  const { code, out, err } = await run('replay', '--all', '--db', db, ...TOTERS_PASTE);
+  assert.equal(code, 0);
+  assert.match(err, /Pasted credentials are for slack, not toters/);
+  assert.match(err, /No toters session/);
+  assert.match(out, /0 replayed, 0 failed, 1 skipped/);
+
+  const after = new SqliteStore(db);
+  try {
+    assert.equal(after.countCursors().pending, 1, 'the page stays queued for a run that has its session');
+    assert.equal(after.countCursors().running, 0);
+  } finally {
+    after.close();
+  }
+});
+
+test('a paste for an app that cannot take one fails instead of reading its local session', async () => {
+  const { code, err } = await run('sync', '--adapter', 'trello', ...TOTERS_PASTE);
+  assert.equal(code, 1);
+  assert.match(err, /trello does not accept pasted --token\/--cookie/);
+  assert.ok(!err.includes(KEYCHAIN_ALLOW_ADVICE), 'no extraction was started');
+});
+
+test('sync rejects an unknown --adapter before touching credentials', async () => {
+  const { code, err } = await run('sync', '--adapter', 'notanapp', ...PASTED);
+  assert.equal(code, 1);
+  assert.match(err, /Unknown adapter "notanapp"/);
+});
+
+test('a literal --token warns that argv is visible; the env var does the same without it', async () => {
+  const literal = await run('sync', '--workspace', 'no-such-team', ...PASTED);
+  assert.match(literal.err, /visible to other local users/);
+
+  const viaEnv = await runWith(
+    { env: { SLUICE_TOKEN: 'xoxc-not-a-real-token', SLUICE_COOKIE: 'd=not-a-real-cookie' } },
+    'sync',
+    '--workspace',
+    'no-such-team',
+  );
+  assert.equal(viaEnv.code, 1);
+  assert.match(viaEnv.err, /Have: Slack \(paste-in\)$/m, 'the same session as the flags');
+  assert.doesNotMatch(viaEnv.err, /visible to other local users/);
+});
+
+test('--token - reads the token from stdin', async () => {
+  const r = await runWith(
+    { stdin: 'xoxc-not-a-real-token\n', env: { SLUICE_COOKIE: 'd=not-a-real-cookie' } },
+    'sync',
+    '--workspace',
+    'no-such-team',
+    '--token',
+    '-',
+  );
+  assert.equal(r.code, 1);
+  assert.match(r.err, /Have: Slack \(paste-in\)$/m);
+  assert.doesNotMatch(r.err, /visible to other local users/);
+});
+
+// ── --dry-run is a preview or it is refused ──────────────────────────────────
+
+test('--dry-run is refused outside --all instead of sending a real request', async () => {
+  const single = await run('replay', 'slack.users.list', '--dry-run', ...PASTED);
+  assert.equal(single.code, 1);
+  assert.match(single.err, /only to --all/);
+
+  const flow = await run('replay', '--flow', 'any-template', '--dry-run');
+  assert.equal(flow.code, 1);
+  assert.match(flow.err, /only to --all/);
+});
+
+test('replay --all --dry-run also lists stranded claims the real run would release', async () => {
+  const db = seededDb();
+  const store = new SqliteStore(db);
+  store.enqueueCursors([{ adapterId: 'slack', actionId: 'slack.conversations.history', containerId: 'C1', cursor: 'p2' }]);
+  const [dead] = store.claimCursors(1); // a drainer that died holding it
+  backdateClaim(store, dead!.id);
+  store.close();
+
+  const { code, out } = await run('replay', '--all', '--dry-run', '--db', db);
+  assert.equal(code, 0);
+  assert.match(out, /Would replay 1 item/);
+  assert.match(out, /stranded claim/);
 });
 
 // ── reparse ──────────────────────────────────────────────────────────────────
@@ -733,4 +1000,177 @@ test('reparse --reapply without --adapter refuses rather than re-deriving everyt
   const { code, err } = await run('reparse', '--reapply');
   assert.equal(code, 1);
   assert.match(err, /--reapply needs --adapter/);
+});
+
+// ── record re-redacts every URL-like field ───────────────────────────────────
+
+test('record masks secrets in path and tabUrl, not only url', async () => {
+  // Rows stored before the ingest funnel redacted URL fields still hold raw
+  // query strings, and a fixture is the artifact that leaves the machine.
+  const dbPath = join(scratch(), 'sluice.db');
+  const store = new SqliteStore(dbPath);
+  store.insertCapture({
+    id: 'cap_url',
+    ts: 1_700_000_000_000,
+    source: 'ext',
+    adapterId: null,
+    method: 'GET',
+    url: 'https://api.example.test/v1/items',
+    host: 'api.example.test',
+    path: '/v1/items?token=not-a-real-0000',
+    status: 200,
+    durationMs: 5,
+    reqHeaders: {},
+    reqBody: null,
+    resHeaders: {},
+    resBody: '{}',
+    tabUrl: 'https://app.example.test/cb?access_token=not-a-real-1111',
+  });
+  store.close();
+
+  const { code, out } = await run('record', '--db', dbPath);
+  assert.equal(code, 0);
+  assert.ok(!out.includes('not-a-real-0000'), 'path is redacted');
+  assert.ok(!out.includes('not-a-real-1111'), 'tabUrl is redacted');
+  assert.match(out, /«redacted»/);
+});
+
+// ── deleting captures rebuilds the derived tables ────────────────────────────
+
+function slackChannelRows(dbPath: string): number {
+  const store = new SqliteStore(dbPath);
+  try {
+    const exists = store.db
+      .prepare("SELECT COUNT(*) AS n FROM sqlite_master WHERE type = 'table' AND name = 'slack_channel'")
+      .get() as { n: number };
+    if (exists.n === 0) return 0;
+    return (store.db.prepare('SELECT COUNT(*) AS n FROM slack_channel').get() as { n: number }).n;
+  } finally {
+    store.close();
+  }
+}
+
+test('prune drops the derived rows of the captures it deletes', async () => {
+  // materialize only ever upserts, so a pruned capture's channel row used to
+  // survive both the prune and every build-db after it.
+  const dbPath = join(scratch(), 'sluice.db');
+  const store = new SqliteStore(dbPath);
+  store.insertCapture({
+    id: 's1',
+    ts: 1_700_000_000_000,
+    source: 'mitm',
+    adapterId: 'slack',
+    method: 'POST',
+    url: 'https://slack.com/api/conversations.list',
+    host: 'slack.com',
+    path: '/api/conversations.list',
+    status: 200,
+    durationMs: 5,
+    reqHeaders: {},
+    reqBody: null,
+    resHeaders: {},
+    resBody: JSON.stringify({ ok: true, channels: [{ id: 'C1', name: 'general' }] }),
+  });
+  store.close();
+
+  const built = await run('build-db', '--db', dbPath);
+  assert.equal(built.code, 0, built.err);
+  assert.equal(slackChannelRows(dbPath), 1, 'precondition: the channel was materialized');
+
+  const pruned = await run('prune', '--max-rows', '0', '--db', dbPath);
+  assert.equal(pruned.code, 0, pruned.err);
+  assert.match(pruned.out, /Rebuilt/);
+  assert.equal(slackChannelRows(dbPath), 0, 'the pruned capture’s derived row is gone');
+
+  const rebuilt = await run('build-db', '--db', dbPath);
+  assert.equal(rebuilt.code, 0, rebuilt.err);
+  assert.equal(slackChannelRows(dbPath), 0, 'and a later build-db does not bring it back');
+});
+
+test('auth --hints lists each credential once, most confident first, and never its value', async () => {
+  const dbPath = join(scratch(), 'auth.db');
+  const store = new SqliteStore(dbPath);
+  const base: Capture = {
+    id: '',
+    ts: 1_700_000_000_000,
+    source: 'mitm',
+    adapterId: null,
+    method: 'GET',
+    url: 'https://api.example.test/v1/me',
+    host: 'api.example.test',
+    path: '/v1/me',
+    status: 200,
+    durationMs: 5,
+    reqHeaders: {},
+    reqBody: null,
+    resHeaders: {},
+    resBody: '{}',
+  };
+  const bearer = { authorization: 'Bearer not-a-real-token-0000' };
+  store.insertCapture({ ...base, id: 'a1', reqHeaders: bearer });
+  store.insertCapture({ ...base, id: 'a2', ts: base.ts + 1, reqHeaders: bearer });
+  store.insertCapture({ ...base, id: 'a3', ts: base.ts + 2, reqHeaders: { cookie: 'sid=not-a-real-cookie-1111' } });
+  store.close();
+
+  const { code, out } = await run('auth', '--hints', '--json', '--db', dbPath);
+  assert.equal(code, 0);
+  const { hints } = JSON.parse(out) as { hints: CredentialHint[] };
+  const keys = hints.map((h) => `${h.location}/${h.name}`);
+  assert.equal(new Set(keys).size, keys.length, 'each location/name once');
+  assert.equal(keys.filter((k) => k === 'header/authorization').length, 1);
+  for (let i = 1; i < hints.length; i++) {
+    assert.ok((hints[i - 1]?.confidence ?? 0) >= (hints[i]?.confidence ?? 0), 'most confident first');
+  }
+  assert.doesNotMatch(out, /not-a-real-token-0000|not-a-real-cookie-1111/, 'previews only, never a value');
+});
+
+// ── writing captured data into a Git worktree ────────────────────────────────
+
+test('record and export warn when they write captured data to an unignored path in a Git worktree', async () => {
+  const db = seededDb();
+  // Real path: macOS temp dirs sit behind a /var → /private/var symlink, which
+  // `git rev-parse --show-toplevel` resolves.
+  const repo = realpathSync(scratch());
+  execFileSync('git', ['init', '-q', repo], { stdio: 'ignore' });
+  writeFileSync(join(repo, '.gitignore'), 'ignored/\n');
+  mkdirSync(join(repo, 'ignored'));
+  const outside = realpathSync(scratch());
+  const WARN = /is inside the Git worktree .* and is not ignored/;
+
+  const tracked = await run('record', '--db', db, '--out', join(repo, 'fixture.ndjson'));
+  assert.equal(tracked.code, 0);
+  assert.match(tracked.err, WARN);
+
+  const ignored = await run('record', '--db', db, '--out', join(repo, 'ignored', 'fixture.ndjson'));
+  assert.equal(ignored.code, 0);
+  assert.doesNotMatch(ignored.err, WARN);
+
+  const elsewhere = await run('record', '--db', db, '--out', join(outside, 'fixture.ndjson'));
+  assert.equal(elsewhere.code, 0);
+  assert.doesNotMatch(elsewhere.err, WARN);
+
+  const exported = await run('export', 'C1', '--format', 'json', '--db', db, '--out', join(repo, 'c1.json'));
+  assert.equal(exported.code, 0, exported.err);
+  assert.match(exported.err, WARN);
+  assert.ok(existsSync(join(repo, 'c1.json')), 'the warning never blocks the write');
+});
+
+test('record and text exports write owner-only files, tightening one that exists', { skip: process.platform === 'win32' }, async () => {
+  // Full mail and message bodies: as private as the 0600 store they came from.
+  const db = seededDb();
+  const dir = scratch();
+  const loose = (name: string): string => {
+    const f = join(dir, name);
+    writeFileSync(f, '');
+    chmodSync(f, 0o644);
+    return f;
+  };
+  for (const out of [join(dir, 'fresh.ndjson'), loose('old.ndjson')]) {
+    assert.equal((await run('record', '--db', db, '--out', out)).code, 0);
+    assert.equal(statSync(out).mode & 0o077, 0, `record --out ${out} is owner-only`);
+  }
+  for (const out of [join(dir, 'fresh.json'), loose('old.json')]) {
+    assert.equal((await run('export', 'C1', '--db', db, '--out', out)).code, 0);
+    assert.equal(statSync(out).mode & 0o077, 0, `export --out ${out} is owner-only`);
+  }
 });

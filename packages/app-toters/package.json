@@ -1,0 +1,22 @@
+{
+  "name": "@sluice/app-toters",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Sluice Toters app: adapter, parser, GET-only replay actions, paste-in credentials, and store-backed MCP tools.",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "node --import tsx --test src/*.test.ts"
+  },
+  "dependencies": {
+    "@sluice/adapter-sdk": "workspace:*",
+    "@sluice/core": "workspace:*",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@types/node": "^20.10.0"
+  }
+}

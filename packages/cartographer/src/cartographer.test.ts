@@ -10,7 +10,17 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { SqliteStore } from '@sluice/core';
 import type { Capture } from '@sluice/core';
-import { buildApiMap, deriveTables, inferSchema, materialize, normalizePath, renderMarkdown } from './index.js';
+import {
+  buildApiMap,
+  deriveTables,
+  inferSchema,
+  materialize,
+  materializeIncremental,
+  MATERIALIZE_WATERMARK_KEY,
+  normalizePath,
+  rebuildMaterialized,
+  renderMarkdown,
+} from './index.js';
 
 function capture(over: Partial<Capture>): Capture {
   return {
@@ -259,6 +269,33 @@ test('materialize keeps an existing id PK when a later batch has no id (no __pk 
   store.close();
 });
 
+test('renderMarkdown survives a response keyed by thousands of record ids', () => {
+  // The regression: `out.push(...renderSchema(child))` passes one ARGUMENT per
+  // line, and V8 throws `Maximum call stack size exceeded` past ~100k of them.
+  // Notion found it — its responses are a `recordMap` keyed by record uuid, so
+  // one endpoint's schema carried ~13,500 sibling properties and `apidoc` died
+  // on a payload only 18 levels deep. A depth bound would not have helped.
+  const store = new SqliteStore(':memory:');
+  const recordMap: Record<string, unknown> = {};
+  for (let i = 0; i < 20_000; i++) {
+    recordMap[`id-${i}`] = { spaceId: 's1', value: { value: { id: `id-${i}`, type: 'page' } } };
+  }
+  store.insertCapture(
+    capture({
+      id: 'notion-like',
+      method: 'POST',
+      url: 'https://app.example.com/api/v3/loadPageChunk',
+      host: 'app.example.com',
+      path: '/api/v3/loadPageChunk',
+      resBody: JSON.stringify({ recordMap }),
+    }),
+  );
+  const md = renderMarkdown(buildApiMap(store));
+  assert.ok(md.includes('## POST /api/v3/loadPageChunk'));
+  assert.ok(md.includes('id-19999'), 'every sibling property is still rendered');
+  store.close();
+});
+
 test('renderMarkdown emits a section per endpoint and leaks no secret values', () => {
   const store = new SqliteStore(':memory:');
   seed(store);
@@ -268,5 +305,97 @@ test('renderMarkdown emits a section per endpoint and leaks no secret values', (
   assert.ok(md.includes('Request params:'));
   assert.ok(md.includes('channels'));
   assert.ok(!md.includes('xoxc')); // redacted token value never appears
+  store.close();
+});
+
+// ── incremental watermark ─────────────────────────────────────────────────────
+
+test('materializeIncremental scans everything once, then only what is new', () => {
+  // The regression: `sluice serve` used to re-derive every table from every
+  // capture on each boot. That is work proportional to the whole store, paid
+  // synchronously before the dashboard could bind a port — tens of seconds on a
+  // multi-gigabyte store, which reads as a hang.
+  const store = new SqliteStore(':memory:');
+  seed(store);
+
+  const first = materializeIncremental(store);
+  assert.equal(first.fullRebuild, true, 'no watermark yet — the first pass is the full one');
+  assert.ok(first.tables.some((t) => t.name === 'slack_channel'));
+  assert.notEqual(store.getMetaNumber(MATERIALIZE_WATERMARK_KEY), undefined);
+
+  const second = materializeIncremental(store);
+  assert.equal(second.fullRebuild, false, 'the watermark survives into the next pass');
+  // Same derived data either way: the pass is narrower, not lossier.
+  const channels = (
+    store.db.prepare('SELECT COUNT(*) AS n FROM slack_channel').get() as { n: number }
+  ).n;
+  assert.equal(channels, 2);
+  store.close();
+});
+
+test('a new capture after the watermark still lands in its table', () => {
+  const store = new SqliteStore(':memory:');
+  seed(store);
+  materializeIncremental(store);
+
+  store.insertCapture(
+    capture({
+      id: 'later',
+      ts: Date.now() + 60_000, // safely past the rewound watermark
+      path: '/api/conversations.list',
+      url: 'https://slack.com/api/conversations.list',
+      resBody: JSON.stringify({ ok: true, channels: [{ id: 'C9', name: 'brand-new' }] }),
+    }),
+  );
+  materializeIncremental(store);
+
+  const row = store.db.prepare('SELECT name FROM slack_channel WHERE id = ?').get('C9') as
+    | { name: string }
+    | undefined;
+  assert.equal(row?.name, 'brand-new');
+  store.close();
+});
+
+test('deleting the watermark forces the next pass to be full again', () => {
+  // Deletes are why this exists: materialize is INSERT-OR-REPLACE only, so a
+  // capture delete is handled by drop + full rebuild, and a surviving watermark
+  // would let the next pass skip the captures that need re-deriving.
+  const store = new SqliteStore(':memory:');
+  seed(store);
+  materializeIncremental(store);
+  assert.equal(materializeIncremental(store).fullRebuild, false);
+
+  store.deleteMeta(MATERIALIZE_WATERMARK_KEY);
+  assert.equal(store.getMetaNumber(MATERIALIZE_WATERMARK_KEY), undefined);
+  assert.equal(materializeIncremental(store).fullRebuild, true);
+  store.close();
+});
+
+test('rebuildMaterialized hands off from its START, so a capture stored mid-rebuild is not skipped', () => {
+  const store = new SqliteStore(':memory:');
+  seed(store);
+  materialize(store);
+  const t0 = 1_800_000_000_000;
+  const realNow = Date.now;
+  let calls = 0;
+  Date.now = () => (calls++ === 0 ? t0 : t0 + 20_000); // the rebuild "takes" 20 s
+  try {
+    const tables = rebuildMaterialized(store, ['slack']);
+    assert.ok(tables.some((t) => t.name === 'slack_channel' && t.rows === 2));
+  } finally {
+    Date.now = realNow;
+  }
+  // Stored by another process after the rebuild's scan began, before it ended.
+  store.insertCapture(
+    capture({
+      id: 'mid',
+      ts: t0 + 1_000,
+      path: '/api/conversations.list',
+      url: 'https://slack.com/api/conversations.list',
+      resBody: JSON.stringify({ ok: true, channels: [{ id: 'C_MID', name: 'mid' }] }),
+    }),
+  );
+  assert.equal(materializeIncremental(store).fullRebuild, false);
+  assert.ok(store.db.prepare('SELECT 1 FROM slack_channel WHERE id = ?').get('C_MID'));
   store.close();
 });

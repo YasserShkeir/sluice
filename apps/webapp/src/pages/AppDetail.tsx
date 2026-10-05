@@ -20,8 +20,10 @@ import { Check, ChevronLeft, Circle } from 'lucide-react';
 import type { AppCatalogEntry, Capture } from '@sluice/core';
 import { appEndpoints, capturesForApp } from '../analytics.js';
 import type { AppEndpointRow } from '../analytics.js';
+import { AppStatusBadge } from '../components/AppCatalog.js';
 import { formatClock } from '../format.js';
 import { Button } from '../ui/button.js';
+import { Kpi } from '../ui/kpi.js';
 import { useLink } from '../router.js';
 
 interface Props {
@@ -72,13 +74,7 @@ export function AppDetail({ id, apps, captures, onFilterTraffic }: Props) {
           </a>
           <div className="flex flex-wrap items-center gap-3">
             <h1 className="m-0 text-[22px] font-semibold text-fg">{app.displayName}</h1>
-            {app.capturing ? (
-              <span className="badge-live">● capturing</span>
-            ) : built ? (
-              <span className="badge-idle">idle</span>
-            ) : (
-              <span className="badge-planned">planned</span>
-            )}
+            <AppStatusBadge app={app} />
             <span className="font-mono text-[11.5px] text-fg-mute">{app.id}</span>
             <div className="ml-auto flex gap-2">
               <Button onClick={() => onFilterTraffic(app.id)} disabled={!built}>
@@ -252,10 +248,7 @@ function BuildStrip({ app }: { app: AppCatalogEntry }) {
       </ul>
       <div className="grid grid-cols-3 gap-2 sm:grid-cols-6">
         {stats.map(([label, value]) => (
-          <div key={label} className="kpi">
-            <div className="kpi-val tabnum">{value.toLocaleString()}</div>
-            <div className="kpi-label">{label}</div>
-          </div>
+          <Kpi key={label} value={value.toLocaleString()} label={label} />
         ))}
       </div>
     </div>

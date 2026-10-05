@@ -37,11 +37,9 @@ import type {
   ReplayAction,
   ReplayRequest,
   Session,
-  Workspace,
 } from '@sluice/core';
-import { operationName } from '@sluice/core';
-import { arr, num, obj, safeJson, str } from '@sluice/adapter-sdk';
-import { csrfTokenFromCookieHeader } from './chrome-cookies.js';
+import { MASK, headerValue, operationName, previewSecret } from '@sluice/core';
+import { actionParam, actionUrl, arr, CHROME_UA, num, obj, safeJson, str } from '@sluice/adapter-sdk';
 
 export const ADAPTER_ID = 'linkedin';
 export const WORKSPACE_ID = 'linkedin';
@@ -51,10 +49,6 @@ export const WORKSPACE_NAME = 'LinkedIn';
 export const JOBS_CONTAINER_ID = 'linkedin:jobs';
 /** Stable container for feed/other items that are not jobs or DMs. */
 export const FEED_CONTAINER_ID = 'linkedin:feed';
-
-/** A real Chrome macOS User-Agent — Voyager rejects non-browser agents. */
-export const CHROME_UA =
-  'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36';
 
 export const LINKEDIN_ORIGIN = 'https://www.linkedin.com';
 
@@ -75,7 +69,6 @@ const P = {
   identity: /[Ii]dentity|[Pp]rofile|normalizedProfiles/i,
   realtime: /^\/realtime\//,
   assety: /\.(js|css|png|jpe?g|gif|webp|svg|woff2?|map)(\?|$)/i,
-  notApi: /^(?!\/voyager\/)/,
 } as const;
 
 export function pathOf(capture: Capture): string {
@@ -231,33 +224,13 @@ function walkObjects(root: unknown, visit: (o: Record<string, unknown>) => void,
 
 // ── Entity builders ──────────────────────────────────────────────────────────────
 
-function workspace(raw?: Record<string, unknown>): Workspace {
+function fixedContainer(id: string, name: string): Container {
   return {
-    id: WORKSPACE_ID,
-    adapterId: ADAPTER_ID,
-    name: WORKSPACE_NAME,
-    domain: 'linkedin.com',
-    raw,
-  };
-}
-
-function jobsContainer(): Container {
-  return {
-    id: JOBS_CONTAINER_ID,
+    id,
     workspaceId: WORKSPACE_ID,
     adapterId: ADAPTER_ID,
     kind: 'other',
-    name: 'Jobs',
-  };
-}
-
-function feedContainer(): Container {
-  return {
-    id: FEED_CONTAINER_ID,
-    workspaceId: WORKSPACE_ID,
-    adapterId: ADAPTER_ID,
-    kind: 'other',
-    name: 'Feed',
+    name,
   };
 }
 
@@ -447,31 +420,15 @@ export function parseLinkedInCapture(capture: Capture): ParseResult {
 
     const jobCardMeta = collectJobCardMeta(body);
 
-    const actors: Actor[] = [];
-    const containers: Container[] = [];
-    const items: Item[] = [];
-    const seenActors = new Set<string>();
-    const seenContainers = new Set<string>();
-    const seenItems = new Set<string>();
+    const actors = new Map<string, Actor>();
+    const containers = new Map<string, Container>();
+    const items = new Map<string, Item>();
+    const add = <T extends { id: string }>(m: Map<string, T>, x: T | undefined): void => {
+      if (x && !m.has(x.id)) m.set(x.id, x);
+    };
     let sawJob = false;
     let sawMe = false;
     let meSummary: Record<string, unknown> | undefined;
-
-    const pushActor = (a: Actor | undefined): void => {
-      if (!a || seenActors.has(a.id)) return;
-      seenActors.add(a.id);
-      actors.push(a);
-    };
-    const pushContainer = (c: Container | undefined): void => {
-      if (!c || seenContainers.has(c.id)) return;
-      seenContainers.add(c.id);
-      containers.push(c);
-    };
-    const pushItem = (i: Item | undefined): void => {
-      if (!i || seenItems.has(i.id)) return;
-      seenItems.add(i.id);
-      items.push(i);
-    };
 
     if (P.me.test(path)) {
       sawMe = true;
@@ -483,7 +440,7 @@ export function parseLinkedInCapture(capture: Capture): ParseResult {
           if (!o) continue;
           if (o.firstName !== undefined || o.lastName !== undefined || o.publicIdentifier) {
             const a = actorFromProfile(o);
-            pushActor(a);
+            add(actors, a);
             if (a && !meSummary) {
               meSummary = {
                 handle: a.handle,
@@ -500,10 +457,10 @@ export function parseLinkedInCapture(capture: Capture): ParseResult {
         }
       }
       const data = root ? obj(root.data) : undefined;
-      if (data && actors.length === 0) {
+      if (data && actors.size === 0) {
         const mini = str(data['*miniProfile']);
         if (mini) {
-          pushActor({
+          add(actors, {
             id: profileIdFromUrn(mini),
             workspaceId: WORKSPACE_ID,
             adapterId: ADAPTER_ID,
@@ -530,7 +487,7 @@ export function parseLinkedInCapture(capture: Capture): ParseResult {
         type.includes('MiniProfile') ||
         type.includes('miniProfile')
       ) {
-        pushActor(actorFromProfile(o));
+        add(actors, actorFromProfile(o));
       }
 
       if (
@@ -543,7 +500,7 @@ export function parseLinkedInCapture(capture: Capture): ParseResult {
         const item = jobToItem(o, capture.id, meta);
         if (item) {
           sawJob = true;
-          pushItem(item);
+          add(items, item);
         }
       }
 
@@ -552,7 +509,7 @@ export function parseLinkedInCapture(capture: Capture): ParseResult {
         isConversationUrn(eu) &&
         (o.conversationParticipants !== undefined || o.lastActivityAt !== undefined)
       ) {
-        pushContainer(conversationToContainer(o));
+        add(containers, conversationToContainer(o));
         for (const p of arr(o.conversationParticipants) ?? []) {
           const po = obj(p);
           if (!po) continue;
@@ -560,7 +517,8 @@ export function parseLinkedInCapture(capture: Capture): ParseResult {
           const member = pt ? obj(pt.member) : undefined;
           if (member) {
             const host = str(po.hostIdentityUrn);
-            pushActor(
+            add(
+              actors,
               actorFromProfile({
                 ...member,
                 entityUrn: host ?? str(po.entityUrn),
@@ -577,20 +535,24 @@ export function parseLinkedInCapture(capture: Capture): ParseResult {
         isMessageUrn(eu) &&
         (o.body !== undefined || o.deliveredAt !== undefined || o.renderContent !== undefined)
       ) {
-        pushItem(messageToItem(o, capture.id));
+        add(items, messageToItem(o, capture.id));
       }
     });
 
-    if (sawJob) pushContainer(jobsContainer());
-    if (items.some((i) => i.containerId === FEED_CONTAINER_ID)) pushContainer(feedContainer());
+    if (sawJob) add(containers, fixedContainer(JOBS_CONTAINER_ID, 'Jobs'));
+    if ([...items.values()].some((i) => i.containerId === FEED_CONTAINER_ID)) {
+      add(containers, fixedContainer(FEED_CONTAINER_ID, 'Feed'));
+    }
 
     const result: ParseResult = {};
-    if (sawMe || actors.length || containers.length || items.length) {
-      result.workspaces = [workspace(meSummary)];
+    if (sawMe || actors.size || containers.size || items.size) {
+      result.workspaces = [
+        { id: WORKSPACE_ID, adapterId: ADAPTER_ID, name: WORKSPACE_NAME, domain: 'linkedin.com', raw: meSummary },
+      ];
     }
-    if (actors.length) result.actors = actors;
-    if (containers.length) result.containers = containers;
-    if (items.length) result.items = items;
+    if (actors.size) result.actors = [...actors.values()];
+    if (containers.size) result.containers = [...containers.values()];
+    if (items.size) result.items = [...items.values()];
     return result;
   } catch {
     return {};
@@ -625,24 +587,16 @@ export function classifyLinkedInCapture(capture: Capture): {
       return { class: 'asset', operation: 'asset' };
     }
     if (!P.voyagerApi.test(path)) {
-      if (P.notApi.test(path) && !path.includes('/voyager/')) {
-        return { class: 'asset', operation: 'asset' };
-      }
+      if (!path.includes('/voyager/')) return { class: 'asset', operation: 'asset' };
       return { class: 'unknown', operation };
     }
     if (P.me.test(path)) return { class: 'auth', operation: 'voyager/api/me' };
     if (P.identity.test(path)) return { class: 'structure', operation };
-    if (P.jobCards.test(path) || /JobPosting|jobsDash|JobsDash/i.test(path)) {
-      return { class: 'messages', operation };
-    }
-    if (P.messaging.test(path)) return { class: 'messages', operation };
+    if (P.jobCards.test(path) || P.messaging.test(path)) return { class: 'messages', operation };
     if (P.graphql.test(path)) {
       const qid = queryIdOf(capture.url) ?? '';
       if (/profile|identity|Me\b|miniProfile/i.test(qid)) return { class: 'structure', operation };
-      if (/job|Job|message|Message|messenger|conversation/i.test(qid)) {
-        return { class: 'messages', operation };
-      }
-      return { class: 'unknown', operation };
+      if (/job|Job|message|Message|messenger|conversation/i.test(qid)) return { class: 'messages', operation };
     }
     return { class: 'unknown', operation };
   } catch {
@@ -719,6 +673,22 @@ const LINKEDIN_REPLAY_ACTIONS: ReplayAction[] = [
 ];
 
 /**
+ * The Voyager `csrf-token` value: LinkedIn's client sends the JSESSIONID cookie's
+ * value (often quoted `"ajax:…"`), and Voyager rejects a request without it even when Cookie is present.
+ */
+export function csrfTokenFromCookieHeader(cookieHeader: string): string | undefined {
+  let value = /(?:^|;)\s*jsessionid\s*=([^;]*)/i.exec(cookieHeader)?.[1]?.trim();
+  if (value === undefined) return undefined;
+  if (
+    (value.startsWith('"') && value.endsWith('"')) ||
+    (value.startsWith("'") && value.endsWith("'"))
+  ) {
+    value = value.slice(1, -1);
+  }
+  return value || undefined;
+}
+
+/**
  * Build a Voyager request with Cookie + csrf-token and browser-like headers.
  *
  * LinkedIn rejects requests missing `csrf-token` even when Cookie is valid.
@@ -734,7 +704,7 @@ export function buildLinkedInReplayRequest(
     session.credentials.values.csrfToken ?? csrfTokenFromCookieHeader(cookieHeader) ?? '';
 
   const headers: Record<string, string> = {
-    'User-Agent': CHROME_UA,
+    'User-Agent': CHROME_UA, // Voyager rejects non-browser agents
     Accept: 'application/vnd.linkedin.normalized+json+2.1',
     'Accept-Language': 'en-US,en;q=0.9',
     'x-restli-protocol-version': '2.0.0',
@@ -754,10 +724,17 @@ export function buildLinkedInReplayRequest(
     if (!keywords) {
       throw new Error('LinkedIn replay action "linkedin.jobs.search" needs keywords.');
     }
-    // Rest.li jobSearch query — keep colons/parens unescaped like the SPA.
+    // Rest.li jobSearch query — the tuple's own ( , : ) stay literal like the
+    // SPA sends them. The keywords VALUE is escaped: a raw `&` would start a new
+    // query param and `#` a fragment. Rest.li 2.0 reserves ( ) , ' : inside
+    // values and encodeURIComponent leaves ( ) ' (and ! *) alone, so those too.
+    const kw = encodeURIComponent(keywords).replace(
+      /[!'()*]/g,
+      (c) => `%${c.charCodeAt(0).toString(16).toUpperCase()}`,
+    );
     const start = params.start ?? '0';
     const count = params.count ?? '25';
-    const query = `(origin:JOB_SEARCH_PAGE_OTHER_ENTRY,keywords:${keywords},spellCorrectionEnabled:true)`;
+    const query = `(origin:JOB_SEARCH_PAGE_OTHER_ENTRY,keywords:${kw},spellCorrectionEnabled:true)`;
     const url =
       'https://www.linkedin.com/voyager/api/voyagerJobsDashJobCards' +
       '?decorationId=com.linkedin.voyager.dash.deco.jobs.search.JobSearchCardsCollection-220' +
@@ -775,41 +752,13 @@ export function buildLinkedInReplayRequest(
     };
   }
 
-  if (action.id === 'linkedin.graphql') {
-    const queryId = params.queryId ?? action.params.find((p) => p.name === 'queryId')?.default;
-    if (!queryId) {
-      throw new Error('LinkedIn replay action "linkedin.graphql" needs a queryId.');
-    }
-    const u = new URL(action.urlTemplate);
-    u.searchParams.set('queryId', queryId);
-    const variables = params.variables;
-    if (variables) u.searchParams.set('variables', variables);
-    return { method: 'GET', url: u.toString(), headers };
+  if (action.id === 'linkedin.graphql' && !actionParam(action, params, 'queryId')) {
+    throw new Error('LinkedIn replay action "linkedin.graphql" needs a queryId.');
   }
-
-  const u = new URL(action.urlTemplate);
-  for (const p of action.params) {
-    const v = params[p.name] ?? p.default;
-    if (v !== undefined && v !== '') u.searchParams.set(p.name, v);
-  }
-  return { method: action.method, url: u.toString(), headers };
+  return { method: action.method, url: actionUrl(action, params), headers };
 }
 
 // ── Credential hints from live captures ──────────────────────────────────────────
-
-function previewSecret(value: string): string {
-  if (value.length <= 12) return '«present»';
-  return `${value.slice(0, 6)}…（${value.length - 6} more）`;
-}
-
-function headerOf(headers: Record<string, string> | undefined, name: string): string | undefined {
-  if (!headers) return undefined;
-  const want = name.toLowerCase();
-  for (const [k, v] of Object.entries(headers)) {
-    if (k.toLowerCase() === want && typeof v === 'string') return v;
-  }
-  return undefined;
-}
 
 /**
  * Surface Cookie / csrf presence. On redacted captures (normal path) values are
@@ -819,30 +768,26 @@ export function extractLinkedInCredentialHints(capture: Capture): CredentialHint
   try {
     if (!matchesLinkedIn(capture.host)) return [];
     const hints: CredentialHint[] = [];
-    const cookie = headerOf(capture.reqHeaders, 'cookie');
-    if (cookie !== undefined) {
-      const redacted = cookie.includes('«redacted»') || cookie === '«redacted»';
+    const hint = (
+      location: CredentialHint['location'],
+      name: string,
+      confidence: number,
+      role: CredentialHint['role'],
+    ): void => {
+      const value = headerValue(capture.reqHeaders, name);
+      if (value === undefined) return;
+      const redacted = value.includes(MASK);
       hints.push({
         adapterId: ADAPTER_ID,
-        location: 'cookie',
-        name: 'cookie',
-        valuePreview: redacted ? '«present»' : previewSecret(cookie),
-        confidence: redacted ? 0.6 : 0.9,
-        role: 'session-cookie',
+        location,
+        name,
+        valuePreview: redacted ? '«present»' : previewSecret(value),
+        confidence: redacted ? 0.6 : confidence,
+        role,
       });
-    }
-    const csrf = headerOf(capture.reqHeaders, 'csrf-token');
-    if (csrf !== undefined) {
-      const redacted = csrf.includes('«redacted»') || csrf === '«redacted»';
-      hints.push({
-        adapterId: ADAPTER_ID,
-        location: 'header',
-        name: 'csrf-token',
-        valuePreview: redacted ? '«present»' : previewSecret(csrf),
-        confidence: redacted ? 0.6 : 0.85,
-        role: 'csrf',
-      });
-    }
+    };
+    hint('cookie', 'cookie', 0.9, 'session-cookie');
+    hint('header', 'csrf-token', 0.85, 'csrf');
     return hints;
   } catch {
     return [];
@@ -859,22 +804,12 @@ export const linkedinAdapter: Adapter = {
   matchRequest(input) {
     return matchesLinkedIn(input.host);
   },
-  parse(capture) {
-    return parseLinkedInCapture(capture);
-  },
-  classify(capture) {
-    return classifyLinkedInCapture(capture);
-  },
-  nextCursors(capture, ctx) {
-    return linkedInNextCursors(capture, ctx);
-  },
+  parse: parseLinkedInCapture,
+  classify: classifyLinkedInCapture,
+  nextCursors: linkedInNextCursors,
   listReplayActions() {
     return LINKEDIN_REPLAY_ACTIONS;
   },
-  buildReplayRequest(action, params, session) {
-    return buildLinkedInReplayRequest(action, params, session);
-  },
-  extractCredentialHints(capture) {
-    return extractLinkedInCredentialHints(capture);
-  },
+  buildReplayRequest: buildLinkedInReplayRequest,
+  extractCredentialHints: extractLinkedInCredentialHints,
 };

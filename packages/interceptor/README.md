@@ -2,8 +2,8 @@
 
 # @sluice/interceptor
 
-Capture engines (MITM, CDP), read-only replay, flow replay, and the process-global
-safety rails. The runner and MCP never open sockets for multi-step work except
+Capture engines (MITM, CDP), rail-checked replay, flow replay, and the
+process-global safety rails. The runner and MCP never open sockets for multi-step work except
 through `runReplay` / `runFlowReplay`.
 
 ## F0 · Capture completeness matrix
@@ -14,28 +14,29 @@ them):
 
 | Class | Engine A — MITM (`mitm-engine.ts`) | Engine C — CDP (`cdp-engine.ts`) | Engine C — extension (`packages/extension`) |
 |---|---|---|---|
-| **Scope gate** | **Default: all hosts** (TLS terminated for everything routed through the proxy). Optional scope via `--host` / `interceptHosts` / `interceptAllHosts: false` → adapter `hosts[]` + extras; non-matching CONNECT is opaque tunnel (no row) | Attaches to every Chrome page target, re-discovering new/closed tabs every 2 s; no host filter at CDP layer — adapter match sets `adapterId` or null | Default-deny host allowlist in `background.js`; unconfigured = inert |
-| **XHR / `fetch`** | Yes (full HTTP on intercepted hosts) | Yes only (`ResourceType` `XHR` \| `Fetch`) | Yes (MAIN-world patch of `fetch` + `XMLHttpRequest`) |
-| **Document / HTML navigations** | Yes if on intercepted host | **Dropped** (not XHR/Fetch) | No (not patched) |
+| **Scope gate** | **Default: all hosts** (TLS terminated for everything routed through the proxy) **except `NEVER_DECRYPT_HOSTS`** (AI-assistant hosts, always tunnelled; see `src/mitm-engine.ts`). Optional scope via `--host` / `interceptHosts` / `interceptAllHosts: false` → adapter `hosts[]` + extras; non-matching CONNECT is opaque tunnel (no row) | Attaches to every Chrome page target, re-discovering new/closed tabs every 2 s; no host filter at CDP layer — adapter match sets `adapterId` or null | Default-deny host allowlist in `background.js`; unconfigured = inert |
+| **Remote HTTP proxy client / LAN bind** | Default listen `127.0.0.1`. `--lan-proxy` rebinds to `0.0.0.0` so a phone on this Wi-Fi can CONNECT, and only the `--lan-allow` addresses (`MitmEngineOptions.lanClients`) plus loopback are accepted — every other connection is dropped before the proxy reads it; CA at `/sluice-ca.mobileconfig` (iOS profile), `/sluice-ca.cer` and `/sluice-ca.pem` on the MITM port only when LAN. Dashboard/WS stay loopback. Not a VPN. | Desktop Chrome only | Desktop Chrome only |
+| **XHR / `fetch`** | Yes (full HTTP on intercepted hosts) | Yes (`ResourceType` `XHR` \| `Fetch`) | Yes (MAIN-world patch of `fetch` + `XMLHttpRequest`) |
+| **Document / HTML navigations** | Yes if on intercepted host | Captured when an installed adapter claims the host (`shouldCaptureCdpResource`); otherwise dropped | No (not patched) |
 | **Scripts, CSS, images, fonts, media** | Yes if on intercepted host (can be noisy) | **Dropped** | No |
 | **`navigator.sendBeacon` / Ping** | Yes if ordinary HTTP on intercepted host | **Dropped** (not XHR/Fetch) | **No** (not patched) |
 | **WebSocket frames** | **Text frames only** by default (`captureWebSockets`); binary frames are dropped with no row | **Text frames only** by default (opcode 1); binary frames are dropped | **No** (documented limitation) |
 | **Request body** | Always attempted; a read failure yields null rather than dropping the row | `requestWillBeSent`'s `request.postData` when Chrome supplies it, else null | String bodies only — `FormData` / `Blob` / `URLSearchParams` / `ArrayBuffer` / stream bodies are recorded as null |
 | **Response body decode** | **Textual content-types only** — `json`, `text`, `xml`, `javascript`, `html`, `x-www-form-urlencoded`, `graphql`, `csv`, `+json`, or an empty content-type. Anything else (protobuf, `application/octet-stream`, grpc-web, msgpack) stores the row with `resBody: null` | Any type via `Network.getResponseBody`, base64-decoded when flagged; an evicted or opaque body yields null and the row is still emitted | Response text via `res.clone().text()`; an XHR whose `responseType` is not `''`/`text` yields an empty body |
-| **Body cap** | 5,000,000 chars, with a `…[truncated N chars]` marker | 5,000,000 chars | 512 KiB per body, clipped in `inject.js` and again in `content.js` |
+| **Body cap** | 5,000,000 chars, with a `…[truncated N chars]` marker | Same cap and marker (request and response bodies, frames) | 512 KiB per body, clipped in `inject.js` and again in `content.js` |
 | **Correlation on `Capture`** | `wsId` + `direction` for frames | `tabId`, `tabUrl`, `loaderId` (aliased to `pageLoadId`), `wsId`, `direction` | Runner sets `source: 'ext'`; tab fields depend on ingest |
 | **F0.3 correlation** | none — MITM captures carry no page-load ids | CDP emits `loaderId` / `pageLoadId` when present | extension may omit |
 
 ### Design rules that matter for flows
 
 1. **MITM defaults to full decrypt; scoping is opt-in.** With no host flags, Engine A
-   terminates TLS for every host so unknown services are still captured (unattributed
-   until an adapter claims them). Once you pass `--host` or set `interceptHosts` /
+   terminates TLS for every host except `NEVER_DECRYPT_HOSTS`, so unknown services are
+   still captured (unattributed until an adapter claims them). Once you pass `--host` or set `interceptHosts` /
    `interceptAllHosts: false`, non-listed hosts are CONNECT-tunnelled. Do not add a
    pre-store “API-shaped only” filter on Engine A without an explicit product decision.
-2. **CDP deliberately drops non-XHR/Fetch.** Companions that only appear as
-   document navigations or beacons will not join CDP bursts; prefer MITM or the
-   extension for those clients, or accept thinner templates.
+2. **CDP keeps XHR/Fetch, plus Document only on adapter-claimed hosts.** Beacons,
+   and navigations on hosts no adapter claims, will not join CDP bursts; prefer
+   MITM or the extension for those clients, or accept thinner templates.
 3. **Extension does not see WebSockets.** RTM/socket companions require MITM or CDP.
 4. **Clustering prefers correlation ids.** `cartographer/flows.ts` keys a burst on
    `pageLoadId ?? loaderId ?? navigationId` when the capture has one (a same-document
@@ -48,10 +49,10 @@ them):
 
 | Path | Status |
 |---|---|
-| MITM: matched host → store (redact on ingest) | OK — no path filter after decrypt |
+| MITM: matched host → store (redact on ingest) | OK — the only path filter after decrypt is `isCaDownloadPath`: `/sluice-ca.pem`, `.cer` and `.mobileconfig` are never stored, on any host |
 | MITM: non-textual response body | **Same-host body drop.** The row is stored, `resBody` is null. Not a row drop, but the burst carries less than it looks like |
 | MITM / CDP: binary WebSocket frames | Dropped with no row on both engines |
-| CDP: only type filter is XHR/Fetch | Intentional; not a silent host drop |
+| CDP: type filter is XHR/Fetch, plus Document on adapter-claimed hosts | Intentional; not a silent host drop |
 | CDP: `loadingFailed` | The pending exchange is deleted — a failed request produces no capture at all |
 | Extension: host allowlist only | OK — default deny until configured |
 | Replay / import / WS-as-primary clustering | Skipped by design in `clusterCapturesIntoFlows` |
@@ -60,43 +61,53 @@ them):
 
 `src/index.ts` is the whole public surface.
 
-**Engines** — `MitmEngine`, `tlsInterceptList(adapters, extraHosts)` (unions every
-adapter's `hosts` with the extras and adds a `*.host` wildcard for any entry that
-lacks one), `CdpEngine`.
+**Engines** — `MitmEngine`, `LAN_LISTEN_HOST`, `NEVER_DECRYPT_HOSTS` (the frozen
+list all-hosts mode tunnels instead of decrypting; scoped mode decrypts only what
+it names anyway), `CdpEngine`. Host scoping (`tlsInterceptList` in
+`mitm-engine.ts`) unions every adapter's `hosts` with the extras and adds a
+`*.host` wildcard for any entry that lacks one. Both engines build every Capture through `capture-build.ts`
+(`redactedCapture`, which applies core's `redactCapture` — headers, bodies,
+`url`, `path`, `tabUrl` and `classification`), and core's `matchAdapter` reports
+and skips a `matchRequest` that throws. `--lan-proxy` clients are gated by
+`MitmEngineOptions.lanClients` (loopback is always admitted).
 
-**Chrome** — `launchDebugChrome`, `defaultChromePath`, `defaultChromeProfileDir`.
+**Chrome** — `launchDebugChrome`, `defaultChromeProfileDir`.
 The launcher spawns Chrome with `--remote-debugging-port`, its own
-`--user-data-dir` (default `~/.sluice/chrome`), `--no-first-run`,
-`--no-default-browser-check`, `--remote-allow-origins=*` and optional
-`--headless=new`, then polls `/json/version` every 200 ms with a 15 s deadline.
+`--user-data-dir` (default `~/.sluice/chrome`, created 0700), `--no-first-run`,
+`--no-default-browser-check` and optional `--headless=new`, then polls
+`/json/version` every 200 ms with a 15 s deadline. It deliberately does not pass
+`--remote-allow-origins`: the CDP client sends no Origin header, and the flag
+would only let web pages drive the signed-in debug browser.
 Because it is a dedicated profile, you sign in *inside* that Chrome — or attach
 to your own with `sluice capture --no-launch`.
 
 **CA** — `ensureSluiceCA()` and `sluiceCaCertPath()`. The root lives at
-`~/Library/Application Support/Sluice/ca` on macOS (`~/.sluice/ca` elsewhere) as
-`sluice-ca.key` (0600) and `sluice-ca.cert` (0644). `ensureSluiceCA` reuses the
+`~/Library/Application Support/Sluice/ca` on macOS (`~/.sluice/ca` elsewhere,
+created 0700) as `sluice-ca.key` (0600) and `sluice-ca.cert` (0644). `ensureSluiceCA` reuses the
 pair whenever both files exist and otherwise mints one; `sluiceCaCertPath`
 reports the path *without* generating anything, so callers can test for
 existence without the side effect. `MitmEngine.start()` and `sluice ca-install`
 share this one definition — start **generates** the CA, only `ca-install`
 **trusts** it.
 
-**Supervision** — `superviseEngine`, `backoffMs`. Probes every 5 s (the runner's
+**Supervision** — `superviseEngine`. Probes every 5 s (the runner's
 MITM probe is a TCP connect to the proxy port), allows at most 5 consecutive
-restarts, and backs off 1 s / 2 s / 4 s / 8 s / 16 s. It acts only on an engine
+restarts, and backs off 1 s / 2 s / 4 s / 8 s / 16 s (`backoffMs`). It acts only on an engine
 that self-reports `running`, and a probe that throws counts as unhealthy. A
 supervisor is single-use, so the controller builds a fresh one per start.
 
-**Replay** — `runReplay`, `assertReplayAllowed`, `replayBudget`,
-`ReplayDeniedError`, `withReplaySlot`, and `replayWithRefresh`.
+**Replay** — `runReplay` (which applies `assertReplayAllowed` and
+`withReplaySlot` from `replay-policy.ts`), `replayBudget`, `ReplayDeniedError`,
+and `replayWithRefresh`.
 `replayWithRefresh` runs `runReplay`, and on `isAuthFailure` re-extracts the
 session and runs *exactly once* more, rebuilding the request from the fresh
 session and recording both attempts (failure first). It must sit **above**
 `runReplay` — calling `runReplay` from inside anything `runReplay` invoked
 deadlocks on the single-flight promise.
 
-**Flow replay** — `runFlowReplay`, `resolveJsonPath`, `nextPaceWaitMs`,
-`FLOW_DELAY_CAP_MS`, `DEFAULT_FLOW_TIMEOUT_MS`.
+**Flow replay** — `runFlowReplay`. Pacing (`nextPaceWaitMs`, capped by
+`FLOW_DELAY_CAP_MS`) and the default deadline (`DEFAULT_FLOW_TIMEOUT_MS`) live in
+`flow-replay.ts`. A result's `error` and `steps[].detail` come back redacted.
 
 **Credential forensics** — `mapAuthFlow` (correlates capture history into
 issuers by evidence: `Set-Cookie` minus known analytics cookies, plus
@@ -114,27 +125,31 @@ rejects with an opaque `fetch failed`.
 
 ## Rails
 
-Three independent, process-global gates sit below every caller — CLI, dashboard,
-sync and MCP alike. There is no path to the network from Sluice that skips them.
+Independent gates sit below every caller — CLI, dashboard, sync and MCP alike.
+There is no path to the network from Sluice that skips them. They are per
+process: the runner, each CLI command and `sluice-mcp` each hold their own budget
+and slot.
 
 | Gate | Value | Failure |
 |---|---|---|
-| Method allowlist | `GET`, `HEAD`, `POST` | `ReplayDeniedError` `method_not_allowed` |
-| Operation denylist | `looksLikeDeniedOperation` from `@sluice/core`, matched against path + query **and** the request body | `ReplayDeniedError` `operation_not_allowed` |
-| Rate budget | Token bucket, 60 requests per 60 s, process-global | `ReplayDeniedError` `rate_budget_exhausted`, with a retry-in estimate |
+| Method allowlist | `isReplayMethodAllowed` from `@sluice/core`: `GET`, `HEAD`, `POST` | `ReplayDeniedError` `method_not_allowed` |
+| Operation denylist | `looksLikeDeniedReplay` from `@sluice/core` — the same check the flow build gate runs: path + query **and** the request body, as sent and percent-decoded, plus method-override headers and `_method` fields. A best-effort heuristic, not a proof of non-mutation | `ReplayDeniedError` `operation_not_allowed` |
+| Host allowlist | `replayHostAllowed` from `@sluice/core`; `runReplay` requires `allowedHosts` (the owning app's hosts): the URL host must be one of them or a subdomain. An empty list allows nothing | `ReplayDeniedError` `host_not_allowed` |
+| Rate budget | Token bucket, 60 requests per 60 s, per process | `ReplayDeniedError` `rate_budget_exhausted`, with a retry-in estimate |
 | Concurrency | `withReplaySlot` — single-flight, one in-flight promise chain, kept alive on rejection so a failure cannot wedge it | serialized, never concurrent |
 | Timeout | 20 s, covering the response **body** read | throws `replay request failed: <redacted>` |
 | Body cap | 5,000,000 chars before redaction | truncated |
+| Redirects | Never followed (`redirect: 'manual'`); the rails checked only the original URL | the 3xx itself is the capture, `Location` redacted |
 
 Any HTTP status, including 4xx and 5xx, comes back as a `Capture` with
 `source: 'replay'` and `adapterId: null` — only a network-level failure throws.
 Attribution is the caller's job.
 
-Flow steps add a fourth build-time rail on top of the same runtime gates:
-`buildFlowStepRequest` enforces `allowedHosts` against the owning adapter's
-declared hosts (exact match or a subdomain of the apex, `*.` stripped), plus
-`path_unresolved` when a placeholder survives into the assembled URL.
-Single-request replay has no host rail. Each step charges its own budget token,
+Flow steps add build-time rails on top of the same runtime gates:
+`flowStepBuilder(template, app)` enforces the owning adapter's declared hosts
+(the same core matcher), refuses a non-GET/HEAD step that matches none of the
+adapter's replay actions, and raises `path_unresolved` when a placeholder
+survives into the assembled URL or a path value is `.` / `..`. Each step charges its own budget token,
 inter-step waits are capped at 2 s, and the whole flow times out at 120 s. An
 auth failure on any step stops the flow and triggers exactly one whole-flow
 restart after a credential refresh.
@@ -143,4 +158,4 @@ restart after a credential refresh.
 
 - Single-request fidelity: `packages/cartographer/src/faithful.ts`
 - Multi-step learn/run: `flow-learn.ts`, `flow-build.ts`, `flow-replay.ts`
-- Rails: `replay-policy.ts` (method, operation denylist, budget)
+- Rails: `replay-policy.ts` (method, operation denylist, host allowlist, budget)

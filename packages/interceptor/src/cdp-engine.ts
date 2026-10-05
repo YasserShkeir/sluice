@@ -8,6 +8,11 @@
  * unusual happens, which is the whole point: the traffic is the client's own, and
  * no CA cert or proxy is involved.
  *
+ * XHR/Fetch are captured on every host. Document navigations are captured only
+ * when an installed adapter claims the host — SPA listing pages (OLX
+ * `__NEXT_DATA__`) never issue a Fetch for the payload that is already in the
+ * HTML, so dropping Document left those apps with zero items.
+ *
  * It attaches to EVERY page target, not one:
  *   - a sign-in flow that opens a new tab used to produce nothing at all,
  *   - a second workspace in a second tab was invisible,
@@ -22,8 +27,9 @@
  * a Capture is emitted.
  */
 import type CDPType from 'chrome-remote-interface';
-import { newId, redactHeaders, redactText, redactUrl, splitUrl } from '@sluice/core';
+import { matchAdapter, redactedErrorMessage, redactUrl, splitUrl } from '@sluice/core';
 import type { Adapter, Capture, EngineStatus, FrameDirection } from '@sluice/core';
+import { capBody, redactedCapture, wsFrameCapture } from './capture-build.js';
 
 /**
  * chrome-remote-interface is loaded on demand.
@@ -36,7 +42,6 @@ async function cdp(): Promise<typeof CDPType> {
   return (await import('chrome-remote-interface')).default;
 }
 
-const MAX_BODY = 5_000_000;
 /** How often to re-poll for tabs opened since we attached. */
 const DISCOVER_INTERVAL_MS = 2_000;
 
@@ -79,6 +84,17 @@ interface RespReceived {
 interface WithRequestId {
   requestId: string;
 }
+
+/**
+ * CDP records every resource type. We want API calls always, plus the HTML
+ * document when an adapter already claims the host (listing pages that embed
+ * JSON rather than refetching it). Scripts, images, CSS stay out.
+ */
+export function shouldCaptureCdpResource(type: string, adapterMatched: boolean): boolean {
+  if (type === 'XHR' || type === 'Fetch') return true;
+  return type === 'Document' && adapterMatched;
+}
+
 interface GetBodyResult {
   body: string;
   base64Encoded: boolean;
@@ -186,7 +202,8 @@ export class CdpEngine {
       this.setState('running', this.describeAttachment());
       return { port: this.port };
     } catch (e) {
-      this.setState('error', e instanceof Error ? e.message : String(e));
+      // Redacted: the status detail is broadcast and logged.
+      this.setState('error', redactedErrorMessage(e));
       throw e;
     }
   }
@@ -201,7 +218,7 @@ export class CdpEngine {
     const n = this.attached.size;
     const first = [...this.attached.values()][0];
     return n === 1
-      ? `attached to Chrome :${this.port} (${first?.url || 'page'})`
+      ? `attached to Chrome :${this.port} (${redactUrl(first?.url) || 'page'})`
       : `attached to Chrome :${this.port} (${n} tabs)`;
   }
 
@@ -217,8 +234,12 @@ export class CdpEngine {
         return; // Chrome may be shutting down; the disconnect handlers will cope
       }
       const live = new Set(targets.map((t) => t.id));
+      // Tab URLs are refreshed on this poll, so a capture's tabUrl is accurate to
+      // within DISCOVER_INTERVAL_MS rather than frozen at attach time.
       for (const t of targets) {
-        if (!this.attached.has(t.id) && !this.attaching.has(t.id)) await this.attach(t);
+        const entry = this.attached.get(t.id);
+        if (entry) entry.url = t.url;
+        else if (!this.attaching.has(t.id)) await this.attach(t);
       }
       // Drop bookkeeping for tabs that are gone; their client emits 'disconnect'
       // too, but polling also covers a target that vanished without one.
@@ -288,11 +309,7 @@ export class CdpEngine {
     for (const k of [...this.pending.keys()]) {
       if (k.startsWith(`${id}:`)) this.pending.delete(k);
     }
-    try {
-      void entry.client.close();
-    } catch {
-      /* already gone */
-    }
+    void entry.client.close();
     if (this.stopping) return;
     // Capture only truly ends when the last tab goes.
     if (this.attached.size === 0) this.setState('stopped', `Chrome DevTools connection closed (${why})`);
@@ -305,12 +322,14 @@ export class CdpEngine {
 
   private onRequest(tab: Attached, p: ReqWillBeSent): void {
     const type = p.type ?? '';
-    if (type !== 'XHR' && type !== 'Fetch') return; // API calls only — skip docs/assets
     const { host, path } = splitUrl(p.request.url);
     // Capture ALL API calls (any host); tag the owning app if an adapter claims it.
-    const match = this.adapters.find((a) =>
-      a.matchRequest({ host, path, method: p.request.method, url: p.request.url }),
+    const match = matchAdapter(
+      this.adapters,
+      { host, path, method: p.request.method, url: p.request.url },
+      this.onError,
     );
+    if (!shouldCaptureCdpResource(type, match !== undefined)) return;
     const loaderId = p.loaderId ?? null;
     this.pending.set(this.key(tab.id, p.requestId), {
       method: p.request.method,
@@ -318,7 +337,7 @@ export class CdpEngine {
       host,
       path,
       reqHeaders: p.request.headers ?? {},
-      reqBody: p.request.postData ?? null,
+      reqBody: p.request.postData == null ? null : capBody(p.request.postData),
       startedAt: Date.now(),
       adapterId: match?.id ?? null,
       status: null,
@@ -347,39 +366,36 @@ export class CdpEngine {
       // Fetch through the OWNING tab's session — a request id means nothing to
       // another target's client.
       const res = (await tab.client.Network.getResponseBody({ requestId })) as GetBodyResult | undefined;
-      if (res) {
-        bodyText = res.base64Encoded ? Buffer.from(res.body, 'base64').toString('utf8') : res.body;
-        if (bodyText.length > MAX_BODY) bodyText = `${bodyText.slice(0, MAX_BODY)}…[truncated]`;
-      }
+      if (res) bodyText = capBody(res.base64Encoded ? Buffer.from(res.body, 'base64').toString('utf8') : res.body);
     } catch {
       bodyText = null; // body may be evicted or opaque; still emit the capture
     }
 
     try {
-      this.onCapture({
-        id: newId('cap'),
-        ts: pend.startedAt,
-        source: 'cdp',
-        adapterId: pend.adapterId,
-        method: pend.method,
-        url: redactUrl(pend.url),
-        host: pend.host,
-        path: pend.path,
-        status: pend.status,
-        durationMs: Date.now() - pend.startedAt,
-        reqHeaders: redactHeaders(pend.reqHeaders),
-        reqBody: pend.reqBody == null ? null : redactText(pend.reqBody),
-        resHeaders: redactHeaders(pend.resHeaders),
-        resBody: bodyText == null ? null : redactText(bodyText),
-        pid: null,
-        processName: null,
-        tabId: pend.tabId,
-        tabUrl: pend.tabUrl,
-        // F0.3: loaderId is the CDP document load; pageLoadId aliases it so
-        // clustering can use one field across engines.
-        loaderId: pend.loaderId ?? null,
-        pageLoadId: pend.loaderId ?? null,
-      });
+      // redactedCapture masks headers, bodies and every URL-like field — the
+      // raw tabUrl included, which may carry `#access_token=`.
+      this.onCapture(
+        redactedCapture({
+          ts: pend.startedAt,
+          source: 'cdp',
+          adapterId: pend.adapterId,
+          method: pend.method,
+          url: pend.url,
+          host: pend.host,
+          path: pend.path,
+          status: pend.status,
+          durationMs: Date.now() - pend.startedAt,
+          reqHeaders: pend.reqHeaders,
+          reqBody: pend.reqBody,
+          resHeaders: pend.resHeaders,
+          resBody: bodyText,
+          tabId: pend.tabId,
+          tabUrl: pend.tabUrl,
+          // pageLoadId aliases loaderId so clustering can use one field across engines.
+          loaderId: pend.loaderId ?? null,
+          pageLoadId: pend.loaderId ?? null,
+        }),
+      );
     } catch (e) {
       this.onError(e);
     }
@@ -397,62 +413,22 @@ export class CdpEngine {
     const payload = p.response.payloadData ?? '';
     if (!payload) return;
 
-    const url = tab.sockets.get(p.requestId) ?? '';
-    const { host, path } = splitUrl(url || 'https://unknown/');
-    const match = this.adapters.find((a) => a.matchRequest({ host, path, method: 'WS', url }));
-    const text = payload.length > MAX_BODY ? `${payload.slice(0, MAX_BODY)}…[truncated]` : payload;
-    const redacted = redactText(text);
-
     try {
-      this.onCapture({
-        id: newId('cap'),
-        ts: Date.now(),
-        source: 'ws',
-        adapterId: match?.id ?? null,
-        method: 'WS',
-        url: redactUrl(url),
-        host,
-        path,
-        status: null,
-        durationMs: null,
-        reqHeaders: {},
-        reqBody: direction === 'sent' ? redacted : null,
-        resHeaders: {},
-        resBody: direction === 'received' ? redacted : null,
-        pid: null,
-        processName: null,
-        tabId: tab.id,
-        tabUrl: tab.url,
-        direction,
-        wsId: p.requestId,
-      });
+      this.onCapture(
+        wsFrameCapture({
+          adapters: this.adapters,
+          url: tab.sockets.get(p.requestId) ?? '',
+          wsId: p.requestId,
+          direction,
+          text: payload,
+          tabId: tab.id,
+          tabUrl: tab.url,
+          onError: this.onError,
+        }),
+      );
     } catch (e) {
       this.onError(e);
     }
-  }
-
-  /** Navigate a tab (defaults to the first attached one). */
-  /**
-   * Drive the attached tab (debug / scripted capture). Not on the hot ingest
-   * path — kept for `sluice capture` helpers and manual CDP control.
-   */
-  async navigate(url: string, tabId?: string): Promise<void> {
-    const tab = tabId ? this.attached.get(tabId) : [...this.attached.values()][0];
-    if (!tab) throw new Error('CdpEngine has no attached tab');
-    await tab.client.Page.navigate({ url });
-  }
-
-  /** Run JS in a tab (defaults to the first attached one). */
-  /** Evaluate JS in the attached tab — same non-hot-path use as navigate. */
-  async evaluate(expression: string, tabId?: string): Promise<void> {
-    const tab = tabId ? this.attached.get(tabId) : [...this.attached.values()][0];
-    if (!tab) throw new Error('CdpEngine has no attached tab');
-    await tab.client.Runtime.evaluate({ expression, awaitPromise: false });
-  }
-
-  /** The tabs currently being captured — surfaced so the UI can label a filter. */
-  tabs(): Array<{ id: string; url: string }> {
-    return [...this.attached.values()].map((t) => ({ id: t.id, url: t.url }));
   }
 
   status(): EngineStatus {
@@ -466,13 +442,7 @@ export class CdpEngine {
       this.discoverTimer = undefined;
     }
     this.pending.clear();
-    for (const entry of this.attached.values()) {
-      try {
-        await entry.client.close();
-      } catch {
-        /* already closed */
-      }
-    }
+    for (const entry of this.attached.values()) await entry.client.close().catch(() => {});
     this.attached.clear();
     this.setState('stopped');
   }

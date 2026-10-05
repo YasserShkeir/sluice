@@ -10,9 +10,9 @@
  * reclaim (rebuild derived tables) reads differently from the irreversible one
  * (delete captures / wipe).
  */
-import { useCallback, useEffect, useState } from 'react';
+import { useEffect, useState } from 'react';
 import { fetchStorage } from '../api.js';
-import type { StorageInfo } from '../api.js';
+import { formatBytes } from '../format.js';
 import {
   sendDataDeleteCaptures,
   sendDataRematerialize,
@@ -20,14 +20,8 @@ import {
   sendDataWipe,
 } from '../ws.js';
 import { Button } from '../ui/button.js';
+import { useAsync } from '../use-async.js';
 import { ConfirmDestructive } from './ConfirmDestructive.js';
-
-function mb(bytes: number): string {
-  if (bytes >= 1e9) return `${(bytes / 1e9).toFixed(2)} GB`;
-  if (bytes >= 1e6) return `${(bytes / 1e6).toFixed(1)} MB`;
-  if (bytes >= 1e3) return `${(bytes / 1e3).toFixed(0)} KB`;
-  return `${bytes} B`;
-}
 
 /** A table is DERIVED (rebuildable) if it is adapter-prefixed or an FTS shadow. */
 function isDerived(name: string, adapterIds: string[]): boolean {
@@ -41,27 +35,20 @@ type Pending =
   | null;
 
 export function StoragePanel() {
-  const [info, setInfo] = useState<StorageInfo | null>(null);
-  const [error, setError] = useState<string | null>(null);
+  const [tick, setTick] = useState(0);
+  const { data: info, error } = useAsync(fetchStorage, [tick]);
   const [pending, setPending] = useState<Pending>(null);
-
-  const refresh = useCallback(() => {
-    fetchStorage()
-      .then(setInfo)
-      .catch((e: unknown) => setError(e instanceof Error ? e.message : String(e)));
-  }, []);
+  const refresh = () => setTick((t) => t + 1);
 
   // Refresh on mount and whenever this tab regains focus — an op that finished in
   // the activity cards changed the numbers under us.
   useEffect(() => {
-    refresh();
-    const onFocus = () => refresh();
-    window.addEventListener('focus', onFocus);
-    return () => window.removeEventListener('focus', onFocus);
-  }, [refresh]);
+    window.addEventListener('focus', refresh);
+    return () => window.removeEventListener('focus', refresh);
+  }, []);
 
   if (error !== null) return <p className="p-4 text-[12px] text-danger">Could not read storage — {error}</p>;
-  if (info === null) return <p className="p-4 text-[12px] text-fg-mute">Reading storage…</p>;
+  if (info === undefined) return <p className="p-4 text-[12px] text-fg-mute">Reading storage…</p>;
 
   const derivedBytes = info.tables
     .filter((t) => isDerived(t.name, info.adapterIds))
@@ -74,22 +61,22 @@ export function StoragePanel() {
     <div className="flex flex-col gap-4 p-3">
       <section>
         <div className="flex items-baseline justify-between">
-          <h2 className="text-[13px] font-semibold text-fg">On disk — {mb(info.totalBytes)}</h2>
+          <h2 className="text-[13px] font-semibold text-fg">On disk — {formatBytes(info.totalBytes)}</h2>
           <button type="button" onClick={refresh} className="text-[11px] text-fg-mute hover:text-fg">
             refresh
           </button>
         </div>
         {/* One stacked bar: derived (safe to drop) / captures (evidence) / other / free. */}
         <div className="mt-2 flex h-3 w-full overflow-hidden rounded bg-bg-3 text-[0]">
-          <Seg bytes={derivedBytes} total={info.totalBytes} className="bg-accent" title={`derived ${mb(derivedBytes)}`} />
-          <Seg bytes={captureBytes} total={info.totalBytes} className="bg-ok" title={`captures ${mb(captureBytes)}`} />
-          <Seg bytes={otherBytes} total={info.totalBytes} className="bg-fg-mute" title={`other ${mb(otherBytes)}`} />
-          <Seg bytes={info.freeBytes} total={info.totalBytes} className="bg-bg-3" title={`free ${mb(info.freeBytes)}`} />
+          <Seg bytes={derivedBytes} total={info.totalBytes} className="bg-accent" title={`derived ${formatBytes(derivedBytes)}`} />
+          <Seg bytes={captureBytes} total={info.totalBytes} className="bg-ok" title={`captures ${formatBytes(captureBytes)}`} />
+          <Seg bytes={otherBytes} total={info.totalBytes} className="bg-fg-mute" title={`other ${formatBytes(otherBytes)}`} />
+          <Seg bytes={info.freeBytes} total={info.totalBytes} className="bg-bg-3" title={`free ${formatBytes(info.freeBytes)}`} />
         </div>
         <div className="mt-1.5 flex flex-wrap gap-x-4 gap-y-1 text-[11px] text-fg-mute">
-          <Legend className="bg-accent" label={`derived ${mb(derivedBytes)}`} />
-          <Legend className="bg-ok" label={`captures ${mb(captureBytes)}`} />
-          <Legend className="bg-fg-mute" label={`other ${mb(otherBytes)}`} />
+          <Legend className="bg-accent" label={`derived ${formatBytes(derivedBytes)}`} />
+          <Legend className="bg-ok" label={`captures ${formatBytes(captureBytes)}`} />
+          <Legend className="bg-fg-mute" label={`other ${formatBytes(otherBytes)}`} />
           <span>{info.captures.total} captures ({info.captures.unattributed} unattributed)</span>
         </div>
       </section>
@@ -98,10 +85,10 @@ export function StoragePanel() {
         <h3 className="text-[12px] font-semibold text-fg">Reclaim (safe — rebuilds from captures)</h3>
         <div className="flex flex-wrap gap-2">
           <Button onClick={() => sendDataRematerialize()}>
-            Rebuild derived tables ({mb(derivedBytes)})
+            Rebuild derived tables ({formatBytes(derivedBytes)})
           </Button>
           <Button onClick={() => sendDataVacuum()}>
-            Reclaim free space ({mb(info.freeBytes)})
+            Reclaim free space ({formatBytes(info.freeBytes)})
           </Button>
         </div>
       </section>
@@ -130,7 +117,7 @@ export function StoragePanel() {
               <tr key={t.name} className="border-b border-border/50">
                 <td className="py-0.5 pr-2 font-mono">{t.name}</td>
                 <td className="py-0.5 pr-2 text-right tabular-nums">{t.rows}</td>
-                <td className="py-0.5 text-right tabular-nums">{mb(t.bytes)}</td>
+                <td className="py-0.5 text-right tabular-nums">{formatBytes(t.bytes)}</td>
               </tr>
             ))}
           </tbody>

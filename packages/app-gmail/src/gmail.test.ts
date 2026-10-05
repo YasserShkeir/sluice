@@ -6,10 +6,12 @@
  * Two kinds of input, and the split matters.
  *
  * `fixtures/gmail.ndjson` is a SCRUBBED recording of a real mailbox —
- * `scrubCaptures(recording, { salt: 'app-gmail' })` — so array lengths, nesting,
- * types, string lengths and `^label` ids survive and every character of content
- * is synthetic. It is what pins the layout claims, because a hand-written
- * fixture only proves this file agrees with itself.
+ * `scrubCaptures(recording)`, under a random salt and a random time shift that
+ * were never written down — so array lengths, nesting, types, string lengths and
+ * `^label` ids survive and every character of content is synthetic. It is what
+ * pins the layout claims, because a hand-written fixture only proves this file
+ * agrees with itself. The scrambled literals below (addresses, ids, names) are
+ * read off that one scrub; a re-scrub draws new ones and they must be re-read.
  *
  * Two consequences of scrubbing that this file leans on. The scrubber replaces
  * any string that does not START with `^`, so the `bv` request's search query —
@@ -29,8 +31,8 @@ import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 import { makeCapture, parseNdjson, runConformance } from '@sluice/adapter-sdk';
 import type { Capture, Container, Item, Session } from '@sluice/core';
-import { MAX_BODY_CHARS, htmlToText } from './html-to-text.js';
 import {
+  GMAIL_THREADS_LIST,
   accountWorkspaceId,
   addressOfWorkspaceId,
   isProvisionalWorkspaceId,
@@ -38,13 +40,14 @@ import {
   containerKind,
   decodeGmailBody,
   gmailAdapter,
-  gmailApp,
   gmailMessageView,
   gmailNextCursors,
   gmailThreadView,
   labelRef,
   parseGmailCapture,
-} from './index.js';
+} from './gmail-adapter.js';
+import { MAX_BODY_CHARS, htmlToText } from './html-to-text.js';
+import { gmailApp } from './index.js';
 
 // ── The scrubbed recording ───────────────────────────────────────────────────────
 
@@ -1170,9 +1173,17 @@ test('nextCursors is empty — no page offset was identifiable', () => {
 
 // ── replay ───────────────────────────────────────────────────────────────────────
 
+test('no replay action is offered while nothing can supply a Gmail session', () => {
+  // Without a provider no host holds a Gmail session: the dashboard refused the
+  // action with an `extract-token` hint that could not help, and the CLI and MCP
+  // sent it unauthenticated. A provider landing here must list the action
+  // deliberately, and this test is what makes that deliberate.
+  assert.equal(gmailApp.credentials, undefined, 'a provider exists now: offer GMAIL_THREADS_LIST');
+  assert.deepEqual(gmailApp.listReplayActions(), []);
+});
+
 test('buildReplayRequest puts the cookie VALUES in the Cookie header', () => {
-  const action = gmailAdapter.listReplayActions()[0];
-  assert.ok(action, 'precondition: gmail has a replay action');
+  const action = GMAIL_THREADS_LIST;
   const req = gmailAdapter.buildReplayRequest(action, { label: '^i' }, SESSION);
   assert.equal(req.headers.Cookie, 'SID=g.a000REAL_SID_VALUE; HSID=REAL_HSID_VALUE; SSID=REAL_SSID_VALUE');
   assert.equal(req.headers['x-framework-xsrf-token'], 'synthetic-xsrf:1700000000000');
@@ -1182,8 +1193,7 @@ test('buildReplayRequest puts the cookie VALUES in the Cookie header', () => {
 test('a pre-assembled cookieHeader is accepted when no injection map is given', () => {
   // What a Chrome-cookie provider hands over: one ready-made header rather than a
   // name→key map. app-trello mints exactly this shape.
-  const action = gmailAdapter.listReplayActions()[0];
-  assert.ok(action);
+  const action = GMAIL_THREADS_LIST;
   const req = gmailAdapter.buildReplayRequest(action, {}, {
     ...SESSION,
     credentials: {
@@ -1199,8 +1209,7 @@ test('the account index goes in the PATH and the label goes in the BODY', () => 
   // `new URL('…/u/{account}/i/bv')` percent-encodes the braces into a literal
   // `/u/%7Baccount%7D/`, which 404s; and bv reads its arguments positionally out
   // of the body, so a label appended to the query string selects nothing.
-  const action = gmailAdapter.listReplayActions()[0];
-  assert.ok(action);
+  const action = GMAIL_THREADS_LIST;
   const req = gmailAdapter.buildReplayRequest(action, { account: '2', label: '^x_1' }, SESSION);
   const u = new URL(req.url);
   assert.equal(u.pathname, '/sync/u/2/i/bv');
@@ -1220,8 +1229,7 @@ test('a scoped label id selects the label AND the account it came from', () => {
   // those are scoped now. Two ways to get this wrong, both silent: `in:gmail:u1/^i`
   // is a query that selects nothing, and replaying account 1's Inbox against
   // `/u/0/` fetches the wrong mailbox and files it under a right-looking view.
-  const action = gmailAdapter.listReplayActions()[0];
-  assert.ok(action);
+  const action = GMAIL_THREADS_LIST;
   const req = gmailAdapter.buildReplayRequest(action, { label: 'gmail:u1/^x_1' }, SESSION);
   assert.equal(new URL(req.url).pathname, '/sync/u/1/i/bv');
   assert.equal(req.headers.Referer, 'https://mail.google.com/mail/u/1/');
@@ -1229,15 +1237,13 @@ test('a scoped label id selects the label AND the account it came from', () => {
 });
 
 test('an explicit account still wins over the one the label id names', () => {
-  const action = gmailAdapter.listReplayActions()[0];
-  assert.ok(action);
+  const action = GMAIL_THREADS_LIST;
   const req = gmailAdapter.buildReplayRequest(action, { account: '2', label: 'gmail:u1/^i' }, SESSION);
   assert.equal(new URL(req.url).pathname, '/sync/u/2/i/bv');
 });
 
 test('a missing account throws by name instead of building a broken url', () => {
-  const action = gmailAdapter.listReplayActions()[0];
-  assert.ok(action);
+  const action = GMAIL_THREADS_LIST;
   assert.throws(
     () => gmailAdapter.buildReplayRequest(action, { account: '' }, SESSION),
     /account/,

@@ -11,8 +11,8 @@ only ever sees the generic `App` interface. `packages/apps` is the single module
 that names concrete app packages, and adding a service touches exactly two files
 outside its own package — both of them in `packages/apps`.
 
-Six apps ship today, in registration order: **slack, fast, trello, gmail, loom,
-linkedin**. `packages/app-fast` is the smallest complete example (credential-free,
+Nine apps ship today, in registration order: **slack, fast, trello, gmail, loom,
+linkedin, olx, notion, toters**. `packages/app-fast` is the smallest complete example (credential-free,
 one replay action, one MCP tool). `packages/app-trello` is the smallest example
 *with* credentials, and is the model for credential error handling. Read whichever
 matches the service before writing code.
@@ -311,34 +311,57 @@ count rows, stat a file, do not decrypt — so it never raises a Keychain prompt
 `sluice doctor` skips any app that lacks it and reports it as "cannot be checked",
 so without it a broken credential only surfaces when a tool fails.
 
-**Distinguish "not signed in" from "could not read it."** `app-trello` is the
-pattern to copy:
+**Distinguish "not signed in" from "could not read it."** For a Chrome-cookie
+session, do not hand-write the provider: `localSessionCredentials` from
+`@sluice/adapter-sdk` does it, and `app-trello/src/index.ts` is the pattern to copy:
 
 ```ts
-function isNoSessionError(err: unknown): boolean {
-  const msg = err instanceof Error ? err.message : String(err);
-  return /not signed in|no .*cookie|not found|does not exist|ENOENT/i.test(msg);
-}
-// …
-} catch (err) {
-  if (isNoSessionError(err)) return [];      // genuinely absent → surface nothing
-  throw new Error(`Trello credential extraction failed: ${…}`);
-}
+import { locateChromeProfile, readChromeCookieHeader } from '@sluice/core';
+import { localSessionCredentials } from '@sluice/adapter-sdk';
+
+const trelloCredentials: CredentialProvider = localSessionCredentials({
+  adapterId: ADAPTER_ID,
+  label: 'Trello',
+  kind: 'trello-session',
+  workspace: { id: 'trello', name: 'Trello', domain: 'trello.com', url: 'https://trello.com/' },
+  locate: () => locateChromeProfile('trello.com'),   // passive: never decrypts
+  read: () => ({
+    values: {   // SECRET
+      cookieHeader: readChromeCookieHeader({ domainSuffix: 'trello.com', serviceLabel: 'Trello' }).cookieHeader,
+    },
+    injection: { headers: { Cookie: 'cookieHeader' } },
+  }),
+});
 ```
+
+It returns `[]` off macOS or when core's `isNoSessionError` says the user is
+signed out, and throws `"<label> credential extraction failed: …"` for anything
+else. A provider that cannot use the factory must make the same distinction with
+core's `isNoSessionError(err)`, and a reader should throw core's
+`NoChromeSessionError` when no profile is signed in (matched by code, so it
+survives duplicate core copies). A "had no decryptable … cookies" error is a
+failure, not "signed out".
 
 A blanket `catch { return []; }` makes a locked cookie DB, a denied Keychain
 prompt and a decrypt failure all indistinguishable from being signed out — so the
 user is told to sign in when they already are.
 
-**Guard non-darwin by platform, but give it a fallback.** All four credential
-providers today (slack, trello, loom, linkedin) return `[]` or throw off macOS.
-Implement `sessionFromInput` so paste-in still works, as Slack does.
+**Guard non-darwin by platform, but give it a fallback.** The local credential
+providers (slack, trello, loom, linkedin, notion) return `[]` or throw off macOS.
+Implement `sessionFromInput` so paste-in still works, as Slack, Notion and Toters
+do. Pasted credentials reach only the app `--adapter` names, but still return
+`undefined` for input that is not shaped like your service's credential (Slack
+requires an `xox?-` token).
 
 If you need Chrome cookie decryption, **use `@sluice/core`** — do not paste a
 fifth copy. Shared helpers:
 
 - `decryptOscryptV10` / `keychainPassphrase` / `withCopiedSqliteDb` — `packages/core/src/oscrypt.ts`
-- `readChromeCookieHeader` / `locateChromeProfile` — `packages/core/src/chrome-cookies.ts`
+  (the CLI prints `KEYCHAIN_ALLOW_ADVICE` before extraction: "Allow", not "Always Allow")
+- `readChromeCookieHeader` / `locateChromeProfile` (with `requireCookie` to count only
+  profiles holding a named cookie) / `readChromeCookies` / `buildChromeCookieHeader` /
+  `NoChromeSessionError` / `isNoSessionError` — `packages/core/src/chrome-cookies.ts`
+- `copyDirSafe` / `copyFileSafe` / `sweepStaleTempDirs` — `packages/core/src/safe-copy.ts`
 
 App packages keep thin domain wrappers (`domainSuffix: 'example.com'`) plus any
 service-specific header post-processing. Slack desktop still owns LevelDB + host
@@ -349,9 +372,18 @@ ranking in `slack-credentials.ts` but decrypts through the same OSCrypt helpers.
 Add `mcpTools()` if the app should expose data or an action to Claude. The full
 contract is in the **`sluice-mcp-tool`** skill. Two things worth knowing before
 you get there: app tools *can* declare an `inputSchema` (a zod raw shape), and a
-network-touching tool must go through `ctx.replay` rather than a bare `fetch` so
-it inherits the faithful fingerprint, the safety rails, the shared budget and the
-store write-back.
+network-touching tool must go through `ctx.replay` (or `ctx.replayAction` when it
+needs the app's session) rather than a bare `fetch` so it inherits the faithful
+fingerprint, the safety rails (the app host rail included), the budget and the store
+write-back.
+
+For the builder side, `@sluice/adapter-sdk` has `actionParam` /
+`requireActionParam` / `fillPathParams` (which percent-encodes and refuses a missing,
+empty, `.` or `..` path segment), and `injectedHeaders` / `injectedQuery` /
+`injectedCookieHeader` to resolve a session's `injection` maps (NAME → `values`
+KEY). Use core's `headerValue`, `safeJsonParse`, `errorMessage` and `MASK` rather
+than local copies, and core's `previewSecret` for a credential hint's
+`valuePreview`.
 
 ## Registration — the two files outside your package
 
@@ -375,7 +407,7 @@ Both are in `packages/apps`.
    breaks on a clean install.
 
 You do **not** need to edit `PLANNED_APPS` in `packages/runner/src/server.ts`. It
-is a list of four unbuilt placeholders (notion, linear, jira, discord) the app
+is a list of three unbuilt placeholders (linear, jira, discord) the app
 catalog advertises, and the catalog already filters out any id that a registered
 adapter claims — search for `PLANNED_APPS` if you want to read it, but registering
 your app is enough to make the stub disappear.

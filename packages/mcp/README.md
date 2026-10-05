@@ -33,13 +33,15 @@ Nothing here is published to npm yet; the path above is the only install.
 - **The store never holds live credentials.** Replay acquires a `Session`
   in-memory (Keychain / local browser profile) and never writes
   `credentials.values` to SQLite, tool results, or logs. Apps with no credential
-  provider (fast.com, Gmail) replay with a synthetic session whose values are
-  empty by construction, so no Keychain prompt is possible.
+  provider (fast.com, Gmail, OLX) replay with a synthetic session whose values
+  are empty by construction, so no Keychain prompt is possible.
 - **Tool errors pass through redaction** before leaving the process. stdout
   carries MCP protocol frames only; every diagnostic goes to stderr.
-- **The replay budget is process-global** — 60 requests per 60 seconds, shared
-  with the CLI, the dashboard and `sluice sync`. Exhausting it here exhausts it
-  everywhere in this process.
+- **The replay budget is per process** — 60 requests per 60 seconds for this
+  `sluice-mcp` process. The runner (dashboard, sync) and each CLI command have
+  their own bucket, so it bounds this process's traffic, not your account's.
+- **Replay params are bounded** like the dashboard's frames: at most 64 entries,
+  1024-char keys and 8192-char values on `replay` and `sluice_replay_flow`.
 - **Flow describe/list return binding kinds and names only** — never token
   values, cookies, or full bodies.
 
@@ -48,8 +50,8 @@ Nothing here is published to npm yet; the path above is the only install.
 Eleven core tools, plus every tool contributed by the machine's *enabled* apps.
 The app loop iterates `enabledApps()`, so the `adapters` allow-list in
 `~/.sluice/config.json` narrows the advertised surface per machine (and an
-unknown id in that array throws at startup). With no allow-list, all six
-installed apps contribute and the server advertises 29 tools.
+unknown id in that array throws at startup). With no allow-list, all nine
+installed apps contribute and the server advertises 37 tools.
 
 ### Core
 
@@ -64,7 +66,7 @@ installed apps contribute and the server advertises 29 tools.
 | `replay` | **Makes a live network request.** One `actionId` → faithful fingerprint → `runReplay` → store |
 | `sluice_list_flows` | Observed/pinned bursts + learned templates (ids, primaryKey, sampleCount, qualityNotes) |
 | `sluice_describe_flow` | Step plan: roles, offsets, param kinds, unreproducible flags |
-| `sluice_replay_flow` | **Makes live network requests.** Sequential read-only run via `buildFlowStepRequest` + `runFlowReplay` + `runReplay` |
+| `sluice_replay_flow` | **Makes live network requests.** Sequential run for reads via `flowStepBuilder` + `runFlowReplay` + `runReplay` |
 | `auth_flow` | Maps how a service authenticates you, over the 5,000 most recent captures. Names and redacted previews only |
 
 Only `replay` and `sluice_replay_flow` touch the network. Note the naming: the
@@ -84,9 +86,18 @@ with `<app.id>_` so the flat MCP namespace stays collision-free.
 | gmail | `gmail_sync_status`, `gmail_list_labels`, `gmail_list_threads`, `gmail_get_thread`, `gmail_search` | no — all five answer from the capture store |
 | loom | `loom_list_videos`, `loom_get_video`, `loom_list_notifications`, `loom_get_transcript` | yes, all four |
 | linkedin | `linkedin_sync_status`, `linkedin_me`, `linkedin_list_jobs`, `linkedin_list_conversations`, `linkedin_list_messages`, `linkedin_search`, `linkedin_fetch_me` | only `linkedin_fetch_me` |
+| notion | `notion_workspaces`, `notion_read_page` | yes, via `ctx.replay` (Notion session cookie from the local Chrome profile) |
+| olx | `olx_list_categories`, `olx_search_ads`, `olx_get_ad` | yes, via `ctx.replay` (public endpoints, no login) |
+| toters | `toters_stores`, `toters_store_items`, `toters_coverage` | no — all three answer from the capture store |
 
 Store-backed tools throw a named error when the host provides no store — they
 are meant to run through `sluice-mcp`, not as a library.
+
+`ctx.replay` is a single attempt: the tool hands over a finished request, so the
+host has no session to re-extract and re-inject, and only the core `replay` tool
+gets 401 → re-extract → retry-once. App tools that build their own auth (Trello,
+Loom, Notion) detect the auth failure and refresh themselves, sequentially.
+`ctx.replayFlow` runs only this app's own templates.
 
 ### Agent contract (from live Trello/Slack capture)
 
@@ -96,8 +107,10 @@ are meant to run through `sluice-mcp`, not as a library.
    op (`cards/:id`, `boards/:id`, `conversations.history`), not `assets/*` or a
    hashed SPA filename. Use `qualityNotes` on list/describe.
 3. **Describe before replay** — supply every required `flowParam`; pick
-   `workspaceId` when multiple sessions exist. `pickSession` refuses to guess:
-   with no hint it succeeds only if exactly one session exists.
+   `workspaceId` when multiple sessions exist. Session picking refuses to
+   guess: an explicit `workspaceId` must match a signed-in session; otherwise
+   the workspace the params name, else the sole session. An auth-failure retry
+   re-extracts the same workspace, never another account.
 4. **Correlation** — MITM/WS captures have no `pageLoadId`/`loaderId`; bursts are
    **time-window** clustered. CDP populates loader ids when that engine is on.
    WebSocket frames are **excluded** from HTTP flow clustering.
@@ -105,8 +118,11 @@ are meant to run through `sluice-mcp`, not as a library.
    hard-capped at 2 s). Negative offsets mean the companion was observed *before*
    the learned primary (auth/bootstrap); replay fires those immediately if still
    pending. Fallback: chained `delayMsP50`. The whole flow times out at 120 s.
-6. **Rails** — each step: GET|HEAD|POST only, write-op denylist, host must
-   match `app.hosts`. Soft unreproducible companions skip; required failures stop.
+6. **Rails** — each step: GET|HEAD|POST only; a non-GET step must match one of
+   the app's replay actions; a best-effort write-op denylist; the host must match
+   `app.hosts` at build and again at send (the same host rail covers `replay` and
+   `ctx.replay`). These are heuristics, not a proof of non-mutation. Soft
+   unreproducible companions skip; required failures stop.
 7. **No writes** — flow replay is not for create/update/delete.
 8. **Assets** — SPA bundles are deprioritized as primaries and dropped from
    learned templates as soft companions; do not treat asset primaries as actions.

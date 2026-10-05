@@ -121,6 +121,36 @@ test('oversized strings are refused rather than allocated', () => {
   );
 });
 
+test('flow.run params carry the same bounds as replay.run', () => {
+  const flow = (params: unknown) => ({ type: 'flow.run', requestId: 'f', templateId: 't', params });
+  assert.match(rejected(flow({ k: 'y'.repeat(9000) })), /params/);
+  const manyParams = Object.fromEntries(Array.from({ length: 65 }, (_, i) => [`k${i}`, 'v']));
+  assert.match(rejected(flow(manyParams)), /params/);
+  assert.equal(accepted(flow({ channel: 'C1' })).type, 'flow.run');
+});
+
+test('a param KEY is bounded too, because it reaches the outbound request as a name', () => {
+  // Adapters and flow steps copy every key into a query string or a form body,
+  // so an unbounded key is the same outbound-size hole as an unbounded value.
+  const longKey = 'k'.repeat(2000);
+  assert.match(
+    rejected({ type: 'replay.run', requestId: 'r', actionId: 'a', params: { [longKey]: 'v' } }),
+    /params/,
+  );
+  assert.match(
+    rejected({ type: 'flow.run', requestId: 'f', templateId: 't', params: { [longKey]: 'v' } }),
+    /params/,
+  );
+  // At the bound, and the empty key accepted before the key bound existed, still pass.
+  const ok = accepted({
+    type: 'replay.run',
+    requestId: 'r',
+    actionId: 'a',
+    params: { ['k'.repeat(1024)]: 'v', '': 'x' },
+  });
+  assert.equal(ok.type, 'replay.run');
+});
+
 // ── Non-messages ─────────────────────────────────────────────────────────────────
 
 test('anything that is not a message at all is refused with a reason', () => {

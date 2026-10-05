@@ -9,110 +9,146 @@
  *
  * Does not touch the network. Pair with interceptor `runFlowReplay`.
  *
- * F4.4 conformance: refuses denied methods/ops and hosts outside the declared
- * adapter allowlist at build time so a bad template never reaches `runReplay`.
- * Runtime rails in interceptor remain the final gate.
+ * F4.4 conformance: refuses denied methods/ops, non-read requests outside the
+ * adapter's replay actions, and hosts outside the declared adapter allowlist at
+ * build time so a bad template never reaches `runReplay`. Runtime rails in
+ * interceptor remain the final gate.
  */
 
 import type {
+  Adapter,
   FlowParamSource,
   FlowTemplate,
   FlowTemplateStep,
+  ReplayAction,
   ReplayRequest,
   Session,
 } from '@sluice/core';
-import { looksLikeDeniedOperation, MASK } from '@sluice/core';
+import {
+  isReplayMethodAllowed,
+  looksLikeDeniedReplay,
+  MASK,
+  redactText,
+  replayHostAllowed,
+  replayRequestProbe,
+  resolveJsonPath,
+  splitUrl,
+} from '@sluice/core';
 import { makeFaithful } from './faithful.js';
-import type { RequestTemplate } from './faithful.js';
+
+/** Bump when learning rules change; a build refused on an older template says to re-learn. */
+export const FLOW_TEMPLATE_VERSION = 2;
+
+/** The part of a {@link ReplayAction} that says which request it sends. */
+export type ReadAction = Pick<ReplayAction, 'method' | 'urlTemplate'>;
 
 export interface FlowStepBuildContext {
   params: Record<string, string>;
   /** seq → parsed response body from earlier steps in this run */
   priorResponses: Map<number, unknown>;
   /**
-   * Resolve a bind path. Default understands `a.b[0].c` style paths used by
-   * flow-learn. Injected so tests can stub without pulling interceptor.
+   * Declared adapter hosts (F4.4). The built URL's host must match one of them
+   * (exact, or a subdomain of a listed apex / `*.host` entry). Empty refuses
+   * every step: there is no build without a host rail.
    */
-  resolvePath?: (data: unknown, path: string) => string | undefined;
+  allowedHosts: readonly string[];
   /**
-   * Declared adapter hosts (F4.4). When set, the built URL's host must match
-   * one of them (exact or parent of a `*.host` style entry / subdomain of an
-   * apex). Omitted = no host check at build (runtime still has no host rail).
+   * The owning adapter's replay actions — its vetted read surface. A step whose
+   * method is not GET/HEAD is built only when its method and path match one of
+   * them; omitted, every such step is refused. {@link flowStepBuilder} fills
+   * this and `allowedHosts` from the adapter.
    */
-  allowedHosts?: readonly string[];
+  readActions?: readonly ReadAction[];
 }
 
-
-/** Verbs that can only mutate — mirror of interceptor ALLOWED_METHODS. */
-const ALLOWED_METHODS = new Set(['GET', 'HEAD', 'POST']);
+/** Methods that read by definition; anything else must be a vetted read action. */
+const SAFE_METHODS = new Set(['GET', 'HEAD']);
 
 export class FlowBuildError extends Error {
-  readonly code:
-    | 'method_not_allowed'
-    | 'operation_not_allowed'
-    | 'host_not_allowed'
-    | 'path_unresolved';
-  constructor(code: FlowBuildError['code'], message: string) {
+  constructor(
+    readonly code: 'method_not_allowed' | 'operation_not_allowed' | 'host_not_allowed' | 'path_unresolved',
+    message: string,
+  ) {
     super(message);
     this.name = 'FlowBuildError';
-    this.code = code;
   }
 }
 
 /**
  * Build-time rails for one step request (F4.4). Throws {@link FlowBuildError}.
  * Safe to call from tests without opening a socket.
+ *
+ * Messages name the path only, never the query or body: a built GET carries the
+ * live token and injected credentials in its query string, and the message is
+ * copied into flow results that MCP and the CLI print.
  */
 export function assertFlowStepAllowed(
   req: ReplayRequest,
-  opts: { operation?: string; allowedHosts?: readonly string[] } = {},
+  opts: { operation?: string; allowedHosts?: readonly string[]; readActions?: readonly ReadAction[] } = {},
 ): void {
   const method = (req.method || 'GET').toUpperCase();
-  if (!ALLOWED_METHODS.has(method)) {
+  if (!isReplayMethodAllowed(method)) {
     throw new FlowBuildError(
       'method_not_allowed',
-      `flow build refused: ${method} can only mutate. Sluice replays reads only.`,
+      `flow build refused: ${method} can only mutate; flow steps may use GET, HEAD or POST.`,
     );
   }
 
-  let pathProbe = req.url;
-  let host = '';
-  try {
-    const u = new URL(req.url);
-    pathProbe = `${u.pathname}?${u.searchParams.toString()}`;
-    host = u.hostname.toLowerCase();
-  } catch {
-    /* match raw string */
+  const { host } = replayRequestProbe(req.url);
+  if (!/^https:\/\//i.test(req.url)) {
+    throw new FlowBuildError('host_not_allowed', 'flow build refused: flow steps are sent over https only.');
+  }
+  if (!replayHostAllowed(host, opts.allowedHosts ?? [])) {
+    throw new FlowBuildError(
+      'host_not_allowed',
+      `flow build refused: host "${host}" is outside the adapter's declared hosts.`,
+    );
   }
 
+  const pathOnly = urlPathname(req.url);
   const op = opts.operation ?? '';
-  if (looksLikeDeniedOperation(op, pathProbe, req.body)) {
+  if (looksLikeDeniedReplay({ ...req, method }, op)) {
     throw new FlowBuildError(
       'operation_not_allowed',
-      `flow build refused: operation looks write-shaped (${op || pathProbe}).`,
+      redactText(`flow build refused: operation looks write-shaped (${op || pathOnly}).`),
     );
   }
 
-  if (opts.allowedHosts && opts.allowedHosts.length > 0 && host) {
-    if (!hostAllowed(host, opts.allowedHosts)) {
-      throw new FlowBuildError(
-        'host_not_allowed',
-        `flow build refused: host "${host}" is outside the adapter's declared hosts.`,
-      );
-    }
+  // The denylist cannot name every write, so a non-read method needs a positive
+  // match: one of the adapter's own replay actions, which are reviewed reads.
+  if (!isVettedRead({ method, url: req.url }, opts.readActions ?? [])) {
+    throw new FlowBuildError(
+      'operation_not_allowed',
+      redactText(`flow build refused: ${method} ${pathOnly} is not one of the adapter's read actions.`),
+    );
   }
 }
 
-/** True when `host` is listed or is a subdomain of a listed apex / wildcard. */
-export function hostAllowed(host: string, allowed: readonly string[]): boolean {
-  const h = host.toLowerCase();
-  for (const raw of allowed) {
-    const a = raw.toLowerCase().replace(/^\*\./, '');
-    if (!a) continue;
-    if (h === a || h.endsWith(`.${a}`)) return true;
-  }
-  return false;
+/**
+ * GET/HEAD, or the method of one of `actions` with a path its URL template
+ * matches (`{param}` stands for one path segment or part of one). Hosts are left
+ * to the host rail: a Slack action on `slack.com` still vouches for the same
+ * path on `acme.slack.com`.
+ */
+export function isVettedRead(req: { method: string; url: string }, actions: readonly ReadAction[]): boolean {
+  const method = req.method.toUpperCase();
+  if (SAFE_METHODS.has(method)) return true;
+  const path = urlPathname(req.url);
+  return actions.some((a) => a.method.toUpperCase() === method && actionPathPattern(a.urlTemplate).test(path));
 }
+
+/** `https://h/1/boards/{boardId}/cards` → /^\/1\/boards\/[^/]+\/cards\/?$/ */
+function actionPathPattern(urlTemplate: string): RegExp {
+  const path = urlTemplate.replace(/^[a-z][a-z0-9+.-]*:\/\/[^/?#]*/i, '').split(/[?#]/)[0] || '/';
+  const source = path
+    .split(/\{[A-Za-z_][A-Za-z0-9_]*\}/)
+    .map((lit) => lit.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'))
+    .join('[^/]+');
+  return new RegExp(`^${source}/?$`);
+}
+
+/** The pathname of an absolute URL, else the text before any query (never the query: it carries credentials). */
+const urlPathname = (url: string): string => splitUrl(url).path.split('?')[0] ?? url;
 
 /**
  * Build one step's ReplayRequest, or null when the step cannot be reproduced
@@ -128,10 +164,10 @@ export function buildFlowStepRequest(
   if (step.unreproducible) return null;
 
   // Resolve path placeholders before constructing the URL.
-  const resolvedPath = resolveStepPath(step, session, ctx);
+  const resolvedPath = resolveStepPath(step, ctx);
   if (resolvedPath === null) return null;
 
-  const hostGuess = hostFromSessionOrPath(session, step, template);
+  const hostGuess = stepHost(step, template);
   const url = new URL(
     resolvedPath.startsWith('http')
       ? resolvedPath
@@ -143,57 +179,38 @@ export function buildFlowStepRequest(
   const pathParamNames = pathPlaceholderNames(step.path);
 
   // Learned stable body params first.
-  if (step.request?.bodyParams) {
-    for (const [k, v] of Object.entries(step.request.bodyParams)) {
-      if (v.includes(MASK)) continue;
-      params[k] = v;
-    }
+  for (const [k, v] of Object.entries(step.request?.bodyParams ?? {})) if (!v.includes(MASK)) params[k] = v;
+
+  for (const [k, src] of Object.entries(step.params ?? {})) {
+    // A flowParam path placeholder goes into the URL (resolveStepPath), not body/query.
+    if (pathParamNames.has(k) && src.kind === 'flowParam') continue;
+    const resolved = resolveParam(src, ctx);
+    // A missing flowParam/bind cannot be built faithfully; anything else unresolved
+    // (unreproducible, session, masked literal) is omitted.
+    if (resolved === undefined && (src.kind === 'flowParam' || src.kind === 'bind')) return null;
+    if (resolved !== undefined) params[k] = resolved;
   }
 
-  if (step.params) {
-    for (const [k, src] of Object.entries(step.params)) {
-      // Path placeholders are applied to the URL, not body/query (unless also a body key).
-      if (pathParamNames.has(k) && src.kind === 'flowParam') {
-        // Still resolve so missing path params fail early via resolveStepPath;
-        // skip putting them in body/query when they only appear in the path.
-        continue;
-      }
-      const resolved = resolveParam(src, session, ctx);
-      if (resolved === undefined) {
-        if (src.kind === 'unreproducible') {
-          // Soft: omit. Required steps with unreproducible params are flagged
-          // on the step itself and skipped by the runner.
-          continue;
-        }
-        if (src.kind === 'flowParam' || src.kind === 'bind') {
-          // Missing binding/param — cannot build faithfully.
-          return null;
-        }
-        continue;
-      }
-      params[k] = resolved;
-    }
-  }
-
-  // Caller flow params fill any still-missing keys that match by name
-  // (except pure path placeholders already consumed by resolveStepPath).
+  // Caller flow params fill only keys this step declares and left empty (an
+  // unreproducible or redacted value), never new ones such as `_method`, and
+  // never pure path placeholders already consumed by resolveStepPath.
   for (const [k, v] of Object.entries(ctx.params)) {
-    if (params[k] === undefined && !pathParamNames.has(k)) params[k] = v;
+    if (params[k] !== undefined || pathParamNames.has(k)) continue;
+    if (step.params?.[k] !== undefined || step.request?.bodyParams[k] !== undefined) params[k] = v;
   }
 
-  // Session injection (token form field, query, cookies, headers).
+  // Session injection (token form field, query, cookies, headers). Each map is
+  // wire NAME → `values` KEY, and a key with no value sends nothing. Stricter
+  // than @sluice/adapter-sdk's injectedHeaders/injectedQuery on purpose: those
+  // fall back to the ref as a literal for adapter builders, but a learned
+  // template must never put a caller-shaped literal where a credential goes.
   const inj = session.credentials.injection;
   const values = session.credentials.values;
   if (inj.tokenFormField) {
-    const tok = values.token ?? values[inj.tokenFormField];
+    const tok = sessionValue(values, 'token') ?? sessionValue(values, inj.tokenFormField);
     if (tok) params[inj.tokenFormField] = tok;
   }
-  if (inj.query) {
-    for (const [qName, valueKey] of Object.entries(inj.query)) {
-      const v = values[valueKey];
-      if (v) url.searchParams.set(qName, v);
-    }
-  }
+  for (const [qName, v] of injected(inj.query, values)) url.searchParams.set(qName, v);
 
   // Apply non-token params: prefer form body for POST, query for GET.
   const method = (step.method || 'GET').toUpperCase();
@@ -214,47 +231,20 @@ export function buildFlowStepRequest(
   }
 
   // Cookie + header injection from the session.
-  if (inj.cookies) {
-    const parts: string[] = [];
-    for (const [cookieName, valueKey] of Object.entries(inj.cookies)) {
-      const v = values[valueKey];
-      if (v) parts.push(`${cookieName}=${v}`);
-    }
-    if (parts.length > 0) headers['cookie'] = parts.join('; ');
-  }
-  if (inj.headers) {
-    for (const [hName, valueKey] of Object.entries(inj.headers)) {
-      const v = values[valueKey];
-      if (v) headers[hName] = v;
-    }
-  }
-  // Common bearer pattern when injection.headers didn't name it.
-  if (values.token && !headers['authorization'] && !inj.tokenFormField) {
-    // Only add bearer if no form token field — adapters that use headers set injection.
-  }
+  const cookie = injected(inj.cookies, values).map(([n, v]) => `${n}=${v}`).join('; ');
+  if (cookie) headers['cookie'] = cookie;
+  for (const [hName, v] of injected(inj.headers, values)) headers[hName] = v;
 
-  let req: ReplayRequest = {
-    method,
-    url: url.toString(),
-    headers,
-    body,
-  };
-
+  const built: ReplayRequest = { method, url: url.toString(), headers, body };
   // Overlay learned identity headers / stable fingerprint.
-  if (step.request) {
-    const tmpl: RequestTemplate = {
-      headers: step.request.headers,
-      bodyParams: step.request.bodyParams,
-      volatileParams: step.request.volatileParams,
-    };
-    req = makeFaithful(req, tmpl);
-  }
+  const req = step.request ? makeFaithful(built, step.request) : built;
 
-  // Guard: never send unsubstituted path placeholders.
+  // Guard: never send unsubstituted path placeholders. Path only in the
+  // message — the query of a built GET carries the live credentials.
   if (pathStillHasPlaceholders(req.url)) {
     throw new FlowBuildError(
       'path_unresolved',
-      `flow build refused: path still has unsubstituted placeholders (${req.url}).`,
+      redactText(`flow build refused: path still has unsubstituted placeholders (${urlPathname(req.url)}).`),
     );
   }
 
@@ -262,195 +252,169 @@ export function buildFlowStepRequest(
   assertFlowStepAllowed(req, {
     operation: step.operation,
     allowedHosts: ctx.allowedHosts,
+    readActions: ctx.readActions,
   });
 
   return req;
 }
 
 /**
- * Build every reproducible step up front (no binds that need live responses).
- * Steps that need binds return null placeholders — prefer runFlowReplay's
- * per-step build for bind-aware runs.
+ * The `build` hook for interceptor `runFlowReplay`, with both of the adapter's
+ * rails filled in: its declared hosts and its replay actions (the read surface
+ * a non-GET step must match). Taking the adapter, rather than those lists, is
+ * what keeps a call site from dropping either one.
  */
-export function buildFlowRequests(
+export function flowStepBuilder(
   template: FlowTemplate,
+  app: Pick<Adapter, 'hosts' | 'listReplayActions'>,
+): (
+  step: FlowTemplateStep,
   session: Session,
-  params: Record<string, string> = {},
-  opts: { allowedHosts?: readonly string[] } = {},
-): Array<{ step: FlowTemplateStep; request: ReplayRequest | null }> {
-  const ctx: FlowStepBuildContext = {
-    params,
-    priorResponses: new Map(),
-    allowedHosts: opts.allowedHosts,
+  ctx: Pick<FlowStepBuildContext, 'params' | 'priorResponses'>,
+) => ReplayRequest | null {
+  const allowedHosts = app.hosts;
+  const readActions = app.listReplayActions();
+  // An older template keeps building; only a refusal says why it may now fail.
+  const stale = template.version < FLOW_TEMPLATE_VERSION;
+  return (step, session, ctx) => {
+    try {
+      return buildFlowStepRequest(template, step, session, {
+        params: ctx.params,
+        priorResponses: ctx.priorResponses,
+        allowedHosts,
+        readActions,
+      });
+    } catch (e) {
+      if (stale && e instanceof FlowBuildError) {
+        e.message += ` This template was learned by an older Sluice (v${template.version}); re-run \`sluice learn-flows\`.`;
+      }
+      throw e;
+    }
   };
-  return template.steps
-    .slice()
-    .sort((a, b) => a.seq - b.seq)
-    .map((step) => {
-      return { step, request: buildFlowStepRequest(template, step, session, ctx) };
-    });
 }
 
 // ── internals ────────────────────────────────────────────────────────────────
+
+/** A non-empty session value under an OWN key: a ref such as `constructor` never reaches Object.prototype. */
+function sessionValue(values: Record<string, string>, key: string): string | undefined {
+  const v = Object.hasOwn(values, key) ? values[key] : undefined;
+  return typeof v === 'string' && v !== '' ? v : undefined;
+}
+
+/** An injection map (wire NAME → `values` KEY) resolved to [name, value] pairs; keys with no value send nothing. */
+function injected(map: Record<string, string> | undefined, values: Record<string, string>): Array<[string, string]> {
+  return Object.entries(map ?? {}).flatMap(([name, key]): Array<[string, string]> => {
+    const v = sessionValue(values, key);
+    return v === undefined ? [] : [[name, v]];
+  });
+}
 
 /**
  * Substitute `{name}` / legacy `:id` path segments from step.params + ctx.params.
  * Returns null when a required placeholder cannot be resolved (soft miss).
  * Throws path_unresolved only after URL assembly if something still slips through.
  */
-function resolveStepPath(
-  step: FlowTemplateStep,
-  session: Session,
-  ctx: FlowStepBuildContext,
-): string | null {
-  let path = step.path;
-
+function resolveStepPath(step: FlowTemplateStep, ctx: FlowStepBuildContext): string | null {
   // Named `{param}` placeholders.
-  path = path.replace(/\{([A-Za-z_][A-Za-z0-9_]*)\}/g, (full, name: string) => {
-    const v = resolvePathPlaceholder(name, step, session, ctx);
-    return v !== undefined ? encodeURIComponent(v) : full;
+  let path = step.path.replace(/\{([A-Za-z_][A-Za-z0-9_]*)\}/g, (full, name: string) => {
+    const v = resolvePathPlaceholder(name, step, ctx);
+    return v !== undefined ? pathSegment(v) : full;
   });
 
   // Legacy `:id` / `:id2` — prefer explicit step.params named id/id2/cardId… then
   // first unused flow param that looks like an id key, then ctx.params.id.
   if (/(?:^|\/):\w+(?=\/|$)/.test(path)) {
-    const idValues: string[] = [];
+    const ids = new Set<string>();
     const tryNames = ['id', 'cardId', 'boardId', 'listId', 'memberId', 'channel', 'channelId'];
-    const seen = new Set<string>();
     for (const name of tryNames) {
-      const v = resolvePathPlaceholder(name, step, session, ctx);
-      if (v !== undefined && !seen.has(v)) {
-        idValues.push(v);
-        seen.add(v);
-      }
+      const v = resolvePathPlaceholder(name, step, ctx);
+      if (v !== undefined) ids.add(v);
     }
     // Any other resolved step path-ish params.
-    if (step.params) {
-      for (const [k, src] of Object.entries(step.params)) {
-        if (!/Id$|^id\d*$/i.test(k)) continue;
-        const v = resolveParam(src, session, ctx) ?? ctx.params[k];
-        if (v !== undefined && !seen.has(v)) {
-          idValues.push(v);
-          seen.add(v);
-        }
-      }
+    for (const [k, src] of Object.entries(step.params ?? {})) {
+      if (!/Id$|^id\d*$/i.test(k)) continue;
+      const v = resolveParam(src, ctx) ?? ctx.params[k];
+      if (v !== undefined) ids.add(v);
     }
+    const idValues = [...ids];
     let i = 0;
     path = path.replace(/(?<=^|\/):(\w+)(?=\/|$)/g, (full) => {
       const v = idValues[i++];
-      return v !== undefined ? encodeURIComponent(v) : full;
+      return v !== undefined ? pathSegment(v) : full;
     });
   }
 
-  if (pathStillHasPlaceholders(path)) {
-    // Missing path param — cannot build faithfully (same as missing flowParam).
-    return null;
+  return pathStillHasPlaceholders(path) ? null : path; // missing path param — cannot build faithfully
+}
+
+/**
+ * One percent-encoded path segment. `.` and `..` survive encodeURIComponent and
+ * a URL parser resolves them, so a caller value could climb out of the learned
+ * path (`/1/cards/{cardId}` → `/1/`): refused.
+ */
+function pathSegment(value: string): string {
+  if (value === '.' || value === '..') {
+    throw new FlowBuildError('path_unresolved', 'flow build refused: "." and ".." are not path segment values.');
   }
-  return path;
+  return encodeURIComponent(value);
 }
 
 function resolvePathPlaceholder(
   name: string,
   step: FlowTemplateStep,
-  session: Session,
   ctx: FlowStepBuildContext,
 ): string | undefined {
   const src = step.params?.[name];
   if (src) {
-    const v = resolveParam(src, session, ctx);
+    const v = resolveParam(src, ctx);
     if (v !== undefined) return v;
   }
   if (ctx.params[name] !== undefined) return ctx.params[name];
-  // Common alias: callers pass `id` for `{cardId}` etc.
-  if (name.endsWith('Id') && ctx.params.id !== undefined) return ctx.params.id;
-  if (name === 'id' || name === 'cardId') {
-    return ctx.params.cardId ?? ctx.params.id;
-  }
-  if (name === 'boardId') return ctx.params.boardId ?? ctx.params.id;
-  return undefined;
+  // Common aliases: callers pass id for {cardId} etc., and cardId for {id}.
+  return name.endsWith('Id') ? ctx.params.id : name === 'id' ? ctx.params.cardId : undefined;
 }
 
 function pathPlaceholderNames(path: string): Set<string> {
-  const names = new Set<string>();
-  for (const m of path.matchAll(/\{([A-Za-z_][A-Za-z0-9_]*)\}/g)) {
-    if (m[1]) names.add(m[1]);
-  }
-  if (/(?:^|\/):\w+(?=\/|$)/.test(path)) {
-    names.add('id');
-  }
+  const names = new Set(Array.from(path.matchAll(/\{([A-Za-z_][A-Za-z0-9_]*)\}/g), (m) => m[1]!));
+  if (/(?:^|\/):\w+(?=\/|$)/.test(path)) names.add('id');
   return names;
 }
 
 function pathStillHasPlaceholders(urlOrPath: string): boolean {
-  let path = urlOrPath;
-  try {
-    path = new URL(urlOrPath).pathname;
-  } catch {
-    path = urlOrPath.split('?')[0] ?? urlOrPath;
-  }
+  const path = urlPathname(urlOrPath);
   return /\{[A-Za-z_][A-Za-z0-9_]*\}/.test(path) || /(?:^|\/):\w+(?=\/|$)/.test(path);
 }
 
-function resolveParam(
-  src: FlowParamSource,
-  session: Session,
-  ctx: FlowStepBuildContext,
-): string | undefined {
+function resolveParam(src: FlowParamSource, ctx: FlowStepBuildContext): string | undefined {
   switch (src.kind) {
     case 'literal':
       return src.value.includes(MASK) ? undefined : src.value;
     case 'flowParam':
       return ctx.params[src.name];
-    case 'session': {
-      // Prefer explicit token, then cookie, then first value.
-      const v = session.credentials.values;
-      return v.token ?? v.d ?? v.cookie ?? Object.values(v)[0];
-    }
+    case 'session':
+      // Never guessed from the session: a credential goes out only where the
+      // adapter's injection declares it (applied after params resolve), not
+      // under whatever name a redacted capture param had.
+      return undefined;
     case 'bind': {
       const data = ctx.priorResponses.get(src.fromStep);
       if (data === undefined) return undefined;
-      const resolve = ctx.resolvePath ?? defaultResolvePath;
-      return resolve(data, src.jsonPath);
+      // `a.b[0].c` paths from flow-learn.
+      return resolveJsonPath(data, src.jsonPath);
     }
-    case 'unreproducible':
-      return undefined;
     default:
       return undefined;
   }
 }
 
-function defaultResolvePath(data: unknown, path: string): string | undefined {
-  if (!path || path === '$') return prim(data);
-  let cur: unknown = data;
-  const tokens = path.match(/[^.[\]]+|\[\d+\]/g) ?? [];
-  for (const raw of tokens) {
-    if (cur == null) return undefined;
-    if (raw.startsWith('[') && raw.endsWith(']')) {
-      const idx = Number(raw.slice(1, -1));
-      if (!Array.isArray(cur)) return undefined;
-      cur = cur[idx];
-    } else if (typeof cur === 'object') {
-      cur = (cur as Record<string, unknown>)[raw];
-    } else {
-      return undefined;
-    }
-  }
-  return prim(cur);
-}
-
-function prim(v: unknown): string | undefined {
-  if (v === null || v === undefined) return undefined;
-  if (typeof v === 'string') return v;
-  if (typeof v === 'number' || typeof v === 'boolean') return String(v);
-  return undefined;
-}
-
-function hostFromSessionOrPath(
-  _session: Session,
-  step: FlowTemplateStep,
-  template: FlowTemplate,
-): string {
-  // Prefer host embedded in a full URL path sample.
+/**
+ * Where a relative step path is sent, in order: the host of an absolute path;
+ * the fixed host of an adapter with one API origin (kept ahead of the learned
+ * host, so a Slack template never pins the workspace subdomain it was learned
+ * on); the host learned for the step, when it is a plain `host[:port]`; else
+ * `<adapterId>.example`, which the host rail refuses.
+ */
+function stepHost(step: FlowTemplateStep, template: FlowTemplate): string {
   if (step.path.startsWith('http')) {
     try {
       return new URL(step.path).host;
@@ -458,8 +422,6 @@ function hostFromSessionOrPath(
       /* fall through */
     }
   }
-  // Adapter-id heuristic — good enough for build; real hosts come from captures
-  // when path was absolute. Callers can pass absolute paths in templates.
   switch (template.adapterId) {
     case 'slack':
       return 'slack.com';
@@ -469,7 +431,7 @@ function hostFromSessionOrPath(
       return 'mail.google.com';
     case 'fast':
       return 'api.fast.com';
-    default:
-      return `${template.adapterId}.example`;
   }
+  if (step.host && /^[A-Za-z0-9.-]+(?::\d+)?$/.test(step.host)) return step.host;
+  return `${template.adapterId}.example`;
 }

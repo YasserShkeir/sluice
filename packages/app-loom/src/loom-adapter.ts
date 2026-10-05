@@ -31,28 +31,21 @@ import type {
   CaptureClass,
   CursorSeed,
   ParseContext,
-  Container,
   Item,
   ParseResult,
   ReplayAction,
   ReplayRequest,
   Session,
-  Workspace,
 } from '@sluice/core';
-import { arr, obj, safeJsonObject, str } from '@sluice/adapter-sdk';
+import { arr, CHROME_UA, num, obj, requireActionParam, safeJsonObject, str } from '@sluice/adapter-sdk';
 
 export const ADAPTER_ID = 'loom';
 const WORKSPACE_ID = 'loom';
-const WORKSPACE_NAME = 'Loom';
 /** The one container every parsed video lands in. */
 const VIDEOS_CONTAINER_ID = 'loom:videos';
 
 export const LOOM_GRAPHQL_URL = 'https://www.loom.com/graphql';
 export const LOOM_SHARE_BASE = 'https://www.loom.com/share/';
-
-/** A real Chrome macOS User-Agent — Loom's web API expects a browser agent. */
-export const CHROME_UA =
-  'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36';
 
 // ── Matching ─────────────────────────────────────────────────────────────────────
 
@@ -220,28 +213,22 @@ export function transcriptOp(videoId: string, language: string | null): GraphqlO
 
 // ── Request building ───────────────────────────────────────────────────────────────
 
-/** Browser-like headers Loom's GraphQL endpoint expects, plus the auth cookie. */
-export function loomHeaders(cookieHeader: string | undefined, operationName: string): Record<string, string> {
-  const headers: Record<string, string> = {
-    'Content-Type': 'application/json',
-    Accept: '*/*',
-    'User-Agent': CHROME_UA,
-    Origin: 'https://www.loom.com',
-    Referer: 'https://www.loom.com/looms/videos',
-    'apollographql-client-name': 'web',
-    'x-loom-request-source': 'loom_web',
-    'graphql-operation-name': operationName,
-  };
-  if (cookieHeader) headers.Cookie = cookieHeader;
-  return headers;
-}
-
-/** Turn a GraphQL op + cookie into a concrete POST /graphql request. */
+/** Turn a GraphQL op + cookie into a POST /graphql with Loom's browser-like headers and the auth cookie. */
 export function buildGraphqlRequest(op: GraphqlOp, cookieHeader: string | undefined): ReplayRequest {
   return {
     method: 'POST',
     url: LOOM_GRAPHQL_URL,
-    headers: loomHeaders(cookieHeader, op.operationName),
+    headers: {
+      'Content-Type': 'application/json',
+      Accept: '*/*',
+      'User-Agent': CHROME_UA,
+      Origin: 'https://www.loom.com',
+      Referer: 'https://www.loom.com/looms/videos',
+      'apollographql-client-name': 'web',
+      'x-loom-request-source': 'loom_web',
+      'graphql-operation-name': op.operationName,
+      ...(cookieHeader ? { Cookie: cookieHeader } : {}),
+    },
     body: JSON.stringify({ operationName: op.operationName, variables: op.variables, query: op.query }),
   };
 }
@@ -249,9 +236,7 @@ export function buildGraphqlRequest(op: GraphqlOp, cookieHeader: string | undefi
 /** The GraphQL `operationName` a capture's request body declares, if any. */
 export function graphqlOperationOf(capture: Pick<Capture, 'path' | 'reqBody'>): string | undefined {
   if (!capture.path.startsWith('/graphql')) return undefined;
-  const body = obj(safeJsonObject(capture.reqBody ?? ''));
-  const op = body ? str(body.operationName) : undefined;
-  return op || undefined;
+  return str(safeJsonObject(capture.reqBody)?.operationName) || undefined;
 }
 
 // ── Classification ─────────────────────────────────────────────────────────────────
@@ -269,7 +254,7 @@ export function classifyLoomCapture(capture: Capture): { class: CaptureClass; op
   if (capture.status !== null && capture.status >= 400) return { class: 'error', operation: op };
   if (!op) return { class: 'unknown' };
   // A 200 whose GraphQL body is all errors is still a failure.
-  const body = obj(safeJsonObject(capture.resBody ?? ''));
+  const body = safeJsonObject(capture.resBody);
   if (body && Array.isArray(body.errors) && body.errors.length > 0 && body.data == null) {
     return { class: 'error', operation: op };
   }
@@ -281,24 +266,8 @@ export function classifyLoomCapture(capture: Capture): { class: CaptureClass; op
 // ── Parsing ────────────────────────────────────────────────────────────────────────
 
 function loomDate(v: unknown): number {
-  const s = str(v);
-  if (!s) return 0;
-  const ms = Date.parse(s);
+  const ms = Date.parse(str(v) ?? '');
   return Number.isFinite(ms) ? ms : 0;
-}
-
-/** Build the single Workspace + Videos container every parsed video hangs off. */
-function baseEntities(): { workspace: Workspace; container: Container } {
-  return {
-    workspace: { id: WORKSPACE_ID, adapterId: ADAPTER_ID, name: WORKSPACE_NAME, domain: 'loom.com' },
-    container: {
-      id: VIDEOS_CONTAINER_ID,
-      workspaceId: WORKSPACE_ID,
-      adapterId: ADAPTER_ID,
-      kind: 'other',
-      name: 'Videos',
-    },
-  };
 }
 
 /** One RegularUserVideo node → an Item (kind 'other'), or undefined if it has no id. */
@@ -350,21 +319,21 @@ function collectVideoNodes(data: Record<string, unknown>): Array<Record<string, 
 
 export function parseLoomCapture(capture: Capture): ParseResult {
   if (capture.host !== 'www.loom.com' || !capture.path.startsWith('/graphql')) return {};
-  if (!capture.resBody) return {};
-  const root = obj(safeJsonObject(capture.resBody));
-  const data = root ? obj(root.data) : undefined;
+  const data = obj(safeJsonObject(capture.resBody)?.data);
   if (!data) return {};
 
-  const nodes = collectVideoNodes(data);
-  const items: Item[] = [];
-  for (const node of nodes) {
-    const item = videoToItem(node, capture.id);
-    if (item) items.push(item);
-  }
+  const items = collectVideoNodes(data)
+    .map((n) => videoToItem(n, capture.id))
+    .filter((i): i is Item => i !== undefined);
   if (items.length === 0) return {};
 
-  const { workspace, container } = baseEntities();
-  return { workspaces: [workspace], containers: [container], items };
+  return {
+    workspaces: [{ id: WORKSPACE_ID, adapterId: ADAPTER_ID, name: 'Loom', domain: 'loom.com' }],
+    containers: [
+      { id: VIDEOS_CONTAINER_ID, workspaceId: WORKSPACE_ID, adapterId: ADAPTER_ID, kind: 'other', name: 'Videos' },
+    ],
+    items,
+  };
 }
 
 // ── Replay ───────────────────────────────────────────────────────────────────────────
@@ -419,14 +388,6 @@ const LOOM_REPLAY_ACTIONS: ReplayAction[] = [
   },
 ];
 
-function requireParam(action: ReplayAction, params: Record<string, string>, name: string): string {
-  const v = params[name] ?? action.params.find((p) => p.name === name)?.default;
-  if (v === undefined || v === '') {
-    throw new Error(`Loom replay action "${action.id}" needs a value for "${name}".`);
-  }
-  return v;
-}
-
 /** Map a replay action + params → the GraphQL op it issues. */
 export function opForAction(action: ReplayAction, params: Record<string, string>): GraphqlOp {
   switch (action.id) {
@@ -439,9 +400,9 @@ export function opForAction(action: ReplayAction, params: Record<string, string>
       return notificationsOp(Number.isFinite(first) && first > 0 ? first : 20, params.cursor || null);
     }
     case 'loom.video.get':
-      return getVideoOp(requireParam(action, params, 'videoId'));
+      return getVideoOp(requireActionParam(action, params, 'videoId'));
     case 'loom.video.transcript':
-      return transcriptOp(requireParam(action, params, 'videoId'), params.language || null);
+      return transcriptOp(requireActionParam(action, params, 'videoId'), params.language || null);
     default:
       throw new Error(`Unknown Loom replay action "${action.id}".`);
   }
@@ -457,6 +418,19 @@ function buildReplayRequest(
 
 // ── The adapter ────────────────────────────────────────────────────────────────────
 
+/** The first `pageInfo.endCursor` under `node` whose `hasNextPage` is true (arrays are not walked). */
+function nextEndCursor(node: unknown): string | undefined {
+  const o = obj(node);
+  if (!o) return undefined;
+  const pi = obj(o.pageInfo);
+  const end = pi?.hasNextPage === true ? str(pi.endCursor) : undefined;
+  if (end) return end;
+  for (const v of Object.values(o)) {
+    const hit = nextEndCursor(v);
+    if (hit) return hit;
+  }
+  return undefined;
+}
 
 /**
  * Relay library / notifications pages → one more seed when hasNextPage.
@@ -465,63 +439,25 @@ function buildReplayRequest(
 export function loomNextCursors(capture: Capture, _ctx?: ParseContext): CursorSeed[] {
   if (capture.host !== 'www.loom.com' || !capture.path.startsWith('/graphql')) return [];
   if (typeof capture.status === 'number' && capture.status >= 400) return [];
-  if (!capture.resBody || !capture.reqBody) return [];
-  const root = obj(safeJsonObject(capture.resBody));
-  const data = root ? obj(root.data) : undefined;
+  const data = obj(safeJsonObject(capture.resBody)?.data);
   if (!data) return [];
 
   // Detect which op from the request body operationName / query prefix.
-  const req = obj(safeJsonObject(capture.reqBody));
+  const req = safeJsonObject(capture.reqBody);
   const q = str(req?.query) ?? '';
   const opName = str(req?.operationName) ?? '';
   const isLibrary = opName.includes('LoomsForLibrary') || q.includes('GetLoomsForLibrary');
   const isNotif = opName.includes('Notifications') || q.includes('GetCurrentUserNotifications');
   if (!isLibrary && !isNotif) return [];
+  const end = nextEndCursor(data);
+  if (!end) return [];
 
-  // Walk for first pageInfo with hasNextPage
-  function findPageInfo(node: unknown): { endCursor: string; hasNextPage: boolean } | undefined {
-    const o = obj(node);
-    if (!o) return undefined;
-    const pi = obj(o.pageInfo);
-    if (pi && pi.hasNextPage === true) {
-      const end = str(pi.endCursor);
-      if (end) return { endCursor: end, hasNextPage: true };
-    }
-    for (const v of Object.values(o)) {
-      if (v && typeof v === 'object') {
-        const hit = findPageInfo(v);
-        if (hit) return hit;
-      }
-    }
-    return undefined;
-  }
-  const page = findPageInfo(data);
-  if (!page) return [];
-
-  if (isLibrary) {
-    const vars = obj(req?.variables);
-    const limit = str(vars?.limit) ?? '12';
-    return [
-      {
-        adapterId: ADAPTER_ID,
-        actionId: 'loom.videos.library',
-        cursor: page.endCursor,
-        params: { limit, cursor: page.endCursor },
-        reason: 'cursor',
-      },
-    ];
-  }
+  // The page size rides in `variables` as a number; `num` reads numbers and numeric strings.
   const vars = obj(req?.variables);
-  const first = str(vars?.first) ?? '20';
-  return [
-    {
-      adapterId: ADAPTER_ID,
-      actionId: 'loom.notifications.list',
-      cursor: page.endCursor,
-      params: { first, cursor: page.endCursor },
-      reason: 'cursor',
-    },
-  ];
+  const seed: Pick<CursorSeed, 'actionId' | 'params'> = isLibrary
+    ? { actionId: 'loom.videos.library', params: { limit: String(num(vars?.limit) ?? 12), cursor: end } }
+    : { actionId: 'loom.notifications.list', params: { first: String(num(vars?.first) ?? 20), cursor: end } };
+  return [{ adapterId: ADAPTER_ID, ...seed, cursor: end, reason: 'cursor' }];
 }
 
 export const loomAdapter: Adapter = {
@@ -531,15 +467,9 @@ export const loomAdapter: Adapter = {
   matchRequest(input) {
     return matchesLoom(input.host);
   },
-  parse(capture) {
-    return parseLoomCapture(capture);
-  },
-  nextCursors(capture, ctx) {
-    return loomNextCursors(capture, ctx);
-  },
-  classify(capture) {
-    return classifyLoomCapture(capture);
-  },
+  parse: parseLoomCapture,
+  nextCursors: loomNextCursors,
+  classify: classifyLoomCapture,
   listReplayActions() {
     return LOOM_REPLAY_ACTIONS;
   },

@@ -17,7 +17,8 @@ import test from 'node:test';
 import { makeCapture } from '@sluice/adapter-sdk';
 import { SqliteStore } from '@sluice/core';
 import type { Capture } from '@sluice/core';
-import { parseGmailCapture, reconcileGmailAccounts, slotLedger } from './index.js';
+import { parseGmailCapture } from './gmail-adapter.js';
+import { reconcileGmailAccounts, slotLedger } from './reconcile.js';
 
 const HOUR = 3_600_000;
 

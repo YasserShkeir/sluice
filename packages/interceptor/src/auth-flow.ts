@@ -19,10 +19,8 @@
  * Nothing here ever emits a secret value. Names, endpoints, counts and redacted
  * previews only — the same rule as everywhere else in the capture path.
  */
-import { previewSecret } from '@sluice/core';
+import { headerValue, MASK, previewSecret } from '@sluice/core';
 import type { Capture } from '@sluice/core';
-
-const MASK = '«redacted»';
 
 /** An endpoint observed handing out a credential. */
 export interface CredentialIssuer {
@@ -80,13 +78,6 @@ function cookieNamesFrom(header: string): string[] {
     .filter(Boolean);
 }
 
-function headerValue(headers: Record<string, string>, name: string): string | undefined {
-  for (const [k, v] of Object.entries(headers ?? {})) {
-    if (k.toLowerCase() === name) return v;
-  }
-  return undefined;
-}
-
 /** Token-ish field names in a JSON response body that indicate a credential was issued. */
 const TOKEN_FIELD = /"((?:access|refresh|id|session|auth|csrf)[_-]?token|token|jwt)"\s*:\s*"([^"]{8,})"/gi;
 
@@ -109,27 +100,16 @@ export function mapAuthFlow(captures: Capture[], adapterId: string | null = null
   for (const c of ordered) {
     const minted: Array<{ name: string; value: string }> = [];
 
-    const setCookie = headerValue(c.resHeaders ?? {}, 'set-cookie');
+    const setCookie = headerValue(c.resHeaders, 'set-cookie');
     if (setCookie && setCookie !== MASK) {
-      for (const ck of splitSetCookie(setCookie)) {
-        if (BORING_COOKIES.test(ck.name)) continue;
-        minted.push(ck);
-      }
+      minted.push(...splitSetCookie(setCookie).filter((ck) => !BORING_COOKIES.test(ck.name)));
     } else if (setCookie === MASK) {
       // Redacted, but its presence still tells us this endpoint issues a cookie.
       minted.push({ name: '«cookie»', value: MASK });
     }
 
-    if (c.resBody) {
-      TOKEN_FIELD.lastIndex = 0;
-      for (;;) {
-        const m = TOKEN_FIELD.exec(c.resBody);
-        if (!m) break;
-        const name = m[1];
-        const value = m[2];
-        if (!name || !value) continue;
-        minted.push({ name, value });
-      }
+    for (const [, name, value] of c.resBody?.matchAll(TOKEN_FIELD) ?? []) {
+      if (name && value) minted.push({ name, value });
     }
 
     if (minted.length === 0) continue;
@@ -163,9 +143,9 @@ export function mapAuthFlow(captures: Capture[], adapterId: string | null = null
   const seenOnRequests = new Set<string>();
 
   for (const c of ordered) {
-    const cookie = headerValue(c.reqHeaders ?? {}, 'cookie');
+    const cookie = headerValue(c.reqHeaders, 'cookie');
     const names = cookie && cookie !== MASK ? cookieNamesFrom(cookie) : cookie === MASK ? ['«cookie»'] : [];
-    if (headerValue(c.reqHeaders ?? {}, 'authorization')) names.push('authorization');
+    if (headerValue(c.reqHeaders, 'authorization')) names.push('authorization');
     for (const n of names) {
       seenOnRequests.add(n);
       const at = mintedAt.get(n);
@@ -175,15 +155,8 @@ export function mapAuthFlow(captures: Capture[], adapterId: string | null = null
 
   for (const entry of issuers.values()) {
     entry.dependentRequests = entry.mints.reduce((n, name) => n + (used.get(name) ?? 0), 0);
-    if (entry.dependentRequests === 0) {
-      entry.role = 'issues-unused';
-    } else if (entry.observations > 1) {
-      // Issued repeatedly AND depended upon: that is a refresh endpoint. A login
-      // happens once per session; a refresh recurs.
-      entry.role = 'refresh';
-    } else {
-      entry.role = 'login';
-    }
+    // Issued repeatedly AND depended upon = refresh; a login happens once per session.
+    entry.role = entry.dependentRequests === 0 ? 'issues-unused' : entry.observations > 1 ? 'refresh' : 'login';
   }
 
   const explained = new Set([...issuers.values()].flatMap((i) => i.mints));

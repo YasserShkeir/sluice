@@ -11,8 +11,7 @@ import { cn } from '../ui/cn.js';
  * A card is a LINK to that app's page, not a filter toggle. The card can only
  * ever show four ticks and a count; "what did Sluice collect for this app, and
  * what can I do with it" needs room, so it gets a page. Scoping the traffic
- * table is still one click, but it is now the card's secondary action rather
- * than its only one — a real `<a>` so middle-click and copy-link work.
+ * table is the card's secondary action — a real `<a>` so middle-click and copy-link work.
  */
 export function AppCatalog({
   apps,
@@ -34,8 +33,6 @@ export function AppCatalog({
           actions and the hosts it intercepts.
         </p>
       </div>
-      {/* As a panel this rendered nothing until the first catalog broadcast
-          landed. As a page, nothing is indistinguishable from a broken page. */}
       {apps.length === 0 ? (
         <p className="text-[12px] text-fg-mute">Waiting for the app catalog…</p>
       ) : (
@@ -46,6 +43,17 @@ export function AppCatalog({
         </div>
       )}
     </div>
+  );
+}
+
+/** Whether an app is capturing now, built but idle, or only planned. */
+export function AppStatusBadge({ app }: { app: AppCatalogEntry }) {
+  return app.capturing ? (
+    <Badge className="border-[#2c4a30] text-[#9ad0a0]">● capturing</Badge>
+  ) : app.build.adapter ? (
+    <Badge>idle</Badge>
+  ) : (
+    <Badge className="text-fg-mute">planned</Badge>
   );
 }
 
@@ -64,13 +72,7 @@ function AppCard({
     <>
       <div className="mb-1.5 flex items-center gap-2">
         <span className="text-[13.5px] font-medium text-fg">{app.displayName}</span>
-        {app.capturing ? (
-          <Badge className="border-[#2c4a30] text-[#9ad0a0]">● capturing</Badge>
-        ) : built ? (
-          <Badge>idle</Badge>
-        ) : (
-          <Badge className="text-fg-mute">planned</Badge>
-        )}
+        <AppStatusBadge app={app} />
       </div>
 
       <div className="mb-2 text-[11.5px] text-fg-mute">

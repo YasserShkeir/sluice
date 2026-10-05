@@ -1,34 +1,22 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 /** Options page: load/save the runner endpoint, ingest token, host allowlist, and on/off. */
-const KEYS = ['endpoint', 'token', 'hosts', 'enabled'];
-const $ = (id) => document.getElementById(id);
+import { DEFAULT_ENDPOINT, KEYS, isLoopbackEndpoint } from './shared.js';
 
-/** Only loopback runners are allowed — never ship captures off-box. */
-function isLoopbackEndpoint(endpoint) {
-  try {
-    const u = new URL(endpoint);
-    if (u.protocol !== 'http:' && u.protocol !== 'https:') return false;
-    const h = (u.hostname || '').toLowerCase();
-    return h === '127.0.0.1' || h === 'localhost' || h === '[::1]' || h === '::1';
-  } catch {
-    return false;
-  }
-}
+const $ = (id) => document.getElementById(id);
 
 async function load() {
   const c = await chrome.storage.local.get(KEYS);
-  $('endpoint').value = c.endpoint || 'http://127.0.0.1:7788';
+  $('endpoint').value = c.endpoint || DEFAULT_ENDPOINT;
   $('token').value = c.token || '';
   $('hosts').value = c.hosts || '';
   $('enabled').checked = c.enabled !== false;
 }
 
 async function save() {
+  const status = $('status');
   const endpoint = $('endpoint').value.trim();
   if (!isLoopbackEndpoint(endpoint)) {
-    const status = $('status');
-    status.textContent =
-      'Endpoint must be loopback (127.0.0.1, localhost, or [::1]).';
+    status.textContent = 'Endpoint must be loopback (127.0.0.1, localhost, or [::1]).';
     return;
   }
   await chrome.storage.local.set({
@@ -37,7 +25,6 @@ async function save() {
     hosts: $('hosts').value.trim(),
     enabled: $('enabled').checked,
   });
-  const status = $('status');
   status.textContent = 'Saved.';
   setTimeout(() => {
     status.textContent = '';

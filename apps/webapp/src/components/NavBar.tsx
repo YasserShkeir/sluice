@@ -2,11 +2,8 @@
 /**
  * The shell's persistent nav.
  *
- * Connection state, engine state and the app version live here rather than in
- * the traffic toolbar, which is where they were. They describe the RUNNER, not
- * the table: "is anything connected, and is the proxy up?" is the same question
- * on the apps page as on the traffic page, and a status that vanishes when you
- * navigate reads as a status that changed.
+ * Connection, engine state and the app version describe the RUNNER, not the
+ * table, so they live in the nav on every page.
  *
  * The paused pill is here for the same reason but a sharper one — this is a
  * capture tool, and "am I recording right now?" must be answerable from every
@@ -121,11 +118,7 @@ export function NavBar({
             ❚❚ capture paused
           </span>
         ) : null}
-        <span
-          className={[
-            'inline-flex items-center gap-1.5 rounded-full border border-border-2 bg-bg-2 px-2 py-0.5 text-[11.5px]',
-          ].join(' ')}
-        >
+        <span className="inline-flex items-center gap-1.5 rounded-full border border-border-2 bg-bg-2 px-2 py-0.5 text-[11.5px]">
           <span
             className={[
               'inline-block h-2 w-2 rounded-full',

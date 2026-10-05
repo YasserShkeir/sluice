@@ -26,6 +26,7 @@
  * not claim lookalike hosts. Trust still comes from naming the adapter yourself,
  * and from the hosts it adds being disclosed rather than assumed.
  */
+import { errorMessage } from '@sluice/core';
 import type { App } from '@sluice/core';
 import { makeCapture } from './fixtures.js';
 
@@ -153,6 +154,6 @@ function capture$(fn: () => unknown): { threw: boolean; value?: unknown; why?: s
   try {
     return { threw: false, value: fn() };
   } catch (e) {
-    return { threw: true, why: e instanceof Error ? e.message : String(e) };
+    return { threw: true, why: errorMessage(e) };
   }
 }

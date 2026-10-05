@@ -21,7 +21,13 @@ import {
   scrubCaptures,                       // turn a real recording into a committable fixture
   checkConformance,                    // the throw-free load-time gate
   parseNdjson, toNdjson, runMockCaptures,
-  runConformance,                      // test files only — it imports node:test
+  runConformance,                      // test files only — it registers node:test cases
+  localSessionCredentials,             // a macOS local-store (Chrome cookie) CredentialProvider
+  replayAttempt, requireReplay, withCookieRefresh, // an app tool's live call, through ctx.replay only
+  CHROME_UA,                           // default browser User-Agent for adapter headers
+  requireStore, pageArgs, isoTime, previewText,       // store-backed MCP tools
+  actionParam, requireActionParam, fillPathParams, actionUrl, // replay params in buildReplayRequest
+  injectedHeaders, injectedQuery, injectedCookieHeader, // a session's injection map, resolved
 } from '@sluice/adapter-sdk';
 ```
 
@@ -45,8 +51,15 @@ import {
   into a fixture safe to commit. The contract is *preserve shape, replace
   content*: array lengths, nesting depth, object keys, types, every string's
   length, relative timestamp order and the form of ids survive; characters and
-  absolute timestamps do not. Deterministic — every synthetic value is derived
-  from a salted FNV-1a hash, so re-scrubbing the same recording is byte-identical.
+  absolute timestamps do not. Query values, bare query flags, token-shaped
+  query names and URLs nested in redirect wrappers (literal, percent-,
+  double- or `-3D`-encoded) are all scrambled. Every synthetic value is an
+  HMAC-SHA256 of the input keyed by `salt`, and every timestamp moves by
+  `shiftMs`; both default to **random per call**. A published fixture must
+  never be scrubbed with a fixed (committed, scripted, guessable) salt —
+  whoever knows it can confirm a guessed name or address — so pass `salt` and
+  `shiftMs` only for deterministic tests. To re-scrub an existing fixture:
+  `toNdjson(scrubCaptures(parseNdjson(text).captures))`.
 - **`checkConformance`** — see below.
 - **`runConformance`** (+ `ConformanceOptions`) — see below.
 - **`parseNdjson` / `toNdjson` / `runMockCaptures`** (+ `CaptureSink`,
@@ -56,6 +69,32 @@ import {
   traffic — the same fixture path flow clustering / dashboard rate UI should use
   in tests (F0.4). Prefer `speed: Infinity` in pure unit tests. `parseNdjson`
   skips malformed lines by line number rather than losing the whole fixture.
+- **`localSessionCredentials(spec)`** (+ `LocalSessionSpec`) — `listWorkspaces`
+  and `extractSessions` for a session in a macOS local store: a darwin guard, a
+  passive `locate()` probe that must never decrypt, one `local-store` Session
+  from `read()`, and core's `isNoSessionError` deciding "signed out" (`[]`)
+  versus a real failure (`<label> credential extraction failed: …`).
+- **`replayAttempt(req, ctx)` / `requireReplay(ctx)` / `withCookieRefresh(cookie, send, reread)`**
+  (+ `LiveAttempt`) — an app MCP tool's live call. `replayAttempt` goes through
+  `ctx.replay` (fingerprint, replay rails, budget, capture store) and throws
+  without a host context; `requireReplay` is that check alone, for a tool that
+  needs the whole Capture back. There is deliberately no bare-`fetch` fallback,
+  because that would send a live session around the rails. `withCookieRefresh`
+  re-reads the cookie once after an auth failure and re-sends, strictly
+  sequentially.
+- **`CHROME_UA`** — the default macOS Chrome User-Agent for an adapter's
+  browser-like headers; faithful replay replaces it with the learned one.
+- **`requireStore` / `pageArgs` / `isoTime` / `previewText`** (+ `PageArgs`) —
+  store-backed MCP tools: the store or a named refusal, a clamped
+  `{ limit, offset }`, a NaN-safe ISO time, a one-line preview.
+- **`actionParam` / `requireActionParam` / `fillPathParams` / `actionUrl`** — read
+  a replay action's params (caller value, else declared default) and substitute
+  `{name}` path segments, throwing by name when one is missing, empty, `.` or
+  `..` (dot segments a URL parser would resolve out of the path). `actionUrl`
+  adds every other declared, non-empty param as the query.
+- **`injectedHeaders` / `injectedQuery` / `injectedCookieHeader`** — resolve a
+  session's `CredentialInjection` (wire NAME → `values` KEY, literal fallback)
+  into what goes on the wire.
 
 ## The two conformance gates
 
@@ -87,11 +126,12 @@ Two traps:
   checks. Omitting it **silently skips** them (fast.com legitimately has no
   credential seam). Pass a session if your adapter has one. `fixtures` drives the
   entity-ownership and cursor-seed checks.
-- `conformance.ts` statically imports `node:test` and is re-exported from the
-  barrel, so *any* `import … from '@sluice/adapter-sdk'` pulls a bare `node:test`
-  import into the graph — it survives into both of this repo's shipped bundles.
-  Import `runConformance` from test files only; in-repo code that must avoid it
-  can import the other helpers from their own modules instead.
+- `conformance.ts` is re-exported from the barrel but loads `node:test` only on
+  the first `runConformance` call (through `createRequire`, which a bundler does
+  not follow), so importing `@sluice/adapter-sdk` at runtime neither loads it nor
+  carries it into a bundle. Loading it costs a few milliseconds and registers
+  nothing unless `runConformance` is called — so call `runConformance` from test
+  files only.
 
 **`checkConformance(app)` — load time.** The throw-free subset that runs outside
 a test runner: it returns one string per problem (empty array means pass) and

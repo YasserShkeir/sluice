@@ -9,11 +9,15 @@
  * has nothing else to go on.
  */
 import assert from 'node:assert/strict';
+import { createServer } from 'node:http';
+import type { AddressInfo } from 'node:net';
 import test from 'node:test';
 import { readOnlyStore, SqliteStore } from '@sluice/core';
 import { apps } from '@sluice/apps';
-import type { ReplayAction } from '@sluice/core';
-import { buildServer, workspaceOfParams } from './server.js';
+import { flowStepBuilder } from '@sluice/cartographer';
+import { runFlowReplay } from '@sluice/interceptor';
+import type { App, FlowTemplate, FlowTemplateStep, ReplayAction, Session } from '@sluice/core';
+import { acquireSession, appToolContext, buildServer, replayActionFor } from './server.js';
 
 function seeded(): SqliteStore {
   const store = new SqliteStore(':memory:');
@@ -200,6 +204,59 @@ test('sluice_list_flows and sluice_describe_flow read the store without secrets'
   store.close();
 });
 
+test('list and describe report the same quality for one template', async () => {
+  // They used to count API steps by different rules (list skipped `/assets/`,
+  // describe skipped `.js`/`.css`), so this template read 3 in one view and 2 in
+  // the other. Under the one rule it is 1 of 4 in both, and both carry the
+  // low-API-ratio note.
+  const store = seeded();
+  const step = (seq: number, role: FlowTemplateStep['role'], path: string, operation: string): FlowTemplateStep => ({
+    seq,
+    role,
+    method: 'GET',
+    path,
+    operation,
+    required: role === 'primary',
+    support: 1,
+    delayMsP50: 0,
+  });
+  const literal = 'SYNTHETIC-LITERAL-VALUE';
+  store.upsertFlowTemplate({
+    id: 'tmpl-q',
+    adapterId: 'slack',
+    primaryKey: 'conversations.history',
+    sampleCount: 1,
+    version: 1,
+    learnedAt: 1,
+    flowParams: [],
+    steps: [
+      { ...step(0, 'primary', '/api/conversations.history', 'conversations.history'), params: { mode: { kind: 'literal', value: literal } } },
+      step(1, 'companion', '/assets/x', 'thing'),
+      step(2, 'companion', '/static/app.js', 'bundle'),
+      step(3, 'companion', '/static/b.css', 'style'),
+    ],
+  });
+
+  const server = buildServer(store);
+  const listed = (await callTool(server, 'sluice_list_flows', { adapterId: 'slack' })) as {
+    templates: Array<{ id: string; apiStepCount: number; qualityNotes: string[] }>;
+  };
+  const fromList = listed.templates.find((t) => t.id === 'tmpl-q');
+  const described = (await callTool(server, 'sluice_describe_flow', { id: 'tmpl-q' })) as {
+    apiStepCount: number;
+    qualityNotes: string[];
+    steps: Array<{ params?: Record<string, { kind: string }> }>;
+  };
+  assert.equal(fromList?.apiStepCount, 1);
+  assert.equal(described.apiStepCount, 1);
+  assert.deepEqual(fromList?.qualityNotes, described.qualityNotes);
+  assert.ok(described.qualityNotes.some((n) => n.includes('non-API')));
+  // A literal's captured text never leaves; its kind does.
+  assert.equal(described.steps[0]?.params?.mode?.kind, 'literal');
+  assert.equal(JSON.stringify(described).includes(literal), false);
+  store.close();
+});
+
 test('every app-contributed tool is registered under its own name', () => {
   const store = seeded();
   const tools = registeredTools(buildServer(store));
@@ -315,43 +372,298 @@ test('building the server twice does not throw on duplicate registration', () =>
   b.close();
 });
 
-// ── Which workspace a replay is for ──────────────────────────────────────────────
+// ── Sessions and flow results ────────────────────────────────────────────────────
 
-test('a replay infers its workspace from the container its arguments name', () => {
-  // The trap this closes: with four Slack workspaces signed in, falling through
-  // to `sessions[0]` sends a Globex channel's history request out on
-  // Acme Corp's session. Slack answers HTTP 200 with
-  // `{"ok":false,"error":"channel_not_found"}` — which reads as "that channel
-  // does not exist" and actually means "you asked the wrong workspace".
-  const store = new SqliteStore(':memory:');
-  store.applyParseResult(
+/** A secret-free stand-in for a signed-in session. */
+function syntheticSession(adapterId: string, workspaceId?: string, values: Record<string, string> = {}): Session {
+  return {
+    id: `s-${workspaceId ?? 'none'}`,
+    adapterId,
+    workspaceId,
+    label: workspaceId ?? 'none',
+    credentials: { kind: 'synthetic', values, injection: values.token ? { tokenFormField: 'token' } : {} },
+    discoveredAt: 0,
+    source: 'manual',
+  };
+}
+
+test('acquireSession picks exactly one session and redacts an extractor failure', async () => {
+  // Stub apps only: a real credential provider would read the Keychain.
+  const bare = await acquireSession({ id: 'stub', displayName: 'Stub', hosts: [] } as unknown as App, {});
+  assert.ok(bare.ok);
+  assert.equal(bare.session.adapterId, 'stub');
+  assert.deepEqual(bare.session.credentials.values, {});
+
+  const twoSignedIn = {
+    id: 'stub',
+    displayName: 'Stub',
+    hosts: [],
+    credentials: { extractSessions: async () => [syntheticSession('stub', 'W-a'), syntheticSession('stub', 'W-b')] },
+  } as unknown as App;
+  const ambiguous = await acquireSession(twoSignedIn, {});
+  assert.ok(!ambiguous.ok);
+  assert.match(ambiguous.error, /Pass workspaceId/);
+  const pinned = await acquireSession(twoSignedIn, { workspaceId: 'W-b' });
+  assert.ok(pinned.ok);
+  assert.equal(pinned.session.workspaceId, 'W-b');
+  const inferred = await acquireSession(twoSignedIn, { inferred: 'W-a' });
+  assert.ok(inferred.ok);
+  assert.equal(inferred.session.workspaceId, 'W-a');
+  // A workspace nobody owns is a hint, not a choice: with two sessions it decides nothing.
+  assert.ok(!(await acquireSession(twoSignedIn, { inferred: 'slack:app.slack.com' })).ok);
+
+  // One signed-in session whose extractor names no workspace (Trello, Notion):
+  // a container filed under a synthetic workspace must not strand the replay,
+  // but an agent's explicit workspaceId is still never substituted.
+  const one = {
+    id: 'stub',
+    displayName: 'Stub',
+    hosts: [],
+    credentials: { extractSessions: async () => [syntheticSession('stub')] },
+  } as unknown as App;
+  assert.ok((await acquireSession(one, { inferred: 'stub' })).ok);
+  const explicit = await acquireSession(one, { workspaceId: 'W-other' });
+  assert.ok(!explicit.ok);
+  assert.match(explicit.error, /No signed-in workspace matched "W-other"/);
+
+  const secret = 'abcd1234efgh';
+  const failing = await acquireSession(
     {
-      workspaces: [{ id: 'W-globex', adapterId: 'slack', name: 'Globex' }],
-      containers: [
-        { id: 'C-general', workspaceId: 'W-globex', adapterId: 'slack', kind: 'channel', name: 'general' },
-      ],
-    },
-    Date.now(),
+      id: 'stub',
+      displayName: 'Stub',
+      hosts: [],
+      credentials: {
+        extractSessions: async () => {
+          throw new Error(`token=${secret}`);
+        },
+      },
+    } as unknown as App,
+    {},
   );
+  assert.ok(!failing.ok);
+  assert.ok(failing.error.startsWith('Could not acquire a session:'));
+  assert.equal(failing.error.includes(secret), false);
+});
 
-  const action: ReplayAction = {
-    id: 'slack.conversations.history',
+test('a refused flow step never carries the session token into the result', async () => {
+  // The trigger: a GET step with no operation, where the caller's params trip
+  // the write-shaped check. By then the builder has put the token into the query
+  // string, and the refusal used to quote that whole query back to the agent.
+  const slack = apps.find((a) => a.id === 'slack');
+  assert.ok(slack, 'precondition: the Slack app is installed');
+  // Token-shaped but synthetic, assembled at runtime so no scanner-shaped literal
+  // sits in source.
+  const token = ['xoxc', '000000000000', '000000000000', '000000000000', 'f'.repeat(64)].join('-');
+  const session = syntheticSession('slack', 'W-synthetic', { token });
+  const tmpl: FlowTemplate = {
+    id: 'tmpl-deny',
     adapterId: 'slack',
-    label: 'Channel history',
-    method: 'POST',
-    urlTemplate: 'https://slack.com/api/conversations.history',
-    params: [
-      { name: 'channel', label: 'Channel', kind: 'containerId', required: true },
-      { name: 'limit', label: 'Limit', kind: 'number' },
+    primaryKey: 'search.messages',
+    sampleCount: 2,
+    version: 1,
+    learnedAt: 1,
+    flowParams: [{ name: 'q', required: true }],
+    steps: [
+      {
+        seq: 0,
+        role: 'primary',
+        method: 'GET',
+        path: '/api/search.messages',
+        required: true,
+        support: 1,
+        delayMsP50: 0,
+        params: { q: { kind: 'flowParam', name: 'q' } },
+      },
     ],
   };
+  const build = flowStepBuilder(tmpl, slack);
+  const step = tmpl.steps[0];
+  assert.ok(step);
+  assert.throws(
+    () => build(step, session, { params: { q: 'mutation' }, priorResponses: new Map() }),
+    (e: Error) => /write-shaped/.test(e.message) && !e.message.includes(token),
+  );
 
-  assert.equal(workspaceOfParams(store, action, { channel: 'C-general' }), 'W-globex');
-  // Read off the action's DECLARED param kinds, not off key names — an adapter
-  // that calls its container param `board` must work without a rule per name.
-  assert.equal(workspaceOfParams(store, action, { limit: '5' }), undefined);
-  assert.equal(workspaceOfParams(store, action, { channel: 'C-unknown' }), undefined);
-  assert.equal(workspaceOfParams(store, action, undefined), undefined);
-  assert.equal(workspaceOfParams(store, action, { channel: '' }), undefined);
+  let sent = 0;
+  const result = await runFlowReplay({
+    template: tmpl,
+    params: { q: 'mutation' },
+    session,
+    pace: false,
+    io: {
+      build,
+      run: async () => {
+        sent++;
+        throw new Error('tests never reach the network');
+      },
+    },
+  });
+  assert.equal(sent, 0, 'a refused step is never sent');
+  assert.equal(result.steps[0]?.status, 'denied');
+  assert.equal(JSON.stringify(result).includes(token), false, 'the refusal names the path only');
+});
+
+test('replay and sluice_replay_flow bound their params like the dashboard frames', () => {
+  const store = seeded();
+  const tools = registeredTools(buildServer(store));
+  const many = Object.fromEntries(Array.from({ length: 65 }, (_, i) => [`k${i}`, 'v']));
+  for (const name of ['replay', 'sluice_replay_flow']) {
+    const schema = tools.get(name)?.inputSchema as
+      | { safeParse(v: unknown): { success: boolean } }
+      | undefined;
+    assert.ok(schema, `${name} must be registered`);
+    const base = name === 'replay' ? { actionId: 'a' } : { templateId: 't' };
+    assert.equal(schema.safeParse({ ...base, params: { channel: 'C1' } }).success, true, `${name} accepts a normal map`);
+    assert.equal(schema.safeParse({ ...base, params: many }).success, false, `${name} refuses 65 params`);
+    assert.equal(schema.safeParse({ ...base, params: { q: 'x'.repeat(8193) } }).success, false, `${name} long value`);
+    assert.equal(schema.safeParse({ ...base, params: { ['k'.repeat(1025)]: 'v' } }).success, false, `${name} long key`);
+  }
   store.close();
+});
+
+test('replayActionFor sends the app session\'s credentials and stores none of them', async () => {
+  const cookie = ['FAKE', 'COOKIE', 'value', '0123456789'].join('-');
+  const received: Array<string | undefined> = [];
+  const http = createServer((req, res) => {
+    received.push(req.headers.cookie);
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end('{"ok":true}');
+  });
+  await new Promise<void>((resolve) => http.listen(0, '127.0.0.1', resolve));
+  const { port } = http.address() as AddressInfo;
+  const action: ReplayAction = {
+    id: 'stub.me',
+    adapterId: 'stub',
+    label: 'me',
+    method: 'GET',
+    urlTemplate: `http://127.0.0.1:${port}/me`,
+    params: [],
+  };
+  const app = {
+    id: 'stub',
+    displayName: 'Stub',
+    hosts: ['127.0.0.1'],
+    credentials: { extractSessions: async () => [syntheticSession('stub', 'W-a', { cookieHeader: cookie })] },
+    listReplayActions: () => [action],
+    buildReplayRequest: (a: ReplayAction, _p: Record<string, string>, s: Session) => ({
+      method: 'GET',
+      url: a.urlTemplate,
+      headers: { Cookie: s.credentials.values.cookieHeader ?? '' },
+    }),
+    parse: () => ({}),
+  } as unknown as App;
+  const store = new SqliteStore(':memory:');
+  try {
+    const out = await replayActionFor(store, app, action, {}, undefined);
+    assert.ok(out.ok);
+    assert.equal(out.capture.status, 200);
+    assert.deepEqual(received, [cookie], 'the session cookie went out on the wire');
+    const stored = store.getCapture(out.capture.id);
+    assert.ok(stored);
+    assert.equal(JSON.stringify(stored).includes(cookie), false, 'no stored field carries it');
+    assert.equal(JSON.stringify(out.capture).includes(cookie), false, 'nor does the returned capture');
+  } finally {
+    store.close();
+    await new Promise<void>((resolve) => http.close(() => resolve()));
+  }
+});
+
+// ── Host and ownership rails on the app-tool seam ────────────────────────────────
+
+/** A loopback server that counts requests: a regressed rail must never reach real DNS. */
+async function countingServer(): Promise<{ origin: string; hits: () => number; close: () => Promise<void> }> {
+  let hits = 0;
+  const http = createServer((_req, res) => {
+    hits++;
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end('{"ok":true}');
+  });
+  await new Promise<void>((resolve) => http.listen(0, '127.0.0.1', resolve));
+  const { port } = http.address() as AddressInfo;
+  return {
+    origin: `http://127.0.0.1:${port}`,
+    hits: () => hits,
+    close: () => new Promise<void>((resolve) => http.close(() => resolve())),
+  };
+}
+
+/** A stub app whose declared hosts never include loopback. */
+function offHostApp(over: Record<string, unknown> = {}): App {
+  return {
+    id: 'stub',
+    displayName: 'Stub',
+    hosts: ['other.example'],
+    listReplayActions: () => [],
+    buildReplayRequest: (a: ReplayAction) => ({ method: 'GET', url: a.urlTemplate, headers: {} }),
+    parse: () => ({}),
+    ...over,
+  } as unknown as App;
+}
+
+const hostNotAllowed = (e: unknown): boolean =>
+  (e as Error).name === 'ReplayDeniedError' && (e as { code?: string }).code === 'host_not_allowed';
+
+test("an app tool's ctx.replay is sent under the app's host rail", async () => {
+  const srv = await countingServer();
+  const store = new SqliteStore(':memory:');
+  try {
+    const replay = appToolContext(store, offHostApp()).replay;
+    await assert.rejects(replay({ method: 'GET', url: `${srv.origin}/x`, headers: {} }), hostNotAllowed);
+    assert.equal(srv.hits(), 0);
+  } finally {
+    store.close();
+    await srv.close();
+  }
+});
+
+test("ctx.replayFlow refuses another app's template before acquiring a session", async () => {
+  const store = new SqliteStore(':memory:');
+  store.upsertFlowTemplate({
+    id: 'tmpl-slack',
+    adapterId: 'slack',
+    primaryKey: 'conversations.history',
+    sampleCount: 2,
+    version: 2,
+    learnedAt: 1,
+    flowParams: [],
+    steps: [{ seq: 0, role: 'primary', method: 'GET', path: '/api/x', required: true, support: 1, delayMsP50: 0 }],
+  });
+  let extractions = 0;
+  const app = offHostApp({
+    credentials: {
+      extractSessions: async () => {
+        extractions++;
+        return [];
+      },
+    },
+  });
+  try {
+    const replayFlow = appToolContext(store, app).replayFlow;
+    assert.ok(replayFlow);
+    await assert.rejects(replayFlow('tmpl-slack', {}), /Unknown flow template/);
+    assert.equal(extractions, 0, 'refused before any session was extracted');
+  } finally {
+    store.close();
+  }
+});
+
+test("replayActionFor refuses a URL outside the app's hosts before it is sent", async () => {
+  const srv = await countingServer();
+  const action: ReplayAction = {
+    id: 'stub.me',
+    adapterId: 'stub',
+    label: 'me',
+    method: 'GET',
+    urlTemplate: `${srv.origin}/me`,
+    params: [],
+  };
+  const store = new SqliteStore(':memory:');
+  try {
+    const app = offHostApp({ listReplayActions: () => [action] });
+    await assert.rejects(replayActionFor(store, app, action, {}, undefined), hostNotAllowed);
+    assert.equal(srv.hits(), 0);
+  } finally {
+    store.close();
+    await srv.close();
+  }
 });

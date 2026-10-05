@@ -1,25 +1,17 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-import { useCallback, useEffect, useState } from 'react';
+import { useState } from 'react';
 import { fetchApiDoc, fetchTable, listTables } from '../api.js';
 import { StoragePanel } from './StoragePanel.js';
-import type { TableInfo, TablePage } from '../api.js';
 import { Button } from '../ui/button.js';
 import { cn } from '../ui/cn.js';
+import { useAsync } from '../use-async.js';
 
 /**
  * The Cartographer's output, made visible.
  *
- * Sluice has always derived two useful artifacts from captured traffic — typed
- * per-app tables (`slack_channel`, `trello_card`, …) and an endpoint catalog —
- * and neither was reachable from the product: the tables were written on every
- * capture and only readable via the `sqlite3` CLI, and the catalog only via
- * `sluice apidoc`. That made the whole materialize step read as dead weight.
- *
- * Fetching is still lazy, but the gate moved: it used to be a pane collapsed by
- * default inside the single dashboard, so opening it was the signal to fetch.
- * It is a route now, and navigating to it IS that signal — during a live capture
- * these tables are rewritten continuously, and there is still no reason to poll
- * them from a page nobody is looking at.
+ * Typed per-app tables (`slack_channel`, `trello_card`, …) and the endpoint catalog
+ * the Cartographer derives. Fetched when the route opens and never polled (tables
+ * are rewritten continuously during a live capture).
  */
 type Mode = 'storage' | 'tables' | 'apidoc';
 
@@ -31,83 +23,54 @@ const tdClass =
   'max-w-[260px] overflow-hidden text-ellipsis whitespace-nowrap border-b border-border px-2.5 py-0.5';
 
 export function DataBrowser() {
-  const [open, setOpen] = useState(true);
   const [mode, setMode] = useState<Mode>('storage');
 
   return (
     <section className="flex h-full min-h-0 flex-col bg-bg-1">
       <header className="flex items-center gap-3.5 px-3 py-1.5">
-        <button
-          type="button"
-          className="cursor-pointer border-0 bg-transparent p-0.5 text-[length:var(--fs)] text-fg"
-          onClick={() => setOpen((o) => !o)}
-          aria-expanded={open}
-        >
-          {open ? '▾' : '▸'} Data & storage
-        </button>
-        {open ? (
-          <div className="flex gap-1">
-            {(
-              [
-                ['storage', 'Storage'],
-                ['tables', 'Per-app tables'],
-                ['apidoc', 'API catalog'],
-              ] as const
-            ).map(([id, label]) => (
-              <Button
-                key={id}
-                size="sm"
-                variant={mode === id ? 'primary' : 'default'}
-                aria-pressed={mode === id}
-                onClick={() => setMode(id)}
-              >
-                {label}
-              </Button>
-            ))}
-          </div>
-        ) : (
-          <span className="text-[11.5px] text-fg-mute">
-            typed tables + the endpoint catalog built from what you captured
-          </span>
-        )}
+        <span className="p-0.5 text-[length:var(--fs)] text-fg">Data &amp; storage</span>
+        <div className="flex gap-1">
+          {(
+            [
+              ['storage', 'Storage'],
+              ['tables', 'Per-app tables'],
+              ['apidoc', 'API catalog'],
+            ] as const
+          ).map(([id, label]) => (
+            <Button
+              key={id}
+              size="sm"
+              variant={mode === id ? 'primary' : 'default'}
+              aria-pressed={mode === id}
+              onClick={() => setMode(id)}
+            >
+              {label}
+            </Button>
+          ))}
+        </div>
       </header>
-      {open ? mode === 'storage' ? <StoragePanel /> : mode === 'tables' ? <Tables /> : <ApiDoc /> : null}
+      {mode === 'storage' ? <StoragePanel /> : mode === 'tables' ? <Tables /> : <ApiDoc />}
     </section>
   );
 }
 
 function Tables() {
-  const [tables, setTables] = useState<TableInfo[] | null>(null);
-  const [selected, setSelected] = useState<string>('');
-  const [page, setPage] = useState<TablePage | null>(null);
+  // The table list once on mount — see the component docstring.
+  const { data: list, error: listError } = useAsync(listTables, []);
+  const tables = list?.tables;
+  const [selected, setSelected] = useState('');
   const [offset, setOffset] = useState(0);
-  const [error, setError] = useState<string>('');
-
-  useEffect(() => {
-    listTables()
-      .then((r) => {
-        setTables(r.tables);
-        if (r.tables.length > 0 && !selected) setSelected(r.tables[0]!.name);
-      })
-      .catch((e: unknown) => setError(e instanceof Error ? e.message : String(e)));
-    // Intentionally once on mount — see the component docstring.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
-
-  const load = useCallback((name: string, off: number) => {
-    if (!name) return;
-    fetchTable(name, PAGE, off)
-      .then(setPage)
-      .catch((e: unknown) => setError(e instanceof Error ? e.message : String(e)));
-  }, []);
-
-  useEffect(() => {
-    setOffset(0);
-    load(selected, 0);
-  }, [selected, load]);
+  const current = selected || tables?.[0]?.name || '';
+  // Keyed on table AND offset, so a slow page for the previous table cannot land
+  // over the current one.
+  const { data: page, error: pageError } = useAsync(
+    () => (current ? fetchTable(current, PAGE, offset) : null),
+    [current, offset],
+  );
+  const error = listError ?? pageError;
 
   if (error) return <p className="px-3.5 py-4 text-[12.5px] text-err">Could not load tables: {error}</p>;
-  if (!tables) return <p className="px-3.5 py-4 text-[12.5px] text-fg-mute">Loading…</p>;
+  if (tables === undefined) return <p className="px-3.5 py-4 text-[12.5px] text-fg-mute">Loading…</p>;
   if (tables.length === 0) {
     return (
       <p className="px-3.5 py-4 text-[12.5px] text-fg-mute">
@@ -126,9 +89,12 @@ function Tables() {
             key={t.name}
             className={cn(
               'flex w-full cursor-pointer items-center justify-between gap-2 border-0 border-b border-border bg-transparent px-2.5 py-1.5 text-left font-mono text-[11.5px]',
-              t.name === selected ? 'bg-accent-dim text-fg' : 'text-fg-dim hover:bg-bg-2',
+              t.name === current ? 'bg-accent-dim text-fg' : 'text-fg-dim hover:bg-bg-2',
             )}
-            onClick={() => setSelected(t.name)}
+            onClick={() => {
+              setSelected(t.name);
+              setOffset(0);
+            }}
             title={`${t.columns.length} columns`}
           >
             <span className="min-w-0 overflow-hidden text-ellipsis whitespace-nowrap">{t.name}</span>
@@ -138,7 +104,7 @@ function Tables() {
       </aside>
 
       <div className="flex min-w-0 flex-1 flex-col">
-        {page ? (
+        {page !== undefined ? (
           <>
             <div className="min-h-0 flex-1 overflow-auto">
               <table className="w-full border-collapse font-mono text-[11.5px]">
@@ -175,22 +141,14 @@ function Tables() {
               <Button
                 size="sm"
                 disabled={offset === 0}
-                onClick={() => {
-                  const next = Math.max(0, offset - PAGE);
-                  setOffset(next);
-                  load(selected, next);
-                }}
+                onClick={() => setOffset(Math.max(0, offset - PAGE))}
               >
                 ← prev
               </Button>
               <Button
                 size="sm"
                 disabled={offset + PAGE >= page.total}
-                onClick={() => {
-                  const next = offset + PAGE;
-                  setOffset(next);
-                  load(selected, next);
-                }}
+                onClick={() => setOffset(offset + PAGE)}
               >
                 next →
               </Button>
@@ -216,29 +174,8 @@ function cellText(v: unknown): string {
   }
 }
 
-/** Mirrors `ApiEndpoint` from @sluice/cartographer, narrowed to what's rendered. */
-interface ApiEndpointShape {
-  key: string;
-  method: string;
-  path: string;
-  hosts: string[];
-  statuses: number[];
-  requestParams: string[];
-  sampleCount: number;
-}
-interface ApiMapShape {
-  endpoints?: ApiEndpointShape[];
-}
-
 function ApiDoc() {
-  const [map, setMap] = useState<ApiMapShape | null>(null);
-  const [error, setError] = useState('');
-
-  useEffect(() => {
-    fetchApiDoc()
-      .then((m) => setMap(m as ApiMapShape))
-      .catch((e: unknown) => setError(e instanceof Error ? e.message : String(e)));
-  }, []);
+  const { data: map, error } = useAsync(fetchApiDoc, []);
 
   if (error) return <p className="px-3.5 py-4 text-[12.5px] text-err">Could not load the catalog: {error}</p>;
   if (!map) return <p className="px-3.5 py-4 text-[12.5px] text-fg-mute">Loading…</p>;

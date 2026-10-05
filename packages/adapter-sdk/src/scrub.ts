@@ -22,47 +22,65 @@
  * vocabulary rather than the user's data, and a parser that routes on `^i` has
  * to still see `^i`.
  *
- * Deterministic: every synthetic value is drawn from a hash of the input, so
- * re-running the scrubber over the same recording produces a byte-identical
- * fixture and a re-scrub shows up as an empty diff.
+ * Keyed, and random by default: each call draws a fresh HMAC salt and timestamp
+ * shift, because whoever knows either turns the fixture back into the recording
+ * (see ScrubOptions). A published fixture must never use a fixed salt.
  *
  * Never throws. It is not in the ingest funnel, but it runs over exactly the
  * malformed bodies the funnel exists to survive, and a throw here would be a
  * throw over data nobody is allowed to paste into a bug report.
  */
+import { createHmac, randomBytes, randomInt } from 'node:crypto';
 import { MASK } from '@sluice/core';
 import type { Capture } from '@sluice/core';
 import { arr, num, obj, safeJson, str } from './coerce.js';
 
 export interface ScrubOptions {
   /**
-   * Mixed into every hash. Two fixtures scrubbed from the same mailbox with
+   * The key every synthetic value is derived under. Two fixtures scrubbed with
    * different salts share no synthetic text, which is what stops a reader from
    * lining them up and learning that two captures mentioned the same person.
+   *
+   * Omit it and each call draws a random one, which is the only safe choice for
+   * a fixture anyone else will read: whoever knows the salt can confirm a guessed
+   * plaintext. Pass one only for a deterministic test, or keep it secret.
    */
   salt?: string;
+  /**
+   * Added to every epoch-ms timestamp (epoch seconds get the same shift in
+   * seconds, ISO dates the same in ms). Omit it and each call draws a random
+   * shift of 180–730 days back, so no published constant makes the dates exact
+   * again. Pass one only for a deterministic test.
+   */
+  shiftMs?: number;
 }
 
-// ── Determinism ──────────────────────────────────────────────────────────────
+// ── One run ──────────────────────────────────────────────────────────────────
 
-/** FNV-1a, 32-bit. Not a security hash — a stable seed that agrees across runs. */
-function hash32(text: string): number {
-  let h = 0x811c9dc5;
-  for (let i = 0; i < text.length; i++) {
-    h ^= text.charCodeAt(i);
-    h = Math.imul(h, 0x01000193);
-  }
-  return h >>> 0;
+/** What every value in one scrubCaptures call shares, so repeats stay repeats. */
+interface Run {
+  salt: string;
+  shiftMs: number;
+  shiftSec: number;
+}
+
+const DAY_SEC = 86_400;
+
+function runOf(opts: unknown): Run {
+  const o = obj(opts);
+  const salt = str(o?.salt) ?? randomBytes(32).toString('hex');
+  // Whole seconds, so an epoch-ms and an epoch-seconds copy of one instant
+  // still agree after the shift.
+  const shiftMs = num(o?.shiftMs) ?? -randomInt(180 * DAY_SEC, 730 * DAY_SEC + 1) * 1000;
+  return { salt, shiftMs, shiftSec: Math.trunc(shiftMs / 1000) };
 }
 
 /**
- * The seed for one value. The separator is a marker rather than a space so that
- * `salt='a b'` + `'c'` and `salt='a'` + `'b c'` cannot seed the same generator.
+ * The seed for one value: HMAC-SHA256 keyed by the salt, not a fast unkeyed hash whose
+ * small state a few known plaintexts recover. Without the key, a guess's seed cannot be computed.
  */
-const SEED_SEPARATOR = '::sluice-scrub::';
-
 function seedOf(salt: string, value: string): number {
-  return hash32(salt + SEED_SEPARATOR + value);
+  return createHmac('sha256', salt).update(value).digest().readUInt32BE(0);
 }
 
 /** mulberry32. Seeded, so the same string always yields the same synthetic text. */
@@ -144,6 +162,24 @@ const ALL_HEX = /^[0-9a-f]{8,}$/i;
 const EMAIL = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const HTTP_URL = /^https?:\/\//i;
 
+/**
+ * Gmail label vocabulary (`^i`, `^smartlabel_promo`) — word characters, dots
+ * and dashes only, so a `^`-led token carrying `%`, `=`, `:` or `/` is not
+ * mistaken for one and kept.
+ */
+const LABEL = /^\^[A-Za-z0-9_.-]{1,32}$/;
+
+/** A base64/base64url JSON blob (`eyJ` is `{"`): a JWT or a state token, never a route. */
+const JSON_BLOB = /eyJ[\w+-]{8,}/;
+
+/**
+ * How many URLs deep a nested URL is still taken apart. A redirect wrapper
+ * (`google.com/url?q=https://…`) nests one; nothing a parser reads nests four.
+ * Past it the rest is scrambled as opaque text, which is what keeps a hostile
+ * `?q=https://…?q=https://…` chain from recursing the stack into a throw.
+ */
+const MAX_URL_DEPTH = 4;
+
 /** `.test` is reserved by RFC 6761, so a synthetic address can never resolve. */
 const SYNTH_DOMAIN = '@example.test';
 const SHORT_DOMAIN = '@x.test';
@@ -155,19 +191,16 @@ const SHORT_DOMAIN = '@x.test';
  * are recognized BEFORE the string is treated as prose, so a scrubbed fixture
  * still exercises the routing. Everything unrecognized is prose.
  */
-function scrubString(value: string, salt: string): string {
+function scrubString(value: string, run: Run, depth = 0): string {
   if (value.length === 0) return value;
   // A mask is already the absence of data. Re-scrubbing it would hide the fact
   // that the redactor ran, and the fixture is partly there to prove it did.
   if (value === MASK) return value;
-  // Gmail label vocabulary is short (`^i`, `^smartlabel_promo`). An unbounded
-  // caret passthrough would keep arbitrary user text that happens to start with
-  // `^` — bound to label-shaped tokens only.
-  if (/^\^\S{1,32}$/.test(value)) return value;
+  if (LABEL.test(value)) return value;
 
-  const seed = seedOf(salt, value);
+  const seed = seedOf(run.salt, value);
 
-  if (ISO_DATE.test(value)) return scrubIsoDate(value, salt);
+  if (ISO_DATE.test(value)) return scrubIsoDate(value, run);
 
   const prefixed = PREFIXED_ID.exec(value);
   if (prefixed) {
@@ -177,7 +210,11 @@ function scrubString(value: string, salt: string): string {
   if (ALL_DIGITS.test(value)) return synthDigits(seed, value.length);
   if (ALL_HEX.test(value)) return synthHex(seed, value.length);
   // URL before email: `https://user@host.com/` satisfies the address shape too.
-  if (HTTP_URL.test(value)) return scrubUrl(value, salt, false);
+  if (HTTP_URL.test(value)) {
+    return depth < MAX_URL_DEPTH
+      ? scrubUrl(value, run, false, depth + 1)
+      : synthText(seed, value.length);
+  }
   if (EMAIL.test(value)) return synthEmail(seed, value.length);
   return synthText(seed, value.length);
 }
@@ -223,41 +260,38 @@ const UNSAFE_IN_QUERY = /[\s&=#%]/g;
 const UNSAFE_IN_HOST = /[^a-z0-9-]/g;
 
 /**
- * Query values, fragment and userinfo never survive. The HOST and the PATH both
- * depend on whose URL it is, and getting that split wrong is the one way this
- * file leaks.
+ * Query values, bare query flags, fragment and userinfo never survive. The HOST
+ * and the PATH both depend on whose URL it is, and getting that split wrong is
+ * the one way this file leaks.
  *
- * `isOwnUrl` — the capture's OWN url, or its `:path`/`tabUrl`. `mail.google.com`
- * and `/sync/u/0/i/bv` are what `matchRequest` and `classify` route on, so
+ * `isOwnUrl` — the capture's OWN url, `path` or `:path`. `mail.google.com` and
+ * `/sync/u/0/i/bv` are what `matchRequest` and `classify` route on, so
  * scrambling them leaves a fixture that exercises neither. Same call as
  * `^label`: service vocabulary, not the user's data.
  *
- * `!isOwnUrl` — a URL found inside a body or a header value, where BOTH parts are
- * the user's data. The path went first: Gmail's image proxy encodes the original
- * remote image URL into `/proxy/<token>`, so keeping embedded paths wrote every
- * remote image the mailbox had loaded into the fixture, 198 characters at a time.
- * The host went second, for the same reason and found the same way — a leak check
- * over an already-scrubbed mailbox came back with a list of third-party domains
- * read straight out of the message bodies. Which companies email a person IS
- * content, and no adapter routes on an EMBEDDED host anyway.
+ * `!isOwnUrl` — a URL in a body or a header value, or the `tabUrl`: host and path are
+ * both user data (image-proxy paths encode remote URLs; which domains email a person
+ * is content), and no adapter routes on an embedded URL.
  *
  * Shape survives in both cases: scheme, label count, label lengths, segment
  * count, segment lengths, total length. The names do not.
+ *
+ * `depth` counts how many URLs this one is nested inside; see MAX_URL_DEPTH.
  */
-function scrubUrl(raw: string, salt: string, isOwnUrl: boolean): string {
+function scrubUrl(raw: string, run: Run, isOwnUrl: boolean, depth = 0): string {
   const parts = URL_PARTS.exec(raw);
-  if (!parts) return synthText(seedOf(salt, raw), raw.length);
+  if (!parts) return synthText(seedOf(run.salt, raw), raw.length);
   const [, authority = '', path = '', query = '', fragment = ''] = parts;
   return (
-    scrubAuthority(authority, salt, isOwnUrl) +
-    (isOwnUrl ? path : scrubPath(path, salt)) +
-    scrubQuery(query, salt) +
-    scrubFragment(fragment, salt)
+    scrubAuthority(authority, run, isOwnUrl) +
+    scrubPath(path, run, depth, isOwnUrl) +
+    scrubQuery(query, run, depth) +
+    scrubFragment(fragment, run, depth)
   );
 }
 
 /** Anything before an `@` is a credential and always goes; the host obeys `keepHost`. */
-function scrubAuthority(authority: string, salt: string, keepHost: boolean): string {
+function scrubAuthority(authority: string, run: Run, keepHost: boolean): string {
   if (authority.length === 0) return authority;
   const scheme = authority.slice(0, authority.indexOf('://') + 3);
   const rest = authority.slice(scheme.length);
@@ -266,11 +300,11 @@ function scrubAuthority(authority: string, salt: string, keepHost: boolean): str
   let userinfo = '';
   if (at >= 0) {
     const raw = rest.slice(0, at);
-    userinfo = `${synthText(seedOf(salt, raw), raw.length)
+    userinfo = `${synthText(seedOf(run.salt, raw), raw.length)
       .replace(UNSAFE_IN_SEGMENT, '-')
       .replace(/[@:]/g, '-')}@`;
   }
-  return `${scheme}${userinfo}${keepHost ? host : scrubHost(host, salt)}`;
+  return `${scheme}${userinfo}${keepHost ? host : scrubHost(host, run)}`;
 }
 
 /**
@@ -280,7 +314,7 @@ function scrubAuthority(authority: string, salt: string, keepHost: boolean): str
  * that splits on `.` still sees what it saw. The port is protocol vocabulary and
  * stays: only the name in front of it is data.
  */
-function scrubHost(host: string, salt: string): string {
+function scrubHost(host: string, run: Run): string {
   const colon = host.lastIndexOf(':');
   const hasPort = colon > 0 && ALL_DIGITS.test(host.slice(colon + 1));
   const name = hasPort ? host.slice(0, colon) : host;
@@ -290,37 +324,60 @@ function scrubHost(host: string, salt: string): string {
     .map((label) =>
       label.length === 0
         ? label
-        : synthText(seedOf(salt, label), label.length).toLowerCase().replace(UNSAFE_IN_HOST, '-'),
+        : synthText(seedOf(run.salt, label), label.length).toLowerCase().replace(UNSAFE_IN_HOST, '-'),
     )
     .join('.');
   return `${scrubbed}${port}`;
 }
 
-function scrubPath(path: string, salt: string): string {
+/**
+ * An OWN path is the route and is kept, except a segment carrying a base64 JSON
+ * blob: that is a token riding in the path, and no adapter routes on one.
+ */
+function scrubPath(path: string, run: Run, depth: number, isOwnUrl: boolean): string {
   return path
     .split('/')
-    .map((seg) => (seg.length === 0 ? seg : scrubString(seg, salt).replace(UNSAFE_IN_SEGMENT, '-')))
+    .map((seg) =>
+      seg.length === 0 || (isOwnUrl && !JSON_BLOB.test(seg))
+        ? seg
+        : scrubString(seg, run, depth).replace(UNSAFE_IN_SEGMENT, '-'),
+    )
     .join('/');
 }
 
-function scrubQuery(query: string, salt: string): string {
+/**
+ * A query NAME is the API's vocabulary (`hl`, `f.sid`, `_x_id`, `email_token`)
+ * and is kept, but only while it still looks like one. The name is everything
+ * before the first `=`, so an encoded nested query (`email_token%3D…%26x=1`, or
+ * the `-3D`/`-26` form an earlier scrub left behind) or a base64 blob with `=`
+ * padding lands in the name position whole. A dash must lead into a letter, so
+ * `-3D`, `-26` and `-252F` fail the shape.
+ */
+const PARAM_NAME = /^[A-Za-z_$][\w.$[\]]*(?:-[A-Za-z_][\w.$[\]]*)*$/;
+const MAX_PARAM_NAME = 32;
+
+function scrubQuery(query: string, run: Run, depth: number): string {
   if (query.length === 0) return query;
+  const value = (text: string): string => scrubString(text, run, depth).replace(UNSAFE_IN_QUERY, '-');
   const parts = query
     .slice(1)
     .split('&')
     .map((part) => {
-      // A param with no `=` is a bare flag: the whole token is its NAME.
+      // A part with no `=` is scrubbed like a value: a percent-encoded nested
+      // query (`?email_token%3D…%26oid%3D…`) arrives as one such part.
       const eq = part.indexOf('=');
-      if (eq < 0) return part;
-      const value = part.slice(eq + 1);
-      return `${part.slice(0, eq + 1)}${scrubString(value, salt).replace(UNSAFE_IN_QUERY, '-')}`;
+      if (eq < 0) return value(part);
+      const name = part.slice(0, eq);
+      const keepName =
+        name.length <= MAX_PARAM_NAME && PARAM_NAME.test(name) && !JSON_BLOB.test(name);
+      return `${keepName ? name : value(name)}=${value(part.slice(eq + 1))}`;
     });
   return `?${parts.join('&')}`;
 }
 
-function scrubFragment(fragment: string, salt: string): string {
+function scrubFragment(fragment: string, run: Run, depth: number): string {
   if (fragment.length === 0) return fragment;
-  return `#${scrubString(fragment.slice(1), salt).replace(UNSAFE_IN_SEGMENT, '-')}`;
+  return `#${scrubString(fragment.slice(1), run, depth).replace(UNSAFE_IN_SEGMENT, '-')}`;
 }
 
 // ── Numbers ──────────────────────────────────────────────────────────────────
@@ -328,44 +385,39 @@ function scrubFragment(fragment: string, salt: string): string {
 const EPOCH_MIN = 1e12;
 const EPOCH_MAX = 2e12;
 
-/**
- * ~347 days back. Constant, so every timestamp in the fixture moves together and
- * both ordering and the gaps between captures survive — which is what the mock
- * runner paces a replay from. It is large enough that a scrubbed date no longer
- * lines up with anything that happened in the real account, and small enough
- * that any plausible recording stays inside the epoch-ms window.
- */
-const EPOCH_SHIFT_MS = -30_000_000_000;
-
-/**
- * Numbers pass through: they are counts, flags, indices and enum values, and a
- * parser that branches on `kind === 2` has to still see 2. Timestamps are the
- * exception — they say when the user did something.
- */
 /** Epoch seconds (~2001–2033) — same shift as ms, in seconds. */
 const EPOCH_SEC_MIN = 1e9;
 const EPOCH_SEC_MAX = 2e9;
-const EPOCH_SHIFT_SEC = Math.trunc(EPOCH_SHIFT_MS / 1000);
 
 /** ISO-8601 date/time strings a JSON body might carry as text. */
 const ISO_DATE =
   /^\d{4}-\d{2}-\d{2}(?:[T ]\d{2}:\d{2}(?::\d{2}(?:\.\d{1,9})?)?(?:Z|[+-]\d{2}:?\d{2})?)?$/;
 
-function scrubNumber(value: number): number {
+/**
+ * Numbers pass through: they are counts, flags, indices and enum values, and a
+ * parser that branches on `kind === 2` has to still see 2. Timestamps are the
+ * exception — they say when the user did something.
+ *
+ * They move by the run's one shift, so every timestamp in the fixture moves
+ * together and both ordering and the gaps between captures survive — which is
+ * what the mock runner paces a replay from.
+ */
+function scrubNumber(value: number, run: Run): number {
   if (!Number.isFinite(value)) return value;
-  if (value >= EPOCH_MIN && value <= EPOCH_MAX) return value + EPOCH_SHIFT_MS;
+  if (value >= EPOCH_MIN && value <= EPOCH_MAX) return value + run.shiftMs;
   // Seconds window — exclude pure small integers (counts/flags) below 1e9.
   if (value >= EPOCH_SEC_MIN && value <= EPOCH_SEC_MAX && Number.isInteger(value)) {
-    return value + EPOCH_SHIFT_SEC;
+    return value + run.shiftSec;
   }
   return value;
 }
 
-/** Shift an ISO date string by EPOCH_SHIFT_MS, preserving length when possible. */
-function scrubIsoDate(value: string, salt: string): string {
+/** Shift an ISO date string by the run's shift, preserving length when possible. */
+function scrubIsoDate(value: string, run: Run): string {
   const ms = Date.parse(value);
-  if (!Number.isFinite(ms)) return synthText(seedOf(salt, value), value.length);
-  const shifted = new Date(ms + EPOCH_SHIFT_MS).toISOString();
+  const at = new Date(ms + run.shiftMs);
+  if (Number.isNaN(at.getTime())) return synthText(seedOf(run.salt, value), value.length);
+  const shifted = at.toISOString();
   // Prefer same length: trim/pad fractional seconds only if needed.
   if (shifted.length === value.length) return shifted;
   if (shifted.length > value.length) return shifted.slice(0, value.length);
@@ -383,18 +435,18 @@ function scrubIsoDate(value: string, salt: string): string {
  * is not covered here — none of the positional-array APIs this was built for do
  * that, and a map like that needs a decision about the map, not a regex.
  */
-function scrubValue(value: unknown, salt: string): unknown {
-  if (typeof value === 'string') return scrubString(value, salt);
-  if (typeof value === 'number') return scrubNumber(value);
+function scrubValue(value: unknown, run: Run): unknown {
+  if (typeof value === 'string') return scrubString(value, run);
+  if (typeof value === 'number') return scrubNumber(value, run);
   if (value === null || typeof value === 'boolean') return value;
 
   const list = arr(value);
-  if (list) return list.map((v) => scrubValue(v, salt));
+  if (list) return list.map((v) => scrubValue(v, run));
 
   const record = obj(value);
   if (record) {
     const out: Record<string, unknown> = {};
-    for (const [k, v] of Object.entries(record)) out[k] = scrubValue(v, salt);
+    for (const [k, v] of Object.entries(record)) out[k] = scrubValue(v, run);
     return out;
   }
   // undefined, a function, a symbol — nothing JSON.parse can produce, and
@@ -417,18 +469,22 @@ const HIJACK_PREFIX = /^\)\]\}'\s*/;
  * Anything that is not JSON — an HTML error page, a JS bundle, a truncated
  * response, a chunked stream — is scrubbed as opaque text of the same length.
  */
-function scrubBody(body: unknown, salt: string): string | null {
+function scrubBody(body: unknown, run: Run): string | null {
   const text = str(body);
   if (text === undefined || text.length === 0) return text === '' ? '' : null;
 
   const preamble = HIJACK_PREFIX.exec(text)?.[0] ?? '';
   const json = text.slice(preamble.length);
+  const opaque = (): string => `${preamble}${synthText(seedOf(run.salt, json), json.length)}`;
   const parsed = safeJson(json);
-  // Not JSON: an HTML error page, a JS bundle, or Gmail's length-prefixed chunk
-  // stream. The preamble still goes back on — a fixture that stops exercising
-  // the strip stops testing the one thing every Google parser has to get right.
-  if (parsed === undefined) return `${preamble}${synthText(seedOf(salt, json), json.length)}`;
-  return `${preamble}${JSON.stringify(scrubValue(parsed, salt))}`;
+  if (parsed === undefined) return opaque();
+  try {
+    return `${preamble}${JSON.stringify(scrubValue(parsed, run))}`;
+  } catch {
+    // JSON nested deep enough to overflow the recursion. Opaque text of the same
+    // length is a worse fixture and still a committable one; a throw is neither.
+    return opaque();
+  }
 }
 
 /**
@@ -454,7 +510,7 @@ const VOCABULARY_HEADERS = new Set([
   'vary',
 ]);
 
-function scrubHeaders(headers: unknown, salt: string): Record<string, string> {
+function scrubHeaders(headers: unknown, run: Run): Record<string, string> {
   const record = obj(headers);
   if (!record) return {};
   const out: Record<string, string> = {};
@@ -463,11 +519,9 @@ function scrubHeaders(headers: unknown, salt: string): Record<string, string> {
     if (text === undefined) continue;
     const lower = name.toLowerCase();
     if (VOCABULARY_HEADERS.has(lower)) out[name] = text;
-    // `:path` is the path AND the query string. Filed under protocol vocabulary
-    // it republished every query value the capture's own `url` had just
-    // scrubbed — an internal build label rode out on `checkbuild?bl=…` that way.
-    else if (lower === ':path') out[name] = scrubUrl(text, salt, true);
-    else out[name] = scrubString(text, salt);
+    // `:path` carries the query string, so it is scrubbed like the own url.
+    else if (lower === ':path') out[name] = scrubUrl(text, run, true);
+    else out[name] = scrubString(text, run);
   }
   return out;
 }
@@ -477,44 +531,53 @@ function scrubHeaders(headers: unknown, salt: string): Record<string, string> {
 /**
  * Scrub a recording into something committable.
  *
- * Routing metadata — `id`, `source`, `adapterId`, `method`, `host`, `path`,
- * `status`, `durationMs`, `classification`, the tab/process/WS fields — is kept
- * verbatim. None of it is the user's data (it is the recorder's own bookkeeping
- * and the service's own URL space), and all of it is what an adapter is matched
- * and classified by, so a fixture without it tests nothing.
+ * Routing metadata — `id`, `source`, `adapterId`, `method`, `host`, the route
+ * in `path`, `status`, `durationMs`, `classification`, the process/WS fields —
+ * is kept verbatim. None of it is the user's data (it is the recorder's own
+ * bookkeeping and the service's own URL space), and all of it is what an adapter
+ * is matched and classified by, so a fixture without it tests nothing.
+ *
+ * `path` gets the same treatment as the capture's own `url`: a query riding on
+ * it is scrubbed. `tabUrl` is the page the user had open — nothing routes on it,
+ * and its path is a page title or a board name — so it is scrubbed like a URL
+ * found in a body, host included.
+ *
+ * Each call is one run: one salt and one timestamp shift, random unless
+ * `opts` fixes them (see ScrubOptions). To re-scrub an existing NDJSON fixture:
+ * `toNdjson(scrubCaptures(parseNdjson(text).captures))`.
  */
 export function scrubCaptures(captures: Capture[], opts: ScrubOptions = {}): Capture[] {
-  const salt = str(obj(opts)?.salt) ?? '';
+  const run = runOf(opts);
   const list = arr(captures) ?? [];
-  return list.map((raw) => scrubCapture(raw, salt));
+  return list.map((raw) => scrubCapture(raw, run));
 }
 
-function scrubCapture(raw: unknown, salt: string): Capture {
+function scrubCapture(raw: unknown, run: Run): Capture {
   const c = obj(raw) ?? {};
   const url = str(c.url) ?? '';
   const tabUrl = str(c.tabUrl);
   const scrubbed: Capture = {
     id: str(c.id) ?? '',
-    ts: scrubNumber(num(c.ts) ?? 0),
+    ts: scrubNumber(num(c.ts) ?? 0, run),
     source: (str(c.source) ?? 'import') as Capture['source'],
     adapterId: str(c.adapterId) ?? null,
     method: str(c.method) ?? 'GET',
-    url: url === '' ? '' : scrubUrl(url, salt, true),
+    url: url === '' ? '' : scrubUrl(url, run, true),
     host: str(c.host) ?? '',
-    path: str(c.path) ?? '',
+    path: scrubUrl(str(c.path) ?? '', run, true),
     status: num(c.status) ?? null,
     durationMs: num(c.durationMs) ?? null,
-    reqHeaders: scrubHeaders(c.reqHeaders, salt),
-    reqBody: scrubBody(c.reqBody, salt),
-    resHeaders: scrubHeaders(c.resHeaders, salt),
-    resBody: scrubBody(c.resBody, salt),
+    reqHeaders: scrubHeaders(c.reqHeaders, run),
+    reqBody: scrubBody(c.reqBody, run),
+    resHeaders: scrubHeaders(c.resHeaders, run),
+    resBody: scrubBody(c.resBody, run),
   };
   // Optional fields are re-attached only when the recording had them, so a
   // scrubbed fixture does not grow keys the recorder never wrote.
   if ('pid' in c) scrubbed.pid = num(c.pid) ?? null;
   if ('processName' in c) scrubbed.processName = str(c.processName) ?? null;
   if ('tabId' in c) scrubbed.tabId = str(c.tabId) ?? null;
-  if ('tabUrl' in c) scrubbed.tabUrl = tabUrl === undefined ? null : scrubUrl(tabUrl, salt, true);
+  if ('tabUrl' in c) scrubbed.tabUrl = tabUrl === undefined ? null : scrubUrl(tabUrl, run, false);
   if ('direction' in c) scrubbed.direction = (str(c.direction) ?? null) as Capture['direction'];
   if ('loaderId' in c) scrubbed.loaderId = str(c.loaderId) ?? null;
   if ('pageLoadId' in c) scrubbed.pageLoadId = str(c.pageLoadId) ?? null;
@@ -523,7 +586,7 @@ function scrubCapture(raw: unknown, salt: string): Capture {
   if ('classification' in c) scrubbed.classification = str(c.classification) ?? null;
   if ('parsedAt' in c) {
     const at = num(c.parsedAt);
-    scrubbed.parsedAt = at === undefined ? null : scrubNumber(at);
+    scrubbed.parsedAt = at === undefined ? null : scrubNumber(at, run);
   }
   return scrubbed;
 }

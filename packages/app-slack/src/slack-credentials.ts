@@ -9,19 +9,26 @@
  * Security discipline (docs/interceptor-plan.md §2.3 / §5):
  *   - Copy-then-read the LevelDB dir and the Cookies triplet into 0700 temp dirs
  *     (they may be locked while Slack runs), and `rm -rf` them in `finally`.
+ *     `finally` does not run on SIGKILL or a native abort, and the LevelDB copy
+ *     holds every workspace's `xoxc-` token in PLAINTEXT, so each read first
+ *     sweeps stale copies an earlier, killed run left behind
+ *     (core's `sweepStaleTempDirs`, which the runner and sluice-mcp also run
+ *     at startup).
  *   - The Keychain prompt on `security find-generic-password` is the consent
  *     boundary — never suppressed.
  *   - The keychain passphrase Buffer is zeroed (`fill(0)`) after use.
  *   - Secrets live only in the returned in-memory Session; nothing is logged.
  */
-import { cpSync, existsSync, mkdtempSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { ClassicLevel } from 'classic-level';
 import {
+  copyDirSafe,
   decryptOscryptV10,
   keychainPassphrase,
   newId,
+  sweepStaleTempDirs,
   withCopiedSqliteDb,
   type Session,
 } from '@sluice/core';
@@ -60,13 +67,13 @@ export async function extractAllSlackSessions(
   }
 
   const dirs = slackAppSupportDirs(opts.appSupportDir);
-  const leveldbDir = firstExisting(dirs.map((d) => join(d, 'Local Storage', 'leveldb')));
+  const leveldbDir = dirs.map((d) => join(d, 'Local Storage', 'leveldb')).find((p) => existsSync(p));
   if (!leveldbDir) {
     throw new Error(
       'Slack Local Storage leveldb not found — is the Slack desktop app installed and signed in?',
     );
   }
-  const cookiesPath = firstExisting(dirs.map((d) => join(d, 'Cookies')));
+  const cookiesPath = dirs.map((d) => join(d, 'Cookies')).find((p) => existsSync(p));
   if (!cookiesPath) throw new Error('Slack Cookies DB not found.');
 
   const cfg = await readLocalConfig(leveldbDir);
@@ -126,14 +133,19 @@ interface LocalTeam {
  * Copy the leveldb dir into a 0700 temp dir (it may be locked while Slack runs),
  * find the key containing `localConfig_v2`, decode the Chromium type-tag byte, and
  * JSON.parse it. Returns the parsed config (`{}` when the key is absent). The temp
- * copy is shredded in `finally`.
+ * copy is shredded in `finally`, and stale copies from a killed run are swept first.
  */
 async function readLocalConfig(
   leveldbDir: string,
 ): Promise<{ teams?: Record<string, LocalTeam> }> {
+  sweepStaleTempDirs();
   const work = mkdtempSync(join(tmpdir(), 'sluice-ldb-'));
   try {
-    cpSync(leveldbDir, work, { recursive: true });
+    // copyDirSafe, not cpSync: Slack's leveldb dir sits in a macOS app
+    // container that Slack itself holds open, and Node 22's native cpSync turns
+    // a failed directory read there (EINTR) into an uncatchable C++ abort that
+    // kills the runner before it binds a port. See @sluice/core safe-copy.ts.
+    copyDirSafe(leveldbDir, work);
     const db = new ClassicLevel<Buffer, Buffer>(work, {
       keyEncoding: 'buffer',
       valueEncoding: 'buffer',
@@ -162,13 +174,15 @@ async function readLocalConfig(
  * PASSIVE, secret-free enumeration of every signed-in Slack workspace. Reads ONLY
  * the LevelDB `localConfig_v2` blob — no Keychain prompt, no network — and NEVER
  * returns tokens or cookies. Yields [] gracefully when Slack isn't installed or
- * signed in on this store.
+ * signed in on this store. "Passive" is about consent, not disk: the read goes
+ * through the same short-lived 0700 copy of Slack's store in `$TMPDIR`, and that
+ * store holds the tokens.
  */
 export async function listSlackWorkspaces(
   opts: { appSupportDir?: string } = {},
 ): Promise<SlackWorkspaceInfo[]> {
   const dirs = slackAppSupportDirs(opts.appSupportDir);
-  const leveldbDir = firstExisting(dirs.map((d) => join(d, 'Local Storage', 'leveldb')));
+  const leveldbDir = dirs.map((d) => join(d, 'Local Storage', 'leveldb')).find((p) => existsSync(p));
   if (!leveldbDir) return [];
 
   let cfg: { teams?: Record<string, LocalTeam> };
@@ -239,11 +253,4 @@ function readSlackCookies(cookiesPath: string): Record<string, string> {
   } finally {
     pass.fill(0); // §2.3 zero the passphrase
   }
-}
-
-// ── path helpers ──────────────────────────────────────────────────────────────
-
-function firstExisting(paths: string[]): string | undefined {
-  for (const p of paths) if (existsSync(p)) return p;
-  return undefined;
 }

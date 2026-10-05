@@ -10,7 +10,7 @@
  *     never launches claude. After that the socket stays up across hide/show, so
  *     toggling the drawer does not kill the session; the session dies when the
  *     TAB closes (the socket drops, the server kills the child).
- *   - It carries the SEPARATE pty secret (never the read token) via {@link ptyWsUrl}.
+ *   - It carries the SEPARATE pty secret (never the session token) via {@link ptyWsUrl}.
  *   - It is single-session by construction: one socket, one child. A reconnect
  *     replaces rather than multiplies (the server takes over).
  *
@@ -22,7 +22,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { Terminal as XTerm } from '@xterm/xterm';
 import { FitAddon } from '@xterm/addon-fit';
 import '@xterm/xterm/css/xterm.css';
-import type { PtyServerFrame } from '@sluice/core';
+import type { PtyClientFrame, PtyServerFrame } from '@sluice/core';
 import { ptyWsUrl } from '../ws.js';
 
 interface Props {
@@ -46,13 +46,10 @@ export function Terminal({ open, onClose }: Props) {
   const wsRef = useRef<WebSocket | null>(null);
   const [status, setStatus] = useState<Status>('connecting');
 
-  const send = useCallback(
-    (frame: { t: 'stdin'; d: string } | { t: 'resize'; cols: number; rows: number } | { t: 'end' }) => {
-      const ws = wsRef.current;
-      if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(frame));
-    },
-    [],
-  );
+  const send = useCallback((frame: PtyClientFrame) => {
+    const ws = wsRef.current;
+    if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(frame));
+  }, []);
 
   // Explicit teardown — the session otherwise PERSISTS across reloads/hide, so
   // this is the only thing that actually ends it.
@@ -104,7 +101,6 @@ export function Terminal({ open, onClose }: Props) {
     }
     wsRef.current = ws;
 
-    ws.onopen = () => setStatus('connecting');
     ws.onmessage = (ev: MessageEvent) => {
       let frame: PtyServerFrame;
       try {
@@ -130,7 +126,8 @@ export function Terminal({ open, onClose }: Props) {
           break;
       }
     };
-    ws.onclose = () => setStatus((s) => (s === 'ended' ? s : 'ended'));
+    // A close after an error frame (bad token, no terminal) must keep saying so.
+    ws.onclose = () => setStatus((s) => (s === 'error' ? s : 'ended'));
     ws.onerror = () => setStatus('error');
 
     const onData = term.onData((d) => send({ t: 'stdin', d }));
@@ -151,7 +148,6 @@ export function Terminal({ open, onClose }: Props) {
       fitRef.current = null;
     };
     // Setup is intentionally once-per-mount; `fitAndResize`/`send` are stable.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   // Refit + refocus when the drawer becomes visible (a hidden container measures
@@ -164,13 +160,6 @@ export function Terminal({ open, onClose }: Props) {
     }, 0);
     return () => clearTimeout(id);
   }, [open, fitAndResize]);
-
-  const statusLabel: Record<Status, string> = {
-    connecting: 'connecting…',
-    live: 'live',
-    ended: 'ended',
-    error: 'error',
-  };
 
   return (
     <div
@@ -194,7 +183,7 @@ export function Terminal({ open, onClose }: Props) {
                 : 'bg-bg-3 text-fg-mute',
           ].join(' ')}
         >
-          {statusLabel[status]}
+          {status === 'connecting' ? 'connecting…' : status}
         </span>
         <span className="text-[11px] text-fg-mute">
           runs as you · session persists across reloads

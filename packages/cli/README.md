@@ -49,17 +49,18 @@ controller and hands it to the dashboard, so the Control panel can start/stop
 capture and toggle the system proxy — the engine merely starts idle. It also
 owns the flags `start` does not have: `--isolated`, `--ingest`, `--terminal*`.
 
-`sluice --help` lists all 24 commands; `sluice <command> --help` gives one
+`sluice --help` lists every command; `sluice <command> --help` gives one
 command's options. `packages/runner/README.md` documents the full surface.
 
 ## Platform
 
 Capture and credential extraction are **macOS-only** today: the system proxy
-goes through `networksetup`, CA trust through `/usr/bin/security`, and four of
-the six installed apps read credentials from the macOS Keychain and local
-browser profiles. Elsewhere you get a proxy you cannot route to and no
-credentials: pasting them in with `--token` / `--cookie` only works where the app
-implements `sessionFromInput`, and today that is Slack alone.
+goes through `networksetup`, CA trust through `/usr/bin/security`, and the
+installed apps that extract credentials read them from the macOS Keychain and
+local browser profiles. Elsewhere you get a proxy you cannot route to and no
+credentials: pasting them in with `--token` / `--cookie` (for `--adapter ID`, else
+Slack) only works where the app implements `sessionFromInput` — today Slack,
+Notion and Toters.
 
 ## Everything is local
 

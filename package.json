@@ -15,6 +15,7 @@
     "sluice": "tsx packages/runner/src/cli.ts",
     "sluice:doctor": "tsx packages/runner/src/cli.ts doctor",
     "serve": "tsx packages/runner/src/cli.ts serve",
+    "graph": "tsx packages/project-graph/src/cli.ts",
     "webapp:dev": "pnpm --filter @sluice/webapp dev",
     "webapp:build": "pnpm --filter @sluice/webapp build",
     "typecheck": "pnpm -r --if-present typecheck",

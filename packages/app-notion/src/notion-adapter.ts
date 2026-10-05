@@ -73,7 +73,19 @@ import type {
   Session,
   Workspace,
 } from '@sluice/core';
-import { arr, compact, obj, requestParams, safeJson, safeJsonObject, str } from '@sluice/adapter-sdk';
+import {
+  actionParam,
+  arr,
+  CHROME_UA,
+  compact,
+  num,
+  obj,
+  requestParams,
+  requireActionParam,
+  safeJson,
+  safeJsonObject,
+  str,
+} from '@sluice/adapter-sdk';
 import {
   recordMaps,
   recordTitle,
@@ -91,12 +103,27 @@ function nonEmpty(v: unknown): string | undefined {
   return t !== undefined && t.length > 0 ? t : undefined;
 }
 
-/** A real Chrome macOS User-Agent — Notion's API rejects non-browser agents. */
-export const CHROME_UA =
-  'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36';
-
 /** Where the private API lives. `www.notion.so` still redirects here. */
 export const API_ORIGIN = 'https://app.notion.com';
+
+/**
+ * The header set Notion's own web client sends (its API rejects non-browser
+ * agents), plus the session cookie and the active-user header when there are
+ * values for them. Shared by `buildReplayRequest` and the MCP tools so the two
+ * cannot drift. The result carries the SECRET cookie — never log it.
+ */
+export function notionHeaders(cookieHeader?: string, activeUserId?: string): Record<string, string> {
+  return {
+    'User-Agent': CHROME_UA,
+    Accept: '*/*',
+    'Content-Type': 'application/json',
+    Origin: API_ORIGIN,
+    Referer: `${API_ORIGIN}/`,
+    'notion-audit-log-platform': 'web',
+    ...(cookieHeader ? { Cookie: cookieHeader } : {}),
+    ...(activeUserId ? { 'x-notion-active-user-header': activeUserId } : {}),
+  };
+}
 
 // ── Matching ─────────────────────────────────────────────────────────────────────
 
@@ -196,10 +223,7 @@ function spaceToWorkspace(record: NotionRecord): Workspace | undefined {
 function userToActor(record: NotionRecord, workspaceId: string): Actor | undefined {
   const id = str(record.id);
   if (!id) return undefined;
-  // Notion sends `email: ""` on every `notion_user` record except the signed-in
-  // user's own — 131 of 132 on this workspace. `str('')` is a string, so a plain
-  // `email ?? id` took the empty one and produced an actor with NO handle at
-  // all, which is worse than the uuid it was falling back from.
+  // `email` is "" on every notion_user but the signed-in user's own (see nonEmpty).
   const email = nonEmpty(record.email);
   const given = str(record.given_name);
   const family = str(record.family_name);
@@ -407,12 +431,8 @@ export function parseNotionCapture(capture: Capture, ctx?: ParseContext): ParseR
   const items = new Map<string, Item>();
   const edges: Edge[] = [];
 
-  // The one endpoint that is NOT a recordMap, and the only one that names every
-  // member of the workspace. `getVisibleUsers` answers a plain
-  // `{users: [{userId, aliases, membershipType, …}]}` — 124 people here against
-  // the 4 that appear across every page chunk put together, because a
-  // `notion_user` record only rides along when that person wrote something.
-  // Miss this and the roster is whoever happened to comment.
+  // The one non-recordMap endpoint, and the only one naming every member: a
+  // `notion_user` record rides along only when that person wrote something.
   if (op === 'getVisibleUsers') return parseVisibleUsers(capture, body, ctx);
 
   for (const map of recordMaps(body)) {
@@ -456,55 +476,31 @@ export function parseNotionCapture(capture: Capture, ctx?: ParseContext): ParseR
       });
     }
 
-    for (const { record, spaceId } of tableRecords(map, 'team')) {
-      const ws = scopeOf(spaceId, record);
-      if (!ws) continue;
-      const c = teamToContainer(record, ws);
-      if (c) containers.set(c.id, c);
-    }
-
-    for (const { record, spaceId } of tableRecords(map, 'collection')) {
-      const ws = scopeOf(spaceId, record);
-      if (!ws) continue;
-      const c = collectionToContainer(record, ws);
-      if (c) containers.set(c.id, c);
-    }
-
-    for (const { record, spaceId } of tableRecords(map, 'block')) {
-      const ws = scopeOf(spaceId, record);
-      if (!ws) continue;
-      const item = blockToItem(record, ws, capture.id);
-      if (!item) continue;
-      items.set(item.id, item);
-      if (item.authorId) {
-        edges.push({
-          srcKind: 'actor',
-          srcId: item.authorId,
-          rel: 'authored',
-          dstKind: 'item',
-          dstId: item.id,
-          adapterId: ADAPTER_ID,
-          workspaceId: ws,
-        });
+    for (const [table, toContainer] of [['team', teamToContainer], ['collection', collectionToContainer]] as const) {
+      for (const { record, spaceId } of tableRecords(map, table)) {
+        const ws = scopeOf(spaceId, record);
+        const c = ws ? toContainer(record, ws) : undefined;
+        if (c) containers.set(c.id, c);
       }
     }
 
-    for (const { record, spaceId } of tableRecords(map, 'comment')) {
-      const ws = scopeOf(spaceId, record);
-      if (!ws) continue;
-      const item = commentToItem(record, ws, capture.id);
-      if (!item) continue;
-      items.set(item.id, item);
-      if (item.authorId) {
-        edges.push({
-          srcKind: 'actor',
-          srcId: item.authorId,
-          rel: 'authored',
-          dstKind: 'item',
-          dstId: item.id,
-          adapterId: ADAPTER_ID,
-          workspaceId: ws,
-        });
+    for (const [table, toItem] of [['block', blockToItem], ['comment', commentToItem]] as const) {
+      for (const { record, spaceId } of tableRecords(map, table)) {
+        const ws = scopeOf(spaceId, record);
+        const item = ws ? toItem(record, ws, capture.id) : undefined;
+        if (!item) continue;
+        items.set(item.id, item);
+        if (item.authorId) {
+          edges.push({
+            srcKind: 'actor',
+            srcId: item.authorId,
+            rel: 'authored',
+            dstKind: 'item',
+            dstId: item.id,
+            adapterId: ADAPTER_ID,
+            workspaceId: item.workspaceId,
+          });
+        }
       }
     }
 
@@ -548,10 +544,7 @@ export function parseNotionCapture(capture: Capture, ctx?: ParseContext): ParseR
     }
   }
 
-  // `compact` rather than an object literal: a ParseResult of five explicit
-  // `undefined` keys is not the `{}` the contract asks for, and a caller testing
-  // `'items' in result` sees a page chunk that recognised nothing as one that
-  // returned an empty list.
+  // `compact`: an empty result must be `{}`, not five undefined keys.
   return compact({
     workspaces: workspaces.size ? [...workspaces.values()] : undefined,
     actors: actors.size ? [...actors.values()] : undefined,
@@ -581,7 +574,10 @@ export function parseNotionCapture(capture: Capture, ctx?: ParseContext): ParseR
  * only ever in the poorer one.
  */
 export function reconcileNotion(store: ReconcileStore): ReconcileOutcome {
-  const captures = store.listCaptures({ adapterId: ADAPTER_ID, limit: 20_000 });
+  // listCaptures returns newest-first, and the 20k window should be the newest;
+  // walk it oldest→newest so the latest name, avatar, email and membership win.
+  // Sorting `asc` in the query instead would select the OLDEST 20k.
+  const captures = store.listCaptures({ adapterId: ADAPTER_ID, limit: 20_000 }).sort((a, b) => a.ts - b.ts);
   const emails = new Map<string, string>();
   const profiles = new Map<string, { name?: string; avatar?: string; workspaceId?: string }>();
   const memberships = new Map<string, Record<string, unknown>>();
@@ -751,10 +747,7 @@ function collectionSeed(
       collectionId,
       viewId,
       ...(spaceId ? { spaceId } : {}),
-      // JSON in a string param: `CursorSeed.params` is Record<string, string>,
-      // and `replayBody` parses it back. See fact 2 in the file header for why
-      // the view's own query has to travel with the seed — Notion applies
-      // nothing from the view when `collectionView.id` is the only thing sent.
+      // JSON in string params (CursorSeed.params is string-typed); see fact 2 in the header.
       ...(query?.filter ? { filter: JSON.stringify(query.filter) } : {}),
       ...(query?.sort ? { sort: JSON.stringify(query.sort) } : {}),
     },
@@ -866,14 +859,10 @@ export function notionNextCursors(capture: Capture, _ctx?: ParseContext): Cursor
   const op = apiOperation(capture.path);
   if (!op) return [];
 
-  // A 429 is "ask again", not "nothing here" — and Notion issues them freely.
-  // A crawl of this workspace at eight concurrent readers took 5,477 rate-limit
-  // answers against 421 successes, and because a 429 carries no records it is
-  // indistinguishable from a leaf page: dropping it silently discarded every
-  // subtree underneath. Re-seeding the same request is what makes the next
-  // `replay --all` drain pick it back up; the worklist dedupes on
-  // (adapter, action, container, cursor), so a page waiting on a retry is
-  // enqueued once however many times it is refused.
+  // A 429 is "ask again", not "nothing here": it carries no records, so dropping it
+  // discards the whole subtree. A browser-captured 429 is re-seeded here as pending for
+  // the next `replay --all`; one hit by the drain dedupes onto the item being drained,
+  // which is released back to pending.
   if (capture.status === 429) return retrySeeds(capture, op);
   if (typeof capture.status === 'number' && capture.status >= 400) return [];
 
@@ -892,16 +881,12 @@ export function notionNextCursors(capture: Capture, _ctx?: ParseContext): Cursor
     for (const { id, record } of tableRecords(map, 'collection_view')) viewRecords.set(id, record);
     // A space or teamspace names its root pages; those are the only entry points
     // into a workspace that no page chunk reaches on its own.
-    for (const { record } of tableRecords(map, 'space')) {
-      for (const p of arr(record.pages) ?? []) {
-        const id = str(p);
-        if (id) pages.add(id);
-      }
-    }
-    for (const { record } of tableRecords(map, 'team')) {
-      for (const p of arr(record.team_pages) ?? []) {
-        const id = str(p);
-        if (id) pages.add(id);
+    for (const [table, key] of [['space', 'pages'], ['team', 'team_pages']] as const) {
+      for (const { record } of tableRecords(map, table)) {
+        for (const p of arr(record[key]) ?? []) {
+          const id = str(p);
+          if (id) pages.add(id);
+        }
       }
     }
     for (const { id, record, spaceId } of tableRecords(map, 'block')) {
@@ -1000,8 +985,6 @@ const NOTION_REPLAY_ACTIONS: ReplayAction[] = [
       { name: 'viewId', label: 'View id', kind: 'string', required: true },
       { name: 'spaceId', label: 'Space id', kind: 'string' },
       { name: 'limit', label: 'Rows', kind: 'number', default: '200' },
-      // The view's own query, as JSON. Without these Notion applies NOTHING from
-      // the view — a board filtered to one assignee returns the whole database.
       { name: 'filter', label: 'View filter (JSON)', kind: 'string' },
       { name: 'sort', label: 'View sort (JSON array)', kind: 'string' },
     ],
@@ -1036,33 +1019,9 @@ const NOTION_REPLAY_ACTIONS: ReplayAction[] = [
   },
 ];
 
-/** A JSON param, or undefined when absent or unparseable — never a throw. */
-function jsonParam(params: Record<string, string>, name: string): unknown {
-  const raw = params[name];
-  if (raw === undefined || raw === '') return undefined;
-  try {
-    return JSON.parse(raw);
-  } catch {
-    return undefined;
-  }
-}
-
-function numberParam(params: Record<string, string>, action: ReplayAction, name: string): number | undefined {
-  const raw = params[name] ?? action.params.find((p) => p.name === name)?.default;
-  if (raw === undefined || raw === '') return undefined;
-  const n = Number(raw);
-  return Number.isFinite(n) ? n : undefined;
-}
-
-/** A required param that is missing THROWS rather than sending `undefined`. */
+/** A required param that is missing THROWS by name rather than sending `undefined`. */
 function requireParam(action: ReplayAction, params: Record<string, string>, name: string): string {
-  const value = params[name] ?? action.params.find((p) => p.name === name)?.default;
-  if (value === undefined || value === '') {
-    throw new Error(
-      `Notion replay action "${action.id}" needs a value for "${name}" — it is a required body field, not an optional one.`,
-    );
-  }
-  return value;
+  return requireActionParam(action, params, name, ' — it is a required body field, not an optional one');
 }
 
 /**
@@ -1086,7 +1045,7 @@ function replayBody(action: ReplayAction, params: Record<string, string>): unkno
     case 'notion.page.chunk':
       return {
         pageId: requireParam(action, params, 'pageId'),
-        limit: numberParam(params, action, 'limit') ?? 100,
+        limit: num(actionParam(action, params, 'limit')) ?? 100,
         cursor: { stack: [] },
         chunkNumber: 0,
         verticalColumns: false,
@@ -1095,10 +1054,8 @@ function replayBody(action: ReplayAction, params: Record<string, string>): unkno
       const collectionId = requireParam(action, params, 'collectionId');
       const viewId = requireParam(action, params, 'viewId');
       const spaceId = params.spaceId;
-      // The view's filter and sort ride in the loader exactly where Notion's own
-      // client puts them. `collectionView.id` alone scopes nothing.
-      const filter = obj(jsonParam(params, 'filter'));
-      const sort = arr(jsonParam(params, 'sort'));
+      const filter = obj(safeJson(params.filter));
+      const sort = arr(safeJson(params.sort));
       return {
         source: { type: 'collection', id: collectionId, ...(spaceId ? { spaceId } : {}) },
         collectionView: { id: viewId, ...(spaceId ? { spaceId } : {}) },
@@ -1107,7 +1064,7 @@ function replayBody(action: ReplayAction, params: Record<string, string>): unkno
           reducers: {
             collection_group_results: {
               type: 'results',
-              limit: numberParam(params, action, 'limit') ?? 200,
+              limit: num(actionParam(action, params, 'limit')) ?? 200,
             },
           },
           ...(filter ? { filter } : {}),
@@ -1122,7 +1079,7 @@ function replayBody(action: ReplayAction, params: Record<string, string>): unkno
         type: 'BlocksInSpace',
         query: params.query ?? '',
         spaceId: requireParam(action, params, 'spaceId'),
-        limit: numberParam(params, action, 'limit') ?? 100,
+        limit: num(actionParam(action, params, 'limit')) ?? 100,
         filters: {
           isDeletedOnly: false,
           excludeTemplates: false,
@@ -1173,19 +1130,8 @@ function buildReplayRequest(
   params: Record<string, string>,
   session: Session,
 ): ReplayRequest {
-  const headers: Record<string, string> = {
-    'User-Agent': CHROME_UA,
-    Accept: '*/*',
-    'Content-Type': 'application/json',
-    Origin: API_ORIGIN,
-    Referer: `${API_ORIGIN}/`,
-    'notion-audit-log-platform': 'web',
-  };
-
-  const cookieHeader = session.credentials.values.cookieHeader;
-  if (cookieHeader) headers.Cookie = cookieHeader;
-  const activeUser = session.credentials.values.activeUserId;
-  if (activeUser) headers['x-notion-active-user-header'] = activeUser;
+  const { cookieHeader, activeUserId } = session.credentials.values;
+  const headers = notionHeaders(cookieHeader, activeUserId);
   const spaceId = params.spaceId;
   if (spaceId) headers['x-notion-space-id'] = spaceId;
 
@@ -1209,18 +1155,10 @@ export const notionAdapter: Adapter = {
   matchRequest(input) {
     return matchesNotion(input.host);
   },
-  parse(capture, ctx) {
-    return parseNotionCapture(capture, ctx);
-  },
-  classify(capture) {
-    return classifyNotionCapture(capture);
-  },
-  nextCursors(capture, ctx) {
-    return notionNextCursors(capture, ctx);
-  },
-  reconcile(store) {
-    return reconcileNotion(store);
-  },
+  parse: parseNotionCapture,
+  classify: classifyNotionCapture,
+  nextCursors: notionNextCursors,
+  reconcile: reconcileNotion,
   listReplayActions() {
     return NOTION_REPLAY_ACTIONS;
   },

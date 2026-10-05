@@ -32,19 +32,8 @@ export interface JsonSchema {
 export function jsonTypeOf(v: unknown): JsonType {
   if (v === null) return 'null';
   if (Array.isArray(v)) return 'array';
-  switch (typeof v) {
-    case 'string':
-      return 'string';
-    case 'number':
-      return 'number';
-    case 'boolean':
-      return 'boolean';
-    case 'object':
-      return 'object';
-    default:
-      // undefined / function / symbol / bigint → treat as absent-ish
-      return 'null';
-  }
+  const t = typeof v; // undefined / function / symbol / bigint → treat as absent-ish
+  return t === 'string' || t === 'number' || t === 'boolean' || t === 'object' ? t : 'null';
 }
 
 interface Acc {
@@ -163,7 +152,6 @@ interface ColAcc {
 export function inferSchema(records: Array<Record<string, unknown>>): InferredTable {
   const total = records.length;
   const cols = new Map<string, ColAcc>();
-  const order: string[] = [];
 
   for (const rec of records) {
     for (const key of Object.keys(rec)) {
@@ -171,7 +159,6 @@ export function inferSchema(records: Array<Record<string, unknown>>): InferredTa
       if (!c) {
         c = { present: 0, sawNull: false, text: false, real: false, int: false, bool: false };
         cols.set(key, c);
-        order.push(key);
       }
       c.present++;
       const v = rec[key];
@@ -198,15 +185,8 @@ export function inferSchema(records: Array<Record<string, unknown>>): InferredTa
   }
 
   const columns: Record<string, InferredColumn> = {};
-  for (const key of order) {
-    const c = cols.get(key);
-    if (!c) continue;
-    let sqliteType: SqliteType;
-    if (c.text) sqliteType = 'TEXT';
-    else if (c.real) sqliteType = 'REAL';
-    else if (c.int) sqliteType = 'INTEGER';
-    else if (c.bool) sqliteType = 'INTEGER';
-    else sqliteType = 'TEXT';
+  for (const [key, c] of cols) {
+    const sqliteType: SqliteType = c.text ? 'TEXT' : c.real ? 'REAL' : c.int || c.bool ? 'INTEGER' : 'TEXT';
     columns[key] = {
       sqliteType,
       nullable: c.sawNull || c.present < total,

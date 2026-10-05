@@ -14,6 +14,9 @@
  * keys and sequences do not (so typing in a filter box never triggers them).
  */
 import { useEffect, useMemo, useRef, useState } from 'react';
+import type { ReactNode } from 'react';
+import { groupBy } from '../collections.js';
+import { DialogShell, useEscapeKey } from '../ui/dialog.js';
 
 export interface Command {
   id: string;
@@ -62,12 +65,7 @@ function matchesCombo(e: KeyboardEvent, spec: string): boolean {
  * `mod+k` opens the palette and `?` opens the cheatsheet regardless of what any
  * command declares.
  */
-export function useGlobalHotkeys(commands: Command[]): {
-  paletteOpen: boolean;
-  setPaletteOpen: (v: boolean) => void;
-  cheatOpen: boolean;
-  setCheatOpen: (v: boolean) => void;
-} {
+export function useGlobalHotkeys(commands: Command[]) {
   const [paletteOpen, setPaletteOpen] = useState(false);
   const [cheatOpen, setCheatOpen] = useState(false);
   const cmdRef = useRef(commands);
@@ -165,12 +163,7 @@ export function CommandPalette({
   };
 
   return (
-    <div
-      className="fixed inset-0 z-[70] flex items-start justify-center bg-black/50 p-4 pt-[12vh]"
-      role="dialog"
-      aria-modal="true"
-      aria-label="Command palette"
-    >
+    <DialogShell label="Command palette" className="z-[70] items-start pt-[12vh]">
       <div className="w-full max-w-lg overflow-hidden rounded-lg border border-border bg-bg-1 shadow-2xl">
         <input
           ref={inputRef}
@@ -215,18 +208,14 @@ export function CommandPalette({
                     <span className="text-fg-mute">{c.group} · </span>
                     {c.label}
                   </span>
-                  {c.keys?.[0] ? (
-                    <kbd className="rounded bg-bg-3 px-1.5 py-0.5 text-[10px] text-fg-mute">
-                      {prettyKeys(c.keys[0])}
-                    </kbd>
-                  ) : null}
+                  {c.keys?.[0] ? <Kbd>{prettyKeys(c.keys[0])}</Kbd> : null}
                 </button>
               </li>
             ))
           )}
         </ul>
       </div>
-    </div>
+    </DialogShell>
   );
 }
 
@@ -241,34 +230,17 @@ export function KeyCheatsheet({
   open: boolean;
   onClose: () => void;
 }) {
-  useEffect(() => {
-    if (!open) return;
-    const onKey = (e: KeyboardEvent): void => {
-      if (e.key === 'Escape') onClose();
-    };
-    window.addEventListener('keydown', onKey);
-    return () => window.removeEventListener('keydown', onKey);
-  }, [open, onClose]);
+  useEscapeKey(open, onClose);
   if (!open) return null;
 
-  const groups = new Map<string, Command[]>();
-  for (const c of commands) {
-    const arr = groups.get(c.group) ?? [];
-    arr.push(c);
-    groups.set(c.group, arr);
-  }
+  const groups = groupBy(commands, (c) => c.group);
 
   return (
-    <div
-      className="fixed inset-0 z-[70] flex items-center justify-center bg-black/50 p-4"
-      role="dialog"
-      aria-modal="true"
-      aria-label="Keyboard shortcuts"
-    >
+    <DialogShell label="Keyboard shortcuts" className="z-[70] items-center">
       <div className="w-full max-w-xl rounded-lg border border-border bg-bg-1 p-4 shadow-2xl">
         <div className="mb-3 flex items-center justify-between">
           <h2 className="text-[14px] font-semibold text-fg">Keyboard shortcuts</h2>
-          <kbd className="rounded bg-bg-3 px-1.5 py-0.5 text-[10px] text-fg-mute">{prettyKeys('mod+k')} for all</kbd>
+          <Kbd>{prettyKeys('mod+k')} for all</Kbd>
         </div>
         <div className="grid grid-cols-2 gap-x-6 gap-y-4">
           {[...groups.entries()].map(([group, cmds]) => (
@@ -279,11 +251,9 @@ export function KeyCheatsheet({
                   <li key={c.id} className="flex items-center justify-between text-[12px]">
                     <span className="text-fg-dim">{c.label}</span>
                     {c.keys?.[0] ? (
-                      <kbd className="rounded bg-bg-3 px-1.5 py-0.5 text-[10px] text-fg-mute">
-                        {prettyKeys(c.keys[0])}
-                      </kbd>
+                      <Kbd>{prettyKeys(c.keys[0])}</Kbd>
                     ) : (
-                      <span className="text-[10px] text-fg-mute">⌘K</span>
+                      <span className="text-[10px] text-fg-mute">{prettyKeys('mod+k')}</span>
                     )}
                   </li>
                 ))}
@@ -292,6 +262,10 @@ export function KeyCheatsheet({
           ))}
         </div>
       </div>
-    </div>
+    </DialogShell>
   );
+}
+
+function Kbd({ children }: { children: ReactNode }) {
+  return <kbd className="rounded bg-bg-3 px-1.5 py-0.5 text-[10px] text-fg-mute">{children}</kbd>;
 }

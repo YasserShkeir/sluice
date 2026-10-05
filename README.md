@@ -19,7 +19,7 @@ rather than taken on faith.
 |---|---|---|
 | Where data goes | Out, to someone else | Nowhere. There is no egress path in the codebase — no telemetry, no cloud, no update check, no analytics |
 | What it does with your session | Exfiltrates it | Holds it in the memory of the process that read it, never writes it to disk. There is deliberately no credentials table in the schema |
-| What it can do to your account | Anything you can | Reads only. `GET`/`HEAD`/`POST`, a write/admin denylist matched against path, query *and* body, and a 60-request-per-60-second budget — enforced below every caller, so the UI cannot route around it |
+| What it can do to your account | Anything you can | Built to read. `GET`/`HEAD`/`POST` only, a best-effort write/admin denylist matched against path, query *and* body, the owning app's hosts only, and a 60-request-per-60-second budget — enforced below every caller, so the UI cannot route around it. Heuristic rails, not a proof of read-only |
 | Who it works for | Whoever installed it | Only accounts already signed in on this machine. It cannot authenticate as anyone else, and there is a standing decision never to add detection evasion |
 
 ### Audit this yourself
@@ -32,16 +32,17 @@ Read github.com/YasserShkeir/sluice and verify or refute these five claims:
    was captured from.
 2. Credentials are never written to SQLite — check packages/core/src/schema.ts
    for any column that could hold one.
-3. Replay cannot issue a mutating request — check
-   packages/interceptor/src/replay-policy.ts and packages/core/src/replay-deny.ts.
-4. Redaction runs before a capture is stored — check the ingest funnel in
-   packages/runner/src/server.ts.
+3. Replay refuses mutating methods, write-shaped operations and foreign hosts
+   below every caller — check packages/interceptor/src/replay-policy.ts and
+   packages/core/src/replay-deny.ts, and say which writes the denylist misses.
+4. Redaction runs before a capture is stored — check the ingest funnel,
+   persistCapture in packages/core/src/persist.ts.
 5. The dashboard's HTTP API is read-only — check packages/runner/src/api.ts.
 Report anything you cannot verify.
 ```
 
-[`SECURITY.md`](./SECURITY.md) documents the gaps too, including one it calls
-"the sharpest gap in the current design".
+[`SECURITY.md`](./SECURITY.md) documents the gaps too — including what the replay
+rails and the redactor do *not* guarantee.
 
 ## What Sluice never does
 
@@ -50,9 +51,11 @@ Report anything you cannot verify.
   service the data came from, and two diagnostic probes if you run `doctor --net`.
 - **Never writes a credential to disk.** The store has no column for one; only a
   redacted descriptor naming credential *kinds* is persisted.
-- **Never issues a mutating request.** 3 methods allowed, 12 denylist patterns
-  matched against path, query and body, 60 requests per 60 seconds, single-flight.
-  Every step of a multi-step flow pays the same three gates.
+- **Refuses the mutating requests it can recognise.** 3 methods allowed, a
+  write/admin denylist matched against path, query and body (as sent and
+  percent-decoded), the owning app's hosts only, no redirects followed, 60
+  requests per 60 seconds, single-flight. Every step of a multi-step flow pays the
+  same gates. These are best-effort heuristics, not a proof a replay cannot write.
 - **Never modifies traffic.** The proxy is read-only passthrough — no breakpoints,
   no rewriting, no injection. Every request and WebSocket is `thenPassThrough()`'d
   with no transforms
@@ -112,9 +115,10 @@ that adds it to your login keychain.
 
 **The residual risk.** While the proxy runs it decrypts **every host** by default,
 not only the ones an adapter claims — so unrelated traffic is decrypted and
-stored. It also listens on **every network interface**, not just loopback, because
-the underlying library offers no way to narrow it. Scope with `--host`, keep
-sessions short, and do not run it on a network you do not trust. Both are
+stored (AI-assistant hosts such as `anthropic.com`, `claude.ai` and `openai.com`
+are the exception: they are tunnelled, never decrypted). It listens on loopback
+only, unless you opt into `--lan-proxy` for a phone, which also needs
+`--lan-allow <phone IP>`. Scope with `--host` and keep sessions short. Both are
 documented in [`SECURITY.md`](./SECURITY.md).
 
 **Who should not do this.** On a managed or employer-owned device, on a shared
@@ -132,8 +136,9 @@ pnpm sluice wipe --all       # panic button: delete the capture DB, the CA and t
 
 </details>
 
-**Status: working MVP.** Six app plugins (Slack, Trello, Gmail, Loom, LinkedIn,
-fast.com), three capture engines, an MCP server, a dashboard and a 24-command CLI.
+**Status: working MVP.** Nine app plugins (Slack, Trello, Gmail, Loom, LinkedIn,
+Notion, OLX, Toters, fast.com), three capture engines, separate runtime-data and project-knowledge MCP
+servers, a dashboard and a 24-command CLI.
 ~770 tests, lint, typecheck and the packaging build run green in CI. Nothing is
 published to npm yet — install from a clone as above.
 
@@ -144,7 +149,7 @@ published to npm yet — install from a clone as above.
 Sluice records the API calls your own, already-authenticated clients make,
 reconstructs the service's structure from them (channels, DMs, users, boards,
 threads), and lets you read and export it — through a web UI, a CLI, or an MCP
-server your agent can call. Slack was the first adapter; six ship today, and the
+server your agent can call. Slack was the first adapter; nine ship today, and the
 architecture generalizes to Notion, Linear, Jira, Discord and anything else
 through pluggable app packages.
 
@@ -161,8 +166,8 @@ be confused with.
 |---|---|---|---|
 | **C — Browser CDP** *(start here)* | XHR/Fetch in a Chrome it launches — the same traffic the Network tab shows you | Touch a desktop app, or see anything outside that browser | Chrome only, and a separate profile you sign into |
 | **C — MV3 extension** | `fetch`/`XHR` on hosts you explicitly name, in your normal profile | Capture anything on a host you did not name; see WebSockets | Default-deny, so it does nothing until configured |
-| **A — MITM proxy** | Every host routed through it, desktop apps included | Modify a single byte — it is read-only passthrough | Needs a CA you trust, decrypts everything by default, and listens on every interface |
-| **B — Credential extract + replay** | Whatever your session can, on demand — including pages you never opened | Issue a write: 3 methods, 12 denylist patterns, 60/60s | Reads your Keychain / cookie DB; macOS only |
+| **A — MITM proxy** | Every host routed through it, desktop apps included | Modify a single byte — it is read-only passthrough | Needs a CA you trust and decrypts everything by default (AI-assistant hosts excepted); loopback-only unless `--lan-proxy --lan-allow <IP>` |
+| **B — Credential extract + replay** | Whatever your session can, on demand — including pages you never opened | Issue a write it can recognise: 3 methods, a write/admin denylist, the app's own hosts, 60/60s | Reads your Keychain / cookie DB; macOS only |
 
 All of them normalize into one data model and stream into a local web app that is
 part traffic inspector (à la Charles/mitmweb/Proxyman), part data explorer. Only
@@ -183,8 +188,9 @@ parsing happen in exactly one place no matter how a capture arrived.
 (MITM) **decrypts every host by default** while capture is running. Pass `--host`
 (repeatable) or `interceptHosts` — or set `interceptAllHosts: false` — to scope TLS
 termination; hosts outside that scope are CONNECT-tunnelled as raw bytes with no row
-written. Engine C's CDP path captures XHR/Fetch on any host; the extension is
-default-deny and captures nothing until you name hosts. Adapter `matchRequest` only
+written. Engine C's CDP path captures XHR/Fetch on any host, plus HTML documents on
+hosts an installed adapter claims; the extension is default-deny and captures nothing
+until you name hosts. Adapter `matchRequest` only
 decides *attribution* — an unknown service is still stored, unattributed.
 
 ![Engine A's TLS scope decision, Engine C's XHR/Fetch filter and extension host allowlist, and Engine B's credential sources.](assets/architecture/02-capture-engines.png)
@@ -194,10 +200,11 @@ app registers its own token shapes into one global policy applied to all traffic
 
 ![The five ingest steps, the redaction policy, the normalized model, the store's tables and the cartographer's outputs.](assets/architecture/03-ingest-normalization.png)
 
-**Replay.** Three independent limits — method, operation, budget — sit below every
+**Replay.** Independent limits — method, operation, host, budget — sit below every
 caller, so a modified frontend or a creative tool argument cannot route around them.
+They are best-effort heuristics, not a proof that a replay cannot write.
 
-![Replay callers, the three safety gates, the build-and-send chain, and multi-step flow replay.](assets/architecture/04-replay.png)
+![Replay callers, the four replay rails (method, operation, host, budget), the build-and-send chain, and multi-step flow replay.](assets/architecture/04-replay.png)
 
 **Control plane and consumers.** The three run modes, the engine lifecycle, the three
 per-run capability secrets, the MCP tool surface and the read-only HTTP API.
@@ -221,9 +228,10 @@ Sluice is designed to be trustworthy because it's boring about data:
 - **100% local.** Captured traffic and credentials never leave your machine. No telemetry, no cloud.
 - **Local session only.** It reads credentials your OS already holds for you on this machine.
 - **Secrets stay in memory.** Session tokens and cookies live only in the process that extracted them and are never written to disk. The capture store lives outside the repo at `~/.sluice/sluice.db`, and `.gitignore` covers `.sluice/`, `captures/` and `*.sqlite*` for the cases where you point it somewhere else. (Credentials are ordinary JS strings and cannot be reliably wiped — see [`SECURITY.md`](./SECURITY.md#known-limits-what-is-not-guaranteed).)
-- **Broad by default.** While Engine A is running it decrypts **every host** routed through the proxy, not just the ones an adapter claims. That is deliberate — a service with no adapter is still worth capturing — but it means unrelated traffic is decrypted and stored. Scope it with `--host`, `interceptHosts`, or `interceptAllHosts: false`, and keep proxy sessions short. `sluice capture` (browser CDP) decrypts nothing.
-- **The proxy listens on every interface.** The dashboard and API are loopback-only, but the MITM proxy is not — `mockttp` gives no way to narrow it. Do not run `sluice start` on a network you do not trust. See [`SECURITY.md`](./SECURITY.md#the-mitm-proxy-listens-on-every-interface-not-just-loopback).
-- **Replay is read-only.** Mutating verbs and write/admin operations are blocked below every caller, with a shared rate budget.
+- **Broad by default.** While Engine A is running it decrypts **every host** routed through the proxy, not just the ones an adapter claims. That is deliberate — a service with no adapter is still worth capturing — but it means unrelated traffic is decrypted and stored. AI-assistant hosts (Anthropic, OpenAI, GitHub Copilot; full list in [`SECURITY.md`](./SECURITY.md), also printed by `sluice start`) are the exception: tunnelled as raw TLS, never decrypted or stored. Scope it with `--host`, `interceptHosts`, or `interceptAllHosts: false`, and keep proxy sessions short. `sluice capture` (browser CDP) decrypts nothing.
+- **The proxy listens on loopback.** So do the dashboard and API. `--lan-proxy` opens the proxy to a phone on your Wi-Fi, and only with `--lan-allow <phone IP>`: it has no authentication, so every other device is refused. See [`SECURITY.md`](./SECURITY.md#the-mitm-proxy-on-the-lan---lan-proxy).
+- **Replay is for reads.** Mutating verbs, write/admin operations and hosts outside the app are refused below every caller, with a per-process rate budget — best-effort rails, not a proof of non-mutation.
+- **Owner-only files.** `~/.sluice` is `0700`; the store and its `-wal`/`-shm`, `runner.json` and `config.json` are `0600`.
 - **Explicit consent.** Trusting the local CA is a deliberate, reversible step you run yourself.
 - **Nothing expires by default.** Set `retentionDays` / `maxCaptures`, or run `sluice prune` / `sluice wipe`.
 
@@ -232,7 +240,7 @@ working with data already reachable from your local session.
 
 ## Commands
 
-`sluice <command> [options]` — 24 commands. Run `pnpm sluice <command> --help` for
+`sluice <command> [options]` — every command is listed below. Run `pnpm sluice <command> --help` for
 per-command options.
 
 **Capture**
@@ -260,6 +268,7 @@ auth            Map how a service authenticates you, from captured traffic. No s
 
 ```
 build-db        Materialize per-app tables from captures.
+reparse         Attribute + parse captures recorded before their app was installed.
 apidoc          Render a Markdown API catalog from captured traffic (scope it with --host).
 flows           List / show / pin interaction flows and learned templates.
 learn-flows     Cluster captures into flows and refresh multi-step templates.
@@ -327,9 +336,12 @@ Two settings behave differently and are worth knowing:
 
 ## HTTP API
 
-The runner exposes a read-only JSON API on the same loopback origin, gated by the read
-token (`?token=…` or `Authorization: Bearer`) plus a loopback `Host` and, when one is
-sent, a loopback `Origin`. Any non-GET request gets 405.
+The runner exposes a read-only JSON API on the same loopback origin, gated by the
+session token (`Authorization: Bearer`, or `?token=…`) plus a loopback `Host` and, when
+one is sent, an `Origin` that is the runner's own or the pinned dev UI's (`:5273`).
+Any non-GET request gets 405. The session token is full dashboard control over the
+WebSocket, not read-only — keep it secret. Capture lists (and the WebSocket) carry at
+most 64 KiB of each body; `/api/captures/:id/body` returns the whole one.
 
 ```
 GET /api/status                      GET /api/captures?limit&app&host&tab&ids&since
@@ -351,7 +363,12 @@ The one exception to "read-only" is `POST /api/ingest`, the MV3 extension's capt
 endpoint. It exists only under `sluice serve --ingest`, is gated by its own separate
 secret, and returns 404 `ingest_disabled` otherwise.
 
-## MCP server
+## MCP servers
+
+Sluice keeps runtime account data and source-code knowledge in separate processes
+and databases.
+
+### Captured-data MCP
 
 Sluice exposes its captured data — and each app's tools — to Claude over MCP. Build
 once, then register the bundle:
@@ -363,13 +380,36 @@ claude mcp add sluice -- node /path/to/sluice/packages/mcp/dist/cli.js
 
 (In dev, before a build: `claude mcp add sluice -- pnpm --dir /path/to/sluice exec tsx packages/mcp/src/cli.ts`.)
 
-The server advertises **29 tools**: 11 core plus 18 contributed by the installed apps
-(gmail 5, linkedin 7, loom 4, trello 1, fast 1; Slack contributes none). Nine of the
+With every app enabled the server advertises **37 tools**: 11 core plus 26 contributed
+by the installed apps (linkedin 7, gmail 5, loom 4, olx 3, toters 3, notion 2, trello 1,
+fast 1; Slack contributes none); an adapter allow-list in the config narrows the app tools. Nine of the
 core tools read the store — workspaces, containers, items, endpoints, capture search,
 endpoint shapes, the auth map and the two flow readers. Two make live requests:
 `replay` and `sluice_replay_flow`, both through the same safety rails as every other
 caller. App-contributed tools get a nine-method read-only projection of the store, so
 a tool cannot write or reach raw SQLite.
+
+### Project-knowledge MCP
+
+Agents working on this repository use `sluice-project`, a local source graph over
+packages, files, symbols, imports/calls, routes, protocol frames, SQLite tables,
+runtime workflows, tests and reviewed findings. It never opens the capture DB,
+loads app credentials or calls the network. The checked-in Codex and Claude MCP
+configs start it automatically; the CLI is also available directly:
+
+```bash
+pnpm graph refresh
+pnpm graph query "how does replay reach the capture store"
+pnpm graph impact packages/core/src/types.ts
+pnpm graph validate
+```
+
+Future agents follow [`AGENTS.md`](./AGENTS.md): check freshness, query and assess
+impact before broad edits, verify cited source, then refresh and validate after
+changes. See the [project graph guide](./docs/public/project-knowledge-graph.md)
+and [whole-project review](./docs/public/project-review.md), plus
+[`@sluice/project-graph`](./packages/project-graph/README.md) for the schema, tools
+and safety boundary.
 
 ## Repo layout
 
@@ -386,7 +426,11 @@ packages/app-gmail     @sluice/app-gmail     Gmail: positional-array sync API ·
 packages/app-loom      @sluice/app-loom      Loom: GraphQL adapter · cookie credentials · transcript MCP tool
 packages/app-linkedin  @sluice/app-linkedin  LinkedIn: Voyager adapter · jobs/messaging · cookie credentials
 packages/app-fast      @sluice/app-fast      fast.com: credential-free adapter · speed-test MCP tool
+packages/app-notion    @sluice/app-notion    Notion: adapter · Chrome-cookie or pasted credentials · MCP tools
+packages/app-olx       @sluice/app-olx       OLX Lebanon: credential-free adapter · public listings MCP tools
+packages/app-toters    @sluice/app-toters    Toters: adapter · pasted credentials · store MCP tools
 packages/mcp           @sluice/mcp           the `sluice-mcp` stdio MCP server
+packages/project-graph @sluice/project-graph source knowledge graph · GraphRAG retrieval · `sluice-project` MCP
 packages/runner        @sluice/runner        the `sluice` CLI + loopback HTTP/WS server
 packages/cli           sluicejs              bare-name launcher — no logic of its own
 packages/extension     @sluice/extension     Engine C's MV3 browser extension (loaded unpacked)
@@ -396,14 +440,15 @@ apps/webapp            @sluice/webapp        Vite + React dashboard (overview ·
 ## Build
 
 ```bash
-pnpm build     # bundles the dashboard, the CLI, the isolated engine child and the MCP server
+pnpm build     # dashboard + runner CLI + isolated child + both MCP servers
 node packages/runner/dist/cli.js doctor
 ```
 
-`pnpm build` runs the Vite build, then esbuild over three entrypoints:
+`pnpm build` runs the Vite build, then esbuild over four entrypoints:
 `packages/runner/dist/cli.js` (the `sluice` binary), `packages/runner/dist/engine-child.js`
 (the `serve --isolated` child process) and `packages/mcp/dist/cli.js` (the `sluice-mcp`
-binary). All three run under plain `node` — no `tsx`, no workspace. The dashboard is
+binary), plus `packages/project-graph/dist/cli.js` (the source-graph MCP). All four
+run under plain `node` — no `tsx`, no workspace. The dashboard is
 copied in alongside the CLI bundle, so a published package would serve it without the repo.
 
 Native addons (`better-sqlite3`, `classic-level`, `node-pty`) plus `chrome-remote-interface`,
@@ -418,8 +463,9 @@ lazily-loaded ~12 MB chunk, so every command except `start` pays nothing for it.
 macOS is the primary target. Credential extraction, CA trust (`ca-install`) and
 system-proxy control (`sluice proxy`) are macOS-only. Everywhere else the dashboard,
 the HTTP API, the MCP server, `sluice capture` (CDP) and replay via pasted
-`--token`/`--cookie` work anywhere Node 20+ runs — though paste-in is implemented for
-Slack only today. CI runs on Linux and Node 20.
+`--token`/`--cookie` work anywhere Node 20+ runs — paste-in is implemented for Slack,
+Notion and Toters, and goes to the one app `--adapter` names (default `slack`); prefer
+`SLUICE_TOKEN` / `SLUICE_COOKIE` or `--token -` over argv. CI runs on Linux and Node 20.
 
 ## Prior art
 
@@ -434,7 +480,7 @@ not already seen.
 |---|---|---|
 | [mitmproxy](https://mitmproxy.org) | MIT, 16 years, the reference local TLS-intercepting proxy. Engine A's mechanism, in Python | Its data model stops at the flow — request bytes, response bytes. Sluice's continues into workspaces, actors, containers, items and edges. mitmproxy will happily replay a captured `DELETE`, unthrottled; Sluice's replay is method-allowlisted, denylisted and rate-budgeted |
 | [HTTP Toolkit](https://httptoolkit.com) | AGPL product over permissive libraries. **Sluice's Engine A is built on `mockttp`, HTT's own interception library** | A debugging workbench: nothing is persisted, and it can breakpoint and rewrite traffic. Sluice persists and normalizes, and never modifies a byte |
-| [slackdump](https://github.com/rusq/slackdump) | AGPL, Go. Borrows your own Slack session, calls Slack's undocumented client APIs, stores to SQLite, ships an MCP server | The closest single neighbour. For Slack alone it is more capable than Sluice. Sluice is the generic seam — one adapter contract, one redactor, one set of replay rails, across six services |
+| [slackdump](https://github.com/rusq/slackdump) | AGPL, Go. Borrows your own Slack session, calls Slack's undocumented client APIs, stores to SQLite, ships an MCP server | The closest single neighbour. For Slack alone it is more capable than Sluice. Sluice is the generic seam — one adapter contract, one redactor, one set of replay rails, across nine services |
 | [Hister](https://hister.org) | AGPL, Go, by the SearX author. A personal search engine over pages and files you keep | Indexes rendered documents; Sluice indexes API exchanges. Genuinely complementary — Hister indexes the page, Sluice captures the calls that page made |
 | [HPI](https://github.com/karlicoss/HPI) / [Promnesia](https://github.com/karlicoss/promnesia) | MIT. Unified, offline, typed access to your own digital trace | The same stated goal with no capture mechanism — HPI reads exports you already possess. Its author also argues *against* normalizing personal data into a database, which is worth reading before defending this one |
 | [screenpipe](https://github.com/mediar-ai/screenpipe) | Source-available. Local capture → SQLite + FTS → MCP | The same shape on a different substrate: it records the rendering (pixels, audio, accessibility tree); Sluice records the JSON the client already fetched, so it gets typed records and stable ids for free |

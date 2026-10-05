@@ -29,8 +29,6 @@ export interface ChildEngineOptions {
   onCapture: (c: Capture) => void;
   onStatus?: (s: EngineStatus) => void;
   onError?: (e: unknown) => void;
-  /** How long stop() waits for a graceful exit before SIGKILL. */
-  stopTimeoutMs?: number;
 }
 
 type ChildFrame =
@@ -140,9 +138,7 @@ export class ChildEngine implements EngineHandle {
       return;
     }
     await new Promise<void>((resolve) => {
-      const timer = setTimeout(() => {
-        child.kill('SIGKILL');
-      }, this.opts.stopTimeoutMs ?? 5000);
+      const timer = setTimeout(() => child.kill('SIGKILL'), 5000);
       child.once('exit', () => {
         clearTimeout(timer);
         resolve();

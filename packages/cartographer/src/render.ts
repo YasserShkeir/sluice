@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 /**
  * Human-readable API docs from an ApiMap — one Markdown section per endpoint.
- * Purely a projection of the (already secret-free) ApiMap; it introduces no new
- * data, so nothing sensitive can appear here.
+ * Purely a projection of the ApiMap, which keeps names and shapes, never values;
+ * it introduces no new data. A JSON key is a name, though, so a response keyed
+ * by record id renders every id (see the Notion `recordMap` test).
  */
 import type { ApiMap } from './map.js';
 import type { JsonSchema } from './infer.js';
@@ -11,7 +12,11 @@ function typeLabel(s: JsonSchema): string {
   return s.types.length ? s.types.join(' | ') : 'unknown';
 }
 
-/** Indented bullet lines describing a schema node's nested shape. */
+/**
+ * Indented bullet lines describing a schema node's nested shape. Child lines are
+ * appended in a loop, not `out.push(...lines)`: a spread passes one argument per
+ * line and V8 overflows the stack past ~100k (see the Notion `recordMap` test).
+ */
 function renderSchema(schema: JsonSchema, depth: number): string[] {
   const pad = '  '.repeat(depth + 1);
   const out: string[] = [];
@@ -25,12 +30,12 @@ function renderSchema(schema: JsonSchema, depth: number): string[] {
           ? ` [${child.present}/${child.total}]`
           : '';
       out.push(`${pad}- ${key}: ${typeLabel(child)}${flags}${seen}`);
-      out.push(...renderSchema(child, depth + 1));
+      for (const line of renderSchema(child, depth + 1)) out.push(line);
     }
   }
   if (schema.items) {
     out.push(`${pad}- [items]: ${typeLabel(schema.items)}${schema.items.nullable ? ' (nullable)' : ''}`);
-    out.push(...renderSchema(schema.items, depth + 1));
+    for (const line of renderSchema(schema.items, depth + 1)) out.push(line);
   }
   return out;
 }

@@ -12,7 +12,7 @@ import type {
   Session,
 } from '@sluice/core';
 import { ReplayDeniedError } from './replay-policy.js';
-import { runFlowReplay, resolveJsonPath, nextPaceWaitMs, FLOW_DELAY_CAP_MS } from './flow-replay.js';
+import { runFlowReplay, nextPaceWaitMs, FLOW_DELAY_CAP_MS } from './flow-replay.js';
 
 const T0 = 1_700_000_000_000;
 
@@ -332,11 +332,97 @@ test('auth failure triggers one full restart when refresh succeeds', async () =>
   assert.ok(builds >= 2);
 });
 
-test('resolveJsonPath walks objects and arrays', () => {
-  const data = { ok: true, channel: { id: 'C1' }, members: [{ id: 'U1' }, { id: 'U2' }] };
-  assert.equal(resolveJsonPath(data, 'channel.id'), 'C1');
-  assert.equal(resolveJsonPath(data, 'members[1].id'), 'U2');
-  assert.equal(resolveJsonPath(data, 'missing'), undefined);
+test('a required step whose build returns null fails the flow as skipped', async () => {
+  const result = await runFlowReplay({
+    template: tmpl(),
+    session: session(),
+    pace: false,
+    io: {
+      build: () => null,
+      run: async () => {
+        throw new Error('must not run');
+      },
+    },
+  });
+  assert.equal(result.ok, false);
+  assert.equal(result.error, 'required step 0 could not be built');
+  assert.equal(result.steps.length, 1);
+  assert.equal(result.steps[0]?.status, 'skipped');
+  assert.equal(result.steps[0]?.detail, 'build returned null');
+});
+
+test('a soft step whose build throws is an error row and the flow continues', async () => {
+  const t = tmpl();
+  t.steps.push({ ...t.steps[1]!, seq: 2, path: '/api/users.info', operation: 'users.info' });
+  const ran: string[] = [];
+  const result = await runFlowReplay({
+    template: t,
+    session: session(),
+    pace: false,
+    io: {
+      build: (step) => {
+        if (step.seq === 1) throw new Error('bind missing');
+        return { method: step.method, url: `https://slack.com${step.path}`, headers: {} };
+      },
+      run: async (req) => {
+        ran.push(new URL(req.url).pathname);
+        return okCapture(req);
+      },
+    },
+  });
+  assert.equal(result.ok, true);
+  assert.equal(result.error, undefined);
+  assert.equal(result.steps[1]?.status, 'error');
+  assert.equal(result.steps[1]?.detail, 'bind missing');
+  assert.equal(result.steps[2]?.status, 'ok');
+  assert.deepEqual(ran, ['/api/conversations.history', '/api/users.info']);
+});
+
+test('the flow deadline stops before the next step', async () => {
+  let runs = 0;
+  const result = await runFlowReplay({
+    template: tmpl(),
+    session: session(),
+    pace: false,
+    timeoutMs: 5,
+    io: {
+      build: (step) => ({ method: step.method, url: `https://slack.com${step.path}`, headers: {} }),
+      run: async (req) => {
+        runs += 1;
+        await new Promise((r) => setTimeout(r, 25));
+        return okCapture(req);
+      },
+    },
+  });
+  assert.equal(result.ok, false);
+  assert.equal(result.error, 'flow timed out after 5ms');
+  assert.equal(runs, 1);
+});
+
+test('a build or run error quoting a token is redacted in error and step detail', async () => {
+  const secret = 'abcd1234efgh';
+  for (const where of ['build', 'run'] as const) {
+    const result = await runFlowReplay({
+      template: tmpl(),
+      session: session(),
+      pace: false,
+      io: {
+        build: (step) => {
+          if (where === 'build') throw new Error(`boom token=${secret}`);
+          return { method: step.method, url: `https://slack.com${step.path}`, headers: {} };
+        },
+        run: async () => {
+          throw new Error(`boom token=${secret}`);
+        },
+      },
+    });
+    assert.equal(result.ok, false);
+    for (const text of [result.error, result.steps[0]?.detail]) {
+      assert.ok(text, where);
+      assert.equal(text.includes(secret), false, where);
+      assert.ok(text.includes('«redacted»'), where);
+    }
+  }
 });
 
 test('FLOW_DELAY_CAP_MS is a finite positive cap', () => {

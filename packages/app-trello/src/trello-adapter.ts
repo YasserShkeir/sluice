@@ -5,7 +5,7 @@
  * Auth contract: Trello's web API (`https://trello.com/1/…`) is authorized by the
  * BROWSER SESSION COOKIE — the `Cookie:` request header. There is NO `token`
  * query param. `buildReplayRequest` therefore sets `Cookie` from the session's
- * `credentials.values.cookieHeader` (minted by chrome-cookies.ts) plus the
+ * `credentials.values.cookieHeader` (read from Chrome by the credential provider) plus the
  * browser-like headers Trello expects (User-Agent / Accept / Referer).
  *
  * Two facts about Trello shape everything below:
@@ -40,15 +40,36 @@ import type {
   ReplayAction,
   ReplayRequest,
   Session,
+  Workspace,
 } from '@sluice/core';
-import { arr, num, obj, requestParam, safeJson, str } from '@sluice/adapter-sdk';
+import { actionUrl, arr, CHROME_UA, num, obj, requestParam, safeJson, str } from '@sluice/adapter-sdk';
 
 export const ADAPTER_ID = 'trello';
 const WORKSPACE_ID = 'trello';
+/**
+ * Trello has no workspace in its REST payloads that every card and board hangs
+ * off, so the parent is a constant — the same one the credential provider names.
+ */
+const TRELLO_WORKSPACE: Workspace = {
+  id: WORKSPACE_ID,
+  adapterId: ADAPTER_ID,
+  name: 'Trello',
+  domain: 'trello.com',
+};
 
-/** A real Chrome macOS User-Agent — Trello's web API rejects non-browser agents. */
-export const CHROME_UA =
-  'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36';
+/**
+ * The browser-like header set Trello's web API expects (it rejects non-browser
+ * agents), plus the session cookie when there is one. Shared by `buildReplayRequest` and the MCP tool so the two
+ * cannot drift. The result carries the SECRET cookie — never log it.
+ */
+export function trelloHeaders(cookieHeader?: string): Record<string, string> {
+  return {
+    'User-Agent': CHROME_UA,
+    Accept: 'application/json',
+    Referer: 'https://trello.com/',
+    ...(cookieHeader ? { Cookie: cookieHeader } : {}),
+  };
+}
 
 // ── Matching ─────────────────────────────────────────────────────────────────────
 
@@ -96,9 +117,7 @@ const P = {
 // ── Coercion helpers (never throw on odd shapes) ─────────────────────────────────
 
 function parseTrelloDate(v: unknown): number | undefined {
-  const s = str(v);
-  if (!s) return undefined;
-  const ms = Date.parse(s);
+  const ms = Date.parse(str(v) ?? '');
   return Number.isFinite(ms) ? ms : undefined;
 }
 
@@ -152,21 +171,65 @@ function boardToContainer(raw: Record<string, unknown> | undefined): Container |
   };
 }
 
+/**
+ * A board COLUMN (`/1/boards/<id>/lists`). `kind: 'other'`: it is neither the
+ * board nor a card, and the board it sits on stays in `raw.idBoard`.
+ */
+function listToContainer(raw: Record<string, unknown> | undefined): Container | undefined {
+  if (!raw) return undefined;
+  const id = str(raw.id);
+  const name = str(raw.name);
+  if (!id || !name) return undefined;
+  return { id, workspaceId: WORKSPACE_ID, adapterId: ADAPTER_ID, kind: 'other', name, raw };
+}
+
+/**
+ * A card comment from an action feed. Every other action type (moves, edits,
+ * label changes) is activity about an entity, not content, and is skipped.
+ *
+ * The comment lives on the card's board, and `threadId` is the card: the card
+ * Item is what its comments reply to.
+ */
+function commentToItem(
+  raw: Record<string, unknown> | undefined,
+  pathBoardId: string | undefined,
+  captureId: string,
+): Item | undefined {
+  if (!raw || str(raw.type) !== 'commentCard') return undefined;
+  const id = str(raw.id);
+  if (!id) return undefined;
+  const data = obj(raw.data);
+  return {
+    id,
+    containerId: str(obj(data?.board)?.id) ?? pathBoardId ?? WORKSPACE_ID,
+    workspaceId: WORKSPACE_ID,
+    adapterId: ADAPTER_ID,
+    kind: 'message',
+    authorId: str(raw.idMemberCreator),
+    ts: parseTrelloDate(raw.date) ?? 0,
+    text: str(data?.text) ?? '',
+    threadId: str(obj(data?.card)?.id),
+    sourceCaptureIds: [captureId],
+    raw,
+  };
+}
+
 // ── Parser ───────────────────────────────────────────────────────────────────────
 
 /**
  * Turn one Trello capture into normalized entities:
  *   - a cards endpoint (`/1/members/*​/cards`, `/1/cards/<id>`, `…/cards`) → Items;
  *   - a boards endpoint (`/1/members/me/boards`, `/1/board/<id>`, `/1/boards/<id>`)
- *     or an embedded `boards` array → Containers.
- * Anything unrecognized yields an empty ParseResult.
+ *     or an embedded `boards` array → Containers;
+ *   - a board's lists (`/1/boards/<id>/lists`) → Containers;
+ *   - an action feed (`/1/boards/<id>/actions`, `/1/cards/<id>/actions`) → one
+ *     Item per `commentCard`.
+ * Anything unrecognized yields an empty ParseResult. Whenever something is
+ * recognized the constant `trello` Workspace rides along, so its children never
+ * arrive without their parent.
  *
- * Routing is by PATH, not by body shape. Two regressions came out of sniffing:
- * `/1/members/me/boards` — the endpoint `classify` calls `structure` and
- * `nextCursors` fans out from — parsed to NOTHING because the only top-level
- * array handled was a cards one; and every single object with a string `idBoard`
- * was filed as a card, so `/1/lists/<id>` recorded a board COLUMN as a card, and
- * `/1/checklists/<id>` a checklist.
+ * Routing is by PATH, not body shape: boards, lists, checklists and cards are all
+ * `{id, name, …}`, and most non-boards carry a string `idBoard`.
  */
 export function parseTrelloCapture(capture: Capture): ParseResult {
   const body = safeJson(capture.resBody);
@@ -190,10 +253,22 @@ export function parseTrelloCapture(capture: Capture): ParseResult {
   };
 
   if (Array.isArray(body)) {
-    // A board row and a card row are both `{id, name, …}`; only the path
-    // separates a list of cards from a list of boards.
+    // A board row, a list row and a card row are all `{id, name, …}`; only the
+    // path separates them.
     if (P.anyCards.test(path)) for (const c of body) pushCard(c);
     else if (P.myBoards.test(path)) for (const b of body) pushBoard(b);
+    else if (P.boardLists.test(path)) {
+      for (const l of body) {
+        const c = listToContainer(obj(l));
+        if (c) containers.push(c);
+      }
+    } else if (P.boardActions.test(path) || P.cardActions.test(path)) {
+      const pathBoardId = P.boardActions.exec(path)?.[1];
+      for (const a of body) {
+        const item = commentToItem(obj(a), pathBoardId, capture.id);
+        if (item) items.push(item);
+      }
+    }
   } else {
     const o = obj(body);
     if (o) {
@@ -209,6 +284,7 @@ export function parseTrelloCapture(capture: Capture): ParseResult {
   const result: ParseResult = {};
   if (containers.length) result.containers = containers;
   if (items.length) result.items = items;
+  if (containers.length || items.length) result.workspaces = [{ ...TRELLO_WORKSPACE }];
   return result;
 }
 
@@ -217,8 +293,8 @@ export function parseTrelloCapture(capture: Capture): ParseResult {
 interface ClassifyRule {
   re: RegExp;
   class: CaptureClass;
-  /** Spelled the way core's `operationName()` spells it, so rows group alike. */
-  operation: string;
+  /** Spelled the way core's `operationName()` spells it, so rows group alike; omitted → operationName(path). */
+  operation?: string;
 }
 
 /**
@@ -242,13 +318,8 @@ const CLASSIFY_RULES: readonly ClassifyRule[] = [
   { re: P.cardActions, class: 'messages', operation: 'cards/:id/actions' },
   { re: P.card, class: 'messages', operation: 'cards/:id' },
   { re: P.me, class: 'auth', operation: 'members/me' },
-  // Gateway before notApi. operationName collapses remaining path segments.
-  {
-    re: P.gateway,
-    class: 'unknown',
-    // Placeholder — classifyTrelloCapture overrides via operationName for stable keys.
-    operation: 'gateway/api',
-  },
+  // Gateway before notApi; unnamed so each op (graphql, session/heartbeat, gasv3/…) is named from its path.
+  { re: P.gateway, class: 'unknown' },
   { re: P.notApi, class: 'asset', operation: 'asset' },
 ];
 
@@ -264,12 +335,7 @@ export function classifyTrelloCapture(capture: Capture): {
 } {
   const path = str(capture.path) ?? '';
   const rule = CLASSIFY_RULES.find((r) => r.re.test(path));
-  // Gateway: name from path (graphql, session/heartbeat, gasv3/…) so templates
-  // merge on the real op rather than one umbrella "gateway/api".
-  const operation =
-    rule?.re === P.gateway
-      ? operationName(path)
-      : (rule?.operation ?? operationName(path));
+  const operation = rule?.operation ?? operationName(path);
   const status = capture.status;
   if (typeof status === 'number' && status >= 400) return { class: 'error', operation };
   return { class: rule?.class ?? 'unknown', operation };
@@ -418,13 +484,8 @@ const TRELLO_REPLAY_ACTIONS: ReplayAction[] = [
     ],
   },
   {
-    // The one STRUCTURE action with no required params, so `sluice sync` (which
-    // runs only param-free actions) actually reconstructs something for Trello.
-    // Without it, sync's only runnable Trello action was `trello.my.cards`, which
-    // parses into ITEMS (cards) — and sync reports only containers+actors, so it
-    // said "+0 channels, +0 users" while silently inserting ~200 cards. This
-    // endpoint parses into Containers (boardToContainer, kind:'board'; classify
-    // already marks the path `structure`), which is what sync counts.
+    // The one STRUCTURE action with no required params: `sluice sync` runs only
+    // param-free actions and counts containers, which this parses into.
     id: 'trello.my.boards',
     adapterId: ADAPTER_ID,
     label: 'My boards',
@@ -482,58 +543,19 @@ const TRELLO_REPLAY_ACTIONS: ReplayAction[] = [
   },
 ];
 
-/** `{boardId}` in a urlTemplate — Trello scopes by path segment, not by query. */
-const PATH_PARAM = /\{(\w+)\}/g;
-
 /**
  * Build the concrete request: the browser session cookie rides in the `Cookie`
  * header (there is no token query param), alongside the browser-like headers
- * Trello requires.
- *
- * Path params are substituted BEFORE the URL is constructed and are then kept out
- * of the query string: `new URL('…/boards/{boardId}/cards')` percent-encodes the
- * braces into a literal `/boards/%7BboardId%7D/cards`, which 404s.
- *
- * A missing path param THROWS rather than substituting `''`. The `''` fallback
- * built `https://trello.com/1/boards//cards`, and `onReplayRun` in
- * packages/runner passes the UI's params through with no `required` check (only
- * `onSync` skips required-param actions), so a one-click replay from the app
- * came back as an opaque 404. This is the only layer that can name the param.
+ * Trello requires. Trello scopes by path segment (`{boardId}`), which
+ * `actionUrl` substitutes, throwing by name when one is missing.
  */
 function buildReplayRequest(
   action: ReplayAction,
   params: Record<string, string>,
   session: Session,
 ): ReplayRequest {
-  const headers: Record<string, string> = {
-    'User-Agent': CHROME_UA,
-    Accept: 'application/json',
-    Referer: 'https://trello.com/',
-  };
-  const cookieHeader = session.credentials.values.cookieHeader;
-  if (cookieHeader) headers.Cookie = cookieHeader;
-
-  const inPath = new Set<string>();
-  const template = action.urlTemplate.replace(PATH_PARAM, (_match, name: string) => {
-    inPath.add(name);
-    const declared = action.params.find((p) => p.name === name);
-    const value = params[name] ?? declared?.default;
-    if (value === undefined || value === '') {
-      throw new Error(
-        `Trello replay action "${action.id}" needs a value for "${name}" — it is a path segment, not a query param.`,
-      );
-    }
-    return encodeURIComponent(value);
-  });
-
-  const u = new URL(template);
-  for (const p of action.params) {
-    if (inPath.has(p.name)) continue;
-    const v = params[p.name] ?? p.default;
-    if (v !== undefined && v !== '') u.searchParams.set(p.name, v);
-  }
-
-  return { method: action.method, url: u.toString(), headers };
+  const headers = trelloHeaders(session.credentials.values.cookieHeader);
+  return { method: action.method, url: actionUrl(action, params), headers };
 }
 
 // ── The adapter ────────────────────────────────────────────────────────────────
@@ -541,23 +563,15 @@ function buildReplayRequest(
 export const trelloAdapter: Adapter = {
   id: ADAPTER_ID,
   displayName: 'Trello',
-  // Only the parent domain: `tlsInterceptList` derives `*.trello.com` from it, so
-  // listing api.trello.com as well bought nothing and made the conformance
-  // lookalike probe (`not` + each declared host) generate `notapi.trello.com` —
-  // a real trello.com subdomain, which matchRequest correctly claims.
+  // Parent domain only: tlsInterceptList derives *.trello.com, and listing api.trello.com
+  // made the lookalike probe test notapi.trello.com, which matchRequest rightly claims.
   hosts: ['trello.com'],
   matchRequest(input) {
     return matchesTrello(input.host);
   },
-  parse(capture) {
-    return parseTrelloCapture(capture);
-  },
-  classify(capture) {
-    return classifyTrelloCapture(capture);
-  },
-  nextCursors(capture, ctx) {
-    return trelloNextCursors(capture, ctx);
-  },
+  parse: parseTrelloCapture,
+  classify: classifyTrelloCapture,
+  nextCursors: trelloNextCursors,
   listReplayActions() {
     return TRELLO_REPLAY_ACTIONS;
   },

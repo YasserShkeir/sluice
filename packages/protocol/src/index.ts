@@ -22,39 +22,25 @@
  * over every capture body on the way to the page, which is the hot path.
  * `hello`/`hello.ok` carry the version handshake, and a genuine skew is caught
  * there rather than by re-checking every frame afterwards.
- *
- * ## The check that keeps this honest
- *
- * Inferring the message types FROM the schemas would read the same and enforce
- * nothing: the schema would be definitionally correct, so it could never be
- * found wrong, and a field added to `SubscribeMsg` in core would simply never
- * arrive. So the types stay in core and {@link EXHAUSTIVE} asserts the two
- * agree in BOTH directions at compile time — a field on either side that the
- * other lacks fails the build.
  */
 import { z } from 'zod';
 import type { ClientMsg } from '@sluice/core';
 
 /**
- * How long a string the protocol will accept in an identifier position.
- *
- * A socket frame is parsed before anything looks at its size, so an unbounded
- * string field is an unbounded allocation reachable from the page. Generous
- * enough that no real id, action or container name comes close.
+ * Frames are parsed before any size check, so an unbounded identifier would be
+ * a page-reachable allocation. 1024 is generous for any real id.
  */
-const MAX_ID = 1024;
+const id = z.string().min(1).max(1024);
 
 /**
- * How many parameters one replay may carry, and how long a value may be.
- *
- * `replay.run` params reach an adapter's request builder and end up in a URL or
- * a request body. The limits are what keeps "the page asked for a replay" from
- * being a way to make the runner build an arbitrarily large outbound request.
+ * The one parameter map shared by `replay.run`, `flow.run` and the MCP replay
+ * tools. Strings only; keys, values and count are bounded because params end up
+ * in an outbound URL or body. The empty key is accepted (no min, unlike
+ * {@link id}).
  */
-const MAX_PARAMS = 64;
-const MAX_PARAM_VALUE = 8192;
-
-const id = z.string().min(1).max(MAX_ID);
+export const replayParamsSchema = z
+  .record(z.string().max(1024), z.string().max(8192))
+  .refine((p) => Object.keys(p).length <= 64, 'at most 64 params');
 
 /**
  * A filter with nothing in it normalizes to `undefined`, so `filter` being set
@@ -87,13 +73,8 @@ const replayRun = z.object({
   type: z.literal('replay.run'),
   requestId: id,
   actionId: id,
-  // Values only, and strings only. The handler passes this map straight to an
-  // adapter's `buildReplayRequest`, which interpolates it into a URL or a body;
-  // an object or an array there is a shape no adapter is written against.
-  params: z.record(z.string().max(MAX_PARAM_VALUE)).refine(
-    (p) => Object.keys(p).length <= MAX_PARAMS,
-    `at most ${MAX_PARAMS} params`,
-  ),
+  // Passed straight to an adapter's `buildReplayRequest`.
+  params: replayParamsSchema,
   sessionId: id.optional(),
 });
 
@@ -102,10 +83,7 @@ const flowRun = z.object({
   requestId: id,
   templateId: id,
   // Same string-only map as replay.run — flow params become URL/path pieces.
-  params: z.record(z.string().max(MAX_PARAM_VALUE)).refine(
-    (p) => Object.keys(p).length <= MAX_PARAMS,
-    `at most ${MAX_PARAMS} params`,
-  ),
+  params: replayParamsSchema,
   sessionId: id.optional(),
 });
 
@@ -200,35 +178,24 @@ export const clientMsgSchema = z.discriminatedUnion('type', [
 type Exact<A, B> = [A] extends [B] ? ([B] extends [A] ? true : never) : never;
 
 /**
- * The build-time guard, and the whole reason this file is not `z.infer`red.
- *
- * A type-level assertion with no runtime cost: `true` inhabits the type when
- * both sides match and the type is `never` when they do not. Checked by adding
- * a field to `SyncMsg` and watching the build break, rather than assumed.
- *
- * It catches REQUIRED fields, in both directions — one added to a message in
- * core without being added here, and one here with no home in the contract.
- * It does NOT catch an OPTIONAL field added to core, because a schema that
- * omits an optional field still produces a value assignable to the interface,
- * and vice versa. That is a real gap and worth knowing: the round-trip test in
- * index.test.ts is what covers optional fields, by naming each one in a message
- * that must be accepted.
+ * The build-time guard. Types are not `z.infer`red from the schemas, because
+ * inferred types are correct by definition and would never catch drift. This
+ * type-level assertion has no runtime cost. It catches REQUIRED fields in both
+ * directions, but NOT an optional field added to core (a schema omitting it
+ * still produces an assignable value); the round-trip test in index.test.ts
+ * covers optional fields.
  */
 const EXHAUSTIVE: Exact<ClientMsg, z.infer<typeof clientMsgSchema>> = true;
 void EXHAUSTIVE;
 
+/** A validated client message, or why the frame was refused. */
+export type ClientMsgResult = { ok: true; msg: ClientMsg } | { ok: false; reason: string };
+
 /**
- * Validate one client frame, or say why not.
- *
- * Returns a result rather than throwing, and rather than the bare `undefined`
- * the old `isClientMsg` gave back. A dropped frame with no reason is the kind of
- * bug that gets diagnosed as "the socket went quiet" — the server logs the
- * reason as a `notice`, so a page sending something malformed finds out from the
- * UI instead of from silence.
+ * Validate one client frame, returning a reason rather than throwing or returning
+ * `undefined`, so the server can log a `notice` instead of the socket going silent.
  */
-export function parseClientMsg(
-  raw: unknown,
-): { ok: true; msg: ClientMsg } | { ok: false; reason: string } {
+export function parseClientMsg(raw: unknown): ClientMsgResult {
   const result = clientMsgSchema.safeParse(raw);
   if (result.success) return { ok: true, msg: result.data };
   const first = result.error.issues[0];
@@ -240,16 +207,10 @@ export function parseClientMsg(
 }
 
 /**
- * Parse a socket payload end to end: JSON, then schema.
- *
- * One function because the two failures want the same handling and the same
- * message shape — a frame that is not JSON and a frame that is not a protocol
- * message are equally "this peer is not speaking the protocol", and having each
- * caller write the try/catch is how one of them ends up not writing it.
+ * Parse a socket payload: JSON, then schema. One handling for both failures, so
+ * no caller forgets the try/catch.
  */
-export function parseClientFrame(
-  text: string,
-): { ok: true; msg: ClientMsg } | { ok: false; reason: string } {
+export function parseClientFrame(text: string): ClientMsgResult {
   let raw: unknown;
   try {
     raw = JSON.parse(text);

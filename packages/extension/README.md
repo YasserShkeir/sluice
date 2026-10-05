@@ -24,10 +24,12 @@ neither. It only ever captures traffic your browser was already making.
 - **Default-deny.** Nothing is sent until you configure a runner endpoint, an
   ingest token, **and** at least one in-scope host. An unconfigured extension is
   inert.
-- **Scoped.** Only requests to the hosts you list (and their subdomains) are
-  forwarded — "capture my Slack" does not ship your bank.
+- **Scoped.** An exchange is forwarded only when BOTH the page you are on and
+  the request's host match the hosts you list (or their subdomains) — "capture
+  my Slack" does not ship your bank. The page's host is taken from the browser
+  (the frame that ran the bridge), not from anything the page says.
 - **Loopback only.** It can reach `127.0.0.1` / `localhost` and nothing else.
-- **Its own secret.** The ingest token is separate from the dashboard read token
+- **Its own secret.** The ingest token is separate from the dashboard session token
   and from the terminal's pty token, is minted only with `sluice serve --ingest`,
   and gates the one POST the API accepts. The runner still re-redacts every
   exchange on the way in.
@@ -58,25 +60,38 @@ neither. It only ever captures traffic your browser was already making.
 
 ```
 page world (inject.js)  ──window.postMessage──▶  isolated world (content.js)
-  patches fetch/XHR                                validates the message,
+  patches fetch/XHR                                whitelists the fields,
   clips bodies at 512 KiB                          re-clips bodies, then
                                                    chrome.runtime.sendMessage
                                                             │
                                                             ▼
                                             background.js  ──POST /api/ingest──▶  Sluice runner
-                                              (batches, scopes by host,           (redact → attribute →
-                                               authenticates with the token)       parse → store → stream)
+                                              (scopes by sender frame             (redact → attribute →
+                                               + request host, batches,            parse → store → stream)
+                                               authenticates with the token)
 ```
 
-`content.js` is a validator, not a relay: it checks `event.source === window`
-and the `__sluice` tag, rejects null / array / non-object entries, and re-clips
-both bodies — a hostile page can `postMessage` anything shaped like a capture.
+A hostile page can `postMessage` anything shaped like a capture, and the bridge
+cannot tell that from the patch — they share one window. So `content.js` copies
+only the fields `inject.js` emits (method, url, status, duration, headers,
+bodies, timestamp), type-checked, and re-clips both bodies: a page cannot choose
+a capture's id, host, path or tab. `background.js` then checks the
+browser-reported sender frame and the request URL against the allowlist, so a
+page outside scope cannot inject captures.
+
+What remains: script running on an in-scope page — including third-party script
+that page loads, or any subdomain of a host you list — can still forge captures
+for in-scope hosts. MAIN-world capture shares the page's JavaScript context, so
+that cannot be authenticated away; list hosts as narrowly as you can.
 
 ## Limitations
 
 Most of these lose data *silently*, which looks identical to "the extension
 isn't working".
 
+- **List the site you browse, not only its API host.** The page must be in scope
+  as well as the request, so list e.g. `toters.com`, not just
+  `api.toters.com`. Calls made from an unlisted page are dropped silently.
 - **A failed POST drops the whole batch.** `flush()` splices the queue before
   the fetch and does not retry or re-queue: a stopped runner, the wrong port, or
   a rejected ingest token all just lose those captures, with nothing shown to

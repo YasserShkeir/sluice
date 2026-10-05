@@ -51,7 +51,7 @@ test('a param that varies between captures is not copied verbatim', () => {
   const store = new SqliteStore(':memory:');
   seedVarying(store);
 
-  const tmpl = learnRequestTemplate(store, 'POST', '/api/conversations.list');
+  const tmpl = learnRequestTemplate(store, 'POST', '/api/conversations.list', 'slack.com');
   assert.ok(tmpl);
   assert.ok(tmpl.volatileParams.includes('_x_id'), '_x_id varies and must be flagged volatile');
   assert.equal(tmpl.bodyParams._x_mode, 'online', 'a stable param must still be learned');
@@ -63,7 +63,7 @@ test('a param that varies between captures is not copied verbatim', () => {
 test('the redacted token is never learned — it is re-injected live', () => {
   const store = new SqliteStore(':memory:');
   seedVarying(store);
-  const tmpl = learnRequestTemplate(store, 'POST', '/api/conversations.list');
+  const tmpl = learnRequestTemplate(store, 'POST', '/api/conversations.list', 'slack.com');
   assert.equal(tmpl?.bodyParams.token, undefined);
   store.close();
 });
@@ -79,7 +79,7 @@ test('a uuid-shaped volatile param is regenerated, not replayed', () => {
     store.insertCapture(capture({ id: `c${i}`, ts: 1_700_000_000_000 + i, reqBody: `_x_req=${id}` }));
   });
 
-  const tmpl = learnRequestTemplate(store, 'POST', '/api/conversations.list');
+  const tmpl = learnRequestTemplate(store, 'POST', '/api/conversations.list', 'slack.com');
   assert.ok(tmpl?.volatileParams.includes('_x_req'));
   const fresh = tmpl?.bodyParams._x_req;
   assert.ok(fresh, 'a uuid shape should be regenerated rather than dropped');
@@ -99,7 +99,7 @@ test('a header that differs between captures is not learned', () => {
       }),
     );
   }
-  const tmpl = learnRequestTemplate(store, 'POST', '/api/conversations.list');
+  const tmpl = learnRequestTemplate(store, 'POST', '/api/conversations.list', 'slack.com');
   assert.equal(tmpl?.headers['user-agent'], 'RealClient/1.0', 'a stable header is kept');
   assert.equal(tmpl?.headers['x-client-nonce'], undefined, 'a varying header is dropped');
   store.close();
@@ -118,7 +118,7 @@ test('per-request headers are dropped by name even when stable', () => {
       },
     }),
   );
-  const tmpl = learnRequestTemplate(store, 'POST', '/api/conversations.list');
+  const tmpl = learnRequestTemplate(store, 'POST', '/api/conversations.list', 'slack.com');
   assert.equal(tmpl?.headers['user-agent'], 'RealClient/1.0');
   for (const h of ['if-none-match', 'traceparent', 'x-amzn-trace-id']) {
     assert.equal(tmpl?.headers[h], undefined, `${h} must not be replayed`);
@@ -129,7 +129,7 @@ test('per-request headers are dropped by name even when stable', () => {
 test('a single capture still yields a usable template (no variance signal)', () => {
   const store = new SqliteStore(':memory:');
   store.insertCapture(capture({ id: 'only', reqBody: '_x_mode=online&types=public_channel' }));
-  const tmpl = learnRequestTemplate(store, 'POST', '/api/conversations.list');
+  const tmpl = learnRequestTemplate(store, 'POST', '/api/conversations.list', 'slack.com');
   assert.equal(tmpl?.bodyParams._x_mode, 'online');
   assert.deepEqual(tmpl?.volatileParams, [], 'one sample cannot prove anything varies');
   store.close();
@@ -251,7 +251,7 @@ test('accept-encoding is now learned from real captures, not skipped', () => {
       reqHeaders: { 'user-agent': 'Real/1', 'accept-encoding': 'gzip, deflate, br, zstd' },
     }),
   );
-  const tmpl = learnRequestTemplate(store, 'POST', '/api/conversations.list');
+  const tmpl = learnRequestTemplate(store, 'POST', '/api/conversations.list', 'slack.com');
   assert.equal(tmpl?.headers['accept-encoding'], 'gzip, deflate, br, zstd', 'the real value is learned');
   store.close();
 });
@@ -265,4 +265,117 @@ test('a captured header undici would reject is dropped, not fatal', () => {
   );
   assert.equal(out.headers['user-agent'], 'Real/1', 'the clean header is kept');
   assert.equal(out.headers['x-weird'], undefined, 'the non-latin1 one is dropped');
+});
+
+// ── What a template may be learned from ──────────────────────────────────────────
+
+test('a template learns only from captures on the target host or its subdomains', () => {
+  // MITM sees every site. Another site's `POST /graphql` captures, however
+  // recent, must not supply headers sent to Loom with the user's session.
+  const store = new SqliteStore(':memory:');
+  const gql = { adapterId: null, path: '/graphql', reqBody: '{"operationName":"GetFolders"}' };
+  for (let i = 0; i < 2; i++) {
+    store.insertCapture(
+      capture({
+        ...gql,
+        id: `loom${i}`,
+        ts: 1_700_000_000_000 + i,
+        host: 'www.loom.com',
+        url: 'https://www.loom.com/graphql',
+        reqHeaders: { 'user-agent': 'LoomClient/1', 'apollographql-client-name': 'web' },
+      }),
+    );
+  }
+  for (let i = 0; i < 4; i++) {
+    store.insertCapture(
+      capture({
+        ...gql,
+        id: `other${i}`,
+        ts: 1_700_000_100_000 + i,
+        host: 'api.other.example',
+        url: 'https://api.other.example/graphql',
+        reqHeaders: { 'user-agent': 'OtherClient/9', 'x-authtoken': 'SYNTHETIC-OTHER-SITE' },
+      }),
+    );
+  }
+  const out = faithfulReplayRequest(store, {
+    method: 'POST',
+    url: 'https://www.loom.com/graphql',
+    headers: { 'content-type': 'application/json' },
+    body: '{"operationName":"GetFolders"}',
+  });
+  assert.equal(out.headers['user-agent'], 'LoomClient/1');
+  assert.equal(out.headers['apollographql-client-name'], 'web');
+  assert.equal(out.headers['x-authtoken'], undefined, 'another host never feeds this template');
+  assert.equal(learnRequestTemplate(store, 'POST', '/graphql', 'evil.loom.com.example'), undefined);
+  store.close();
+});
+
+test('a parent-host replay still learns from its subdomain captures', () => {
+  const store = new SqliteStore(':memory:');
+  store.insertCapture(
+    capture({
+      id: 'ws',
+      host: 'acme.slack.com',
+      url: 'https://acme.slack.com/api/conversations.list',
+      reqBody: 'token=«redacted»&_x_mode=online',
+    }),
+  );
+  // A host that merely ends in the same letters is not a subdomain.
+  store.insertCapture(
+    capture({
+      id: 'lookalike',
+      ts: 1_700_000_000_999,
+      host: 'evilslack.com',
+      url: 'https://evilslack.com/api/conversations.list',
+      reqBody: '_x_mode=injected',
+    }),
+  );
+  const tmpl = learnRequestTemplate(store, 'POST', '/api/conversations.list', 'slack.com');
+  assert.equal(tmpl?.bodyParams._x_mode, 'online');
+  assert.equal(learnRequestTemplate(store, 'POST', '/api/conversations.list', 'notslack.com'), undefined);
+  store.close();
+});
+
+test('a method-override header is never learned', () => {
+  const store = new SqliteStore(':memory:');
+  store.insertCapture(
+    capture({
+      id: 'mo',
+      reqHeaders: { 'user-agent': 'Real/1', 'X-HTTP-Method-Override': 'DELETE', 'x-method-override': 'PUT' },
+    }),
+  );
+  const tmpl = learnRequestTemplate(store, 'POST', '/api/conversations.list', 'slack.com');
+  assert.equal(tmpl?.headers['user-agent'], 'Real/1');
+  assert.deepEqual(Object.keys(tmpl?.headers ?? {}), ['user-agent'], 'no override header survives learning');
+  store.close();
+});
+
+test('a JSON-array body round-trips unchanged and trains no form params', () => {
+  // Gmail's `bv` body is a JSON array: treating it as a form turned the replay
+  // body into `%5B%5B0%2C51…%5D%5D=` and learned the whole JSON text as a key.
+  const store = new SqliteStore(':memory:');
+  const body = '[[0,51,null,[1]]]';
+  store.insertCapture(
+    capture({
+      id: 'bv',
+      adapterId: 'gmail',
+      host: 'mail.google.com',
+      url: 'https://mail.google.com/sync/u/0/i/bv',
+      path: '/sync/u/0/i/bv',
+      reqHeaders: { 'content-type': 'application/json', 'user-agent': 'Real/1' },
+      reqBody: body,
+    }),
+  );
+  const tmpl = learnRequestTemplate(store, 'POST', '/sync/u/0/i/bv', 'mail.google.com');
+  assert.deepEqual(tmpl?.bodyParams, {});
+  const out = faithfulReplayRequest(store, {
+    method: 'POST',
+    url: 'https://mail.google.com/sync/u/0/i/bv',
+    headers: { 'content-type': 'application/json' },
+    body,
+  });
+  assert.equal(out.body, body);
+  assert.equal(out.headers['user-agent'], 'Real/1');
+  store.close();
 });

@@ -5,10 +5,11 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { SqliteStore } from '@sluice/core';
-import type { Capture, Session } from '@sluice/core';
+import type { Capture, FlowTemplate, ReplayAction, Session } from '@sluice/core';
+import { redactUrl } from '@sluice/core';
 import { clusterCaptureList } from './flows.js';
-import { learnFlowTemplates, FLOW_TEMPLATE_VERSION } from './flow-learn.js';
-import { buildFlowStepRequest } from './flow-build.js';
+import { learnFlowTemplates } from './flow-learn.js';
+import { buildFlowStepRequest, FLOW_TEMPLATE_VERSION, FlowBuildError, flowStepBuilder } from './flow-build.js';
 
 const T0 = 1_700_000_000_000;
 
@@ -30,6 +31,20 @@ function capture(over: Partial<Capture> = {}): Capture {
     resBody: null,
     ...over,
   };
+}
+
+function readAction(method: string, urlTemplate: string): ReplayAction {
+  return { id: urlTemplate, adapterId: 'test', label: urlTemplate, method, urlTemplate, params: [] };
+}
+
+/** The Slack read surface these fixtures replay: history is a vetted POST read, members and emoji are not. */
+const SLACK_READS = [readAction('POST', 'https://slack.com/api/conversations.history')];
+const SLACK_APP = { hosts: ['slack.com'], listReplayActions: () => SLACK_READS };
+const SLACK_RAILS = { allowedHosts: ['slack.com'], readActions: SLACK_READS };
+
+/** A FlowBuildError with this code, for assert.throws. */
+function buildRefused(code: FlowBuildError['code']): (e: unknown) => boolean {
+  return (e) => e instanceof FlowBuildError && e.name === 'FlowBuildError' && e.code === code;
 }
 
 function session(): Session {
@@ -168,6 +183,7 @@ test('buildFlowStepRequest injects live token and flow params', () => {
   const req = buildFlowStepRequest(tmpl!, primary, session(), {
     params: { channel: 'C999' },
     priorResponses: new Map(),
+    ...SLACK_RAILS,
   });
   assert.ok(req);
   assert.equal(req!.method, 'POST');
@@ -196,6 +212,7 @@ test('buildFlowStepRequest F4.4 refuses host outside allowedHosts', () => {
         params: { channel: 'C1' },
         priorResponses: new Map(),
         allowedHosts: ['trello.com'],
+        readActions: SLACK_READS,
       }),
     (e: unknown) =>
       e instanceof Error &&
@@ -206,7 +223,7 @@ test('buildFlowStepRequest F4.4 refuses host outside allowedHosts', () => {
   const ok = buildFlowStepRequest(tmpl!, primary, session(), {
     params: { channel: 'C1' },
     priorResponses: new Map(),
-    allowedHosts: ['slack.com'],
+    ...SLACK_RAILS,
   });
   assert.ok(ok);
   store.close();
@@ -228,6 +245,7 @@ test('buildFlowStepRequest returns null when a required flow param is missing', 
   const req = buildFlowStepRequest(tmpl!, primary, session(), {
     params: {},
     priorResponses: new Map(),
+    ...SLACK_RAILS,
   });
   // If channel is only in flowParams but step.params uses flowParam, null is correct.
   if (primary.params?.channel?.kind === 'flowParam') {
@@ -395,7 +413,10 @@ test('learnFlowTemplates drops soft asset companions from API primaries', () => 
   assert.equal(tmpl!.primaryKey, 'cards/:id');
   assert.ok(!tmpl!.steps.some((s) => s.operation === 'asset' || /assets\//i.test(s.path)));
   assert.ok(tmpl!.steps.some((s) => s.role === 'primary'));
-  assert.ok(tmpl!.steps.some((s) => s.operation === 'cards/:id/markAsViewed'));
+  assert.ok(
+    !tmpl!.steps.some((s) => s.operation === 'cards/:id/markAsViewed'),
+    'a read-receipt POST is a write and is not learned',
+  );
   store.close();
 });
 
@@ -480,8 +501,8 @@ test('learnFlowTemplates folds board/:id onto boards/:id', () => {
       ts: T0 + 30,
       adapterId: 'trello',
       host: 'trello.com',
-      path: '/1/boards/5f00000000000000000000b1/lists',
-      url: 'https://trello.com/1/boards/5f00000000000000000000b1/lists',
+      path: '/1/boards/aaaaaaaaaaaaaaaaaaaaaa01/lists',
+      url: 'https://trello.com/1/boards/aaaaaaaaaaaaaaaaaaaaaa01/lists',
       method: 'GET',
       classification: 'boards/:id/lists',
     }),
@@ -564,6 +585,7 @@ test('learn+build Trello path-id yields concrete URL not literal :id', () => {
   const req = buildFlowStepRequest(tmpl!, primary, trelloSession(), {
     params: { cardId: 'AbCdEf12' },
     priorResponses: new Map(),
+    allowedHosts: ['trello.com'],
   });
   assert.ok(req);
   assert.equal(new URL(req!.url).pathname, '/1/cards/AbCdEf12');
@@ -598,8 +620,44 @@ test('buildFlowStepRequest refuses unsubstituted path placeholders', () => {
   const req = buildFlowStepRequest(tmpl, tmpl.steps[0]!, trelloSession(), {
     params: {},
     priorResponses: new Map(),
+    allowedHosts: ['trello.com'],
   });
   assert.equal(req, null);
+});
+
+test('buildFlowStepRequest refuses a dot-segment path value', () => {
+  const tmpl = {
+    id: 't',
+    adapterId: 'trello',
+    primaryKey: 'cards/:id',
+    sampleCount: 1,
+    version: FLOW_TEMPLATE_VERSION,
+    learnedAt: T0,
+    flowParams: [{ name: 'cardId', required: true }],
+    steps: [
+      {
+        seq: 0,
+        role: 'primary' as const,
+        method: 'GET',
+        path: '/1/cards/{cardId}/actions',
+        operation: 'cards/:id/actions',
+        required: true,
+        support: 1,
+        delayMsP50: 0,
+        params: { cardId: { kind: 'flowParam' as const, name: 'cardId' } },
+      },
+    ],
+  };
+  const ctx = (cardId: string) => ({ params: { cardId }, priorResponses: new Map(), allowedHosts: ['trello.com'] });
+  for (const dots of ['.', '..']) {
+    assert.throws(
+      () => buildFlowStepRequest(tmpl, tmpl.steps[0]!, trelloSession(), ctx(dots)),
+      buildRefused('path_unresolved'),
+      `cardId ${dots}`,
+    );
+  }
+  const req = buildFlowStepRequest(tmpl, tmpl.steps[0]!, trelloSession(), ctx('a..b'));
+  assert.equal(new URL(req!.url).pathname, '/1/cards/a..b/actions');
 });
 
 test('findBind maps to template seq after dropped asset companion', () => {
@@ -608,8 +666,8 @@ test('findBind maps to template seq after dropped asset companion', () => {
   // Asset is dropped from the template — bind must point at primary seq, not index 1.
   // Board ids must be id-like (24-hex) so path templatize + normalize collapse them.
   for (const [i, card, board] of [
-    [0, 'SynCard1', '5f00000000000000000000b1'],
-    [1, 'SynCard2', '5f00000000000000000000b3'],
+    [0, 'SynCard1', 'aaaaaaaaaaaaaaaaaaaaaa01'],
+    [1, 'SynCard2', 'bbbbbbbbbbbbbbbbbbbbbb02'],
   ] as const) {
     const base = T0 + i * 10_000;
     store.insertCapture(
@@ -689,5 +747,389 @@ test('findBind maps to template seq after dropped asset companion', () => {
     );
     assert.match(idBoardSrc.jsonPath, /idBoard/);
   }
+  store.close();
+});
+
+// ── Build rails: what a flow step may send ───────────────────────────────────────
+
+/** A one-step template around `step`, for building a single request inline. */
+function oneStep(adapterId: string, step: FlowTemplate['steps'][number]): FlowTemplate {
+  return {
+    id: 't',
+    adapterId,
+    primaryKey: step.operation ?? step.path,
+    sampleCount: 1,
+    version: FLOW_TEMPLATE_VERSION,
+    learnedAt: T0,
+    flowParams: [],
+    steps: [step],
+  };
+}
+
+const STEP = { seq: 0, role: 'primary' as const, required: true, support: 1, delayMsP50: 0 };
+
+test('a refused step never puts the query (and its live token) in the error', () => {
+  // A GET carries tokenFormField and injection.query values in its URL, and the
+  // message ends up in flow results that MCP and the CLI print.
+  const tmpl = oneStep('slack', {
+    ...STEP,
+    method: 'GET',
+    path: '/api/search',
+    params: { q: { kind: 'flowParam', name: 'q' } },
+  });
+  let message = '';
+  assert.throws(
+    () =>
+      buildFlowStepRequest(tmpl, tmpl.steps[0]!, session(), {
+        params: { q: 'chat.postMessage' },
+        priorResponses: new Map(),
+        ...SLACK_RAILS,
+      }),
+    (e: unknown) => {
+      message = e instanceof Error ? e.message : '';
+      return buildRefused('operation_not_allowed')(e);
+    },
+  );
+  assert.ok(message.includes('/api/search'), message);
+  assert.ok(!message.includes('xoxc-live'), 'the live token is not in the message');
+  assert.ok(!message.includes('token='), 'no query string in the message');
+});
+
+test('a bind resolves through the default resolver when none is injected', () => {
+  const tmpl = oneStep('slack', {
+    ...STEP,
+    method: 'POST',
+    path: '/api/conversations.history',
+    operation: 'conversations.history',
+    params: { channel: { kind: 'bind', fromStep: 0, jsonPath: 'channel.id' } },
+  });
+  const req = buildFlowStepRequest(tmpl, tmpl.steps[0]!, session(), {
+    params: {},
+    priorResponses: new Map([[0, { channel: { id: 'C777' } }]]),
+    ...SLACK_RAILS,
+  });
+  assert.ok(req?.body?.includes('channel=C777'), req?.body);
+});
+
+test('an injection ref naming an Object.prototype member injects nothing', () => {
+  // Refs are looked up as OWN keys: `values.constructor` is Object's function,
+  // truthy, and used to be coerced onto the wire as a query, header or cookie.
+  const get = oneStep('trello', { ...STEP, method: 'GET', path: '/1/members/me/boards' });
+  const s = trelloSession();
+  s.credentials.values = { key: 'trello-key' };
+  s.credentials.injection = {
+    tokenFormField: 'constructor',
+    query: { key: 'key', q: 'constructor' },
+    headers: { 'x-probe': 'toString' },
+    cookies: { C: '__proto__' },
+  };
+  const req = buildFlowStepRequest(get, get.steps[0]!, s, {
+    params: {},
+    priorResponses: new Map(),
+    allowedHosts: ['trello.com'],
+  });
+  assert.ok(req);
+  const url = new URL(req.url);
+  assert.equal(url.searchParams.get('key'), 'trello-key', 'an own key still resolves');
+  assert.equal(url.searchParams.has('q'), false);
+  assert.equal(url.searchParams.has('constructor'), false);
+  assert.equal(req.headers['x-probe'], undefined);
+  assert.equal(req.headers.cookie, undefined);
+});
+
+test('a session-kind param never carries a guessed credential', () => {
+  // flow-learn marks any redacted capture param `session`. Build used to fill it
+  // with the first credential value, i.e. Trello's whole cookie jar as `?key=`.
+  const jar = 'SYNTHETIC-COOKIE-JAR-0001';
+  const cookieSession: Session = {
+    ...trelloSession(),
+    credentials: { kind: 'trello', values: { cookieHeader: jar }, injection: { headers: { Cookie: 'cookieHeader' } } },
+  };
+  const params = { key: { kind: 'session' as const }, id: { kind: 'session' as const } };
+  const rails = { allowedHosts: ['trello.com'], readActions: [readAction('POST', 'https://trello.com/1/search')] };
+  for (const [method, path] of [
+    ['GET', '/1/members/me/boards'],
+    ['POST', '/1/search'],
+  ] as const) {
+    const tmpl = oneStep('trello', { ...STEP, method, path, params });
+    const req = buildFlowStepRequest(tmpl, tmpl.steps[0]!, cookieSession, {
+      params: {},
+      priorResponses: new Map(),
+      ...rails,
+    });
+    assert.ok(req, method);
+    assert.ok(!req!.url.includes(jar) && !redactUrl(req!.url).includes(jar), `${method}: not in the URL`);
+    assert.ok(!(req!.body ?? '').includes(jar), `${method}: not in the body`);
+    assert.equal(req!.headers.Cookie, jar, `${method}: declared injection still applies`);
+  }
+});
+
+test('caller params fill declared keys only, never new ones', () => {
+  const store = new SqliteStore(':memory:');
+  seedBursts(store);
+  const [tmpl] = learnFlowTemplates(store, { adapterId: 'slack' });
+  const primary = tmpl!.steps.find((s) => s.role === 'primary')!;
+  const req = buildFlowStepRequest(tmpl!, primary, session(), {
+    params: { channel: 'C1', _method: 'DELETE', extra: 'x' },
+    priorResponses: new Map(),
+    ...SLACK_RAILS,
+  });
+  const body = new URLSearchParams(req?.body);
+  assert.equal(body.get('channel'), 'C1');
+  assert.equal(body.get('_method'), null, 'a caller cannot add a method override');
+  assert.equal(body.get('extra'), null);
+  store.close();
+});
+
+test('a non-GET step must match one of the adapter\'s replay actions', () => {
+  const store = new SqliteStore(':memory:');
+  seedBursts(store);
+  const [tmpl] = learnFlowTemplates(store, { adapterId: 'slack' });
+  const primary = tmpl!.steps.find((s) => s.role === 'primary')!;
+  const members = tmpl!.steps.find((s) => s.operation === 'conversations.members')!;
+  const ctx = { params: { channel: 'C1' }, priorResponses: new Map() };
+  // A POST read the adapter does not list is refused like a write…
+  assert.throws(
+    () => buildFlowStepRequest(tmpl!, members, session(), { ...ctx, ...SLACK_RAILS }),
+    buildRefused('operation_not_allowed'),
+  );
+  // …and with no read surface at all, every POST is refused.
+  assert.throws(
+    () => buildFlowStepRequest(tmpl!, primary, session(), { ...ctx, allowedHosts: ['slack.com'] }),
+    buildRefused('operation_not_allowed'),
+  );
+  assert.ok(buildFlowStepRequest(tmpl!, primary, session(), { ...ctx, ...SLACK_RAILS }));
+  store.close();
+});
+
+test('shipped writes a burst can carry are refused at build', () => {
+  // Opening a card or a channel fires writes alongside the read. A stored
+  // template may still hold one, so build refuses it; runFlowReplay records a
+  // FlowBuildError as 'denied' and never sends it.
+  const cases: Array<{ adapterId: string; s: Session; method: string; path: string; operation: string; hosts: string[] }> = [
+    {
+      adapterId: 'trello',
+      s: trelloSession(),
+      method: 'POST',
+      path: '/1/cards/SynCard1/actions/comments',
+      operation: 'cards/:id/actions/comments',
+      hosts: ['trello.com'],
+    },
+    {
+      adapterId: 'slack',
+      s: session(),
+      method: 'POST',
+      path: '/api/conversations.mark',
+      operation: 'conversations.mark',
+      hosts: ['slack.com'],
+    },
+  ];
+  for (const c of cases) {
+    const tmpl = oneStep(c.adapterId, { ...STEP, method: c.method, path: c.path, operation: c.operation });
+    assert.throws(
+      () =>
+        buildFlowStepRequest(tmpl, tmpl.steps[0]!, c.s, {
+          params: {},
+          priorResponses: new Map(),
+          allowedHosts: c.hosts,
+          readActions: SLACK_READS,
+        }),
+      buildRefused('operation_not_allowed'),
+      c.operation,
+    );
+  }
+});
+
+test('build refuses without a host rail, and over plain http', () => {
+  const get = oneStep('trello', { ...STEP, method: 'GET', path: '/1/members/me/boards' });
+  const ctx = { params: {}, priorResponses: new Map() };
+  assert.throws(
+    () => buildFlowStepRequest(get, get.steps[0]!, trelloSession(), { ...ctx, allowedHosts: [] }),
+    buildRefused('host_not_allowed'),
+  );
+  const plain = oneStep('trello', { ...STEP, method: 'GET', path: 'http://trello.com/1/members/me/boards' });
+  assert.throws(
+    () => buildFlowStepRequest(plain, plain.steps[0]!, trelloSession(), { ...ctx, allowedHosts: ['trello.com'] }),
+    buildRefused('host_not_allowed'),
+  );
+});
+
+test('flowStepBuilder takes both rails from the adapter', () => {
+  const store = new SqliteStore(':memory:');
+  seedBursts(store);
+  const [tmpl] = learnFlowTemplates(store, { adapterId: 'slack' });
+  const primary = tmpl!.steps.find((s) => s.role === 'primary')!;
+  const ctx = { params: { channel: 'C1' }, priorResponses: new Map() };
+  assert.match(flowStepBuilder(tmpl!, SLACK_APP)(primary, session(), ctx)!.url, /conversations\.history/);
+  assert.throws(
+    () => flowStepBuilder(tmpl!, { ...SLACK_APP, hosts: ['other.example'] })(primary, session(), ctx),
+    buildRefused('host_not_allowed'),
+  );
+  assert.throws(
+    () => flowStepBuilder(tmpl!, { ...SLACK_APP, listReplayActions: () => [] })(primary, session(), ctx),
+    buildRefused('operation_not_allowed'),
+  );
+  store.close();
+});
+
+test('a refused build of an older template says to re-learn; a current one does not', () => {
+  const store = new SqliteStore(':memory:');
+  seedBursts(store);
+  const [tmpl] = learnFlowTemplates(store, { adapterId: 'slack' });
+  const primary = tmpl!.steps.find((s) => s.role === 'primary')!;
+  const ctx = { params: { channel: 'C1' }, priorResponses: new Map() };
+  const noReads = { ...SLACK_APP, listReplayActions: () => [] };
+  const old = { ...tmpl!, version: FLOW_TEMPLATE_VERSION - 1 };
+  assert.throws(
+    () => flowStepBuilder(tmpl!, noReads)(primary, session(), ctx),
+    (e: unknown) => buildRefused('operation_not_allowed')(e) && !(e as Error).message.includes('learn-flows'),
+  );
+  assert.throws(
+    () => flowStepBuilder(old, noReads)(primary, session(), ctx),
+    (e: unknown) => buildRefused('operation_not_allowed')(e) && /older Sluice.*sluice learn-flows/.test((e as Error).message),
+  );
+  // An older template that still passes the rails keeps building.
+  assert.ok(flowStepBuilder(old, SLACK_APP)(primary, session(), ctx));
+  store.close();
+});
+
+test('re-learning deletes an older template whose primary no longer qualifies', () => {
+  const store = new SqliteStore(':memory:');
+  seedBursts(store);
+  const [current] = learnFlowTemplates(store, { adapterId: 'slack' });
+  const stale = store.upsertFlowTemplate({
+    ...current!,
+    id: undefined,
+    primaryKey: 'chat.postMessage',
+    version: FLOW_TEMPLATE_VERSION - 1,
+  });
+  learnFlowTemplates(store, { adapterId: 'slack' });
+  const left = store.listFlowTemplates().map((t) => t.id);
+  assert.ok(left.includes(current!.id), 'the re-learned template stays');
+  assert.ok(!left.includes(stale.id), 'the stale one is swept');
+  store.close();
+});
+
+// ── Learn rails: what a template may be trained on ──────────────────────────────
+
+test('given the adapters, learning keeps only POST steps the adapter vouches for', () => {
+  const store = new SqliteStore(':memory:');
+  seedBursts(store);
+  const [tmpl] = learnFlowTemplates(store, { adapterId: 'slack', adapters: [{ id: 'slack', ...SLACK_APP }] });
+  assert.ok(tmpl);
+  assert.deepEqual(
+    tmpl!.steps.map((s) => s.operation),
+    ['conversations.history'],
+    'members and emoji.list are POSTs outside the read surface',
+  );
+  // An adapter that is not installed vouches for nothing.
+  assert.equal(learnFlowTemplates(store, { adapterId: 'slack', adapters: [], persist: false }).length, 0);
+  store.close();
+});
+
+test('a POST from an extension capture never trains a step', () => {
+  // A page can forge extension captures, so only reads are learned from them.
+  const store = new SqliteStore(':memory:');
+  const caps = [
+    capture({ id: 'x1', source: 'ext', path: '/api/conversations.history', classification: 'conversations.history' }),
+    capture({ id: 'x2', source: 'ext', ts: T0 + 20, path: '/api/users.info', classification: 'users.info' }),
+  ];
+  for (const c of caps) store.insertCapture(c);
+  for (const f of clusterCaptureList(caps)) store.upsertFlow(f);
+  assert.ok(store.listFlows({ adapterId: 'slack' }).length > 0, 'the burst clustered');
+  assert.equal(learnFlowTemplates(store, { adapterId: 'slack' }).length, 0);
+  store.close();
+});
+
+// ── learned step host ───────────────────────────────────────────────────────
+
+function loomSession(): Session {
+  return {
+    id: 'l1',
+    adapterId: 'loom',
+    label: 'loom',
+    discoveredAt: T0,
+    source: 'manual',
+    credentials: { kind: 'loom', values: { cookieHeader: 'c=1' }, injection: { headers: { Cookie: 'cookieHeader' } } },
+  };
+}
+
+/** Two Loom bursts (a folder list plus a companion) on www.loom.com, learned. */
+function learnLoomTemplate(store: SqliteStore): FlowTemplate {
+  for (let i = 0; i < 2; i++) {
+    const base = T0 + i * 10_000;
+    const caps = [
+      capture({
+        id: `lf${i}`,
+        ts: base,
+        adapterId: 'loom',
+        method: 'GET',
+        host: 'www.loom.com',
+        url: 'https://www.loom.com/v1/folders',
+        path: '/v1/folders',
+        classification: 'folders.list',
+        resBody: JSON.stringify({ folders: [] }),
+      }),
+      capture({
+        id: `lu${i}`,
+        ts: base + 40,
+        adapterId: 'loom',
+        method: 'GET',
+        host: 'www.loom.com',
+        url: 'https://www.loom.com/v1/users/me',
+        path: '/v1/users/me',
+        classification: 'users.me',
+        resBody: JSON.stringify({ id: 'u' }),
+      }),
+    ];
+    for (const c of caps) store.insertCapture(c);
+    const proposed = clusterCaptureList(caps);
+    assert.equal(proposed.length, 1, `loom burst ${i} should cluster`);
+    store.upsertFlow(proposed[0]!);
+  }
+  const tmpl = learnFlowTemplates(store, { adapterId: 'loom', persist: false }).find(
+    (t) => t.steps.some((s) => s.path === '/v1/folders'),
+  );
+  assert.ok(tmpl, 'a loom template is learned');
+  return tmpl!;
+}
+
+const LOOM_RAILS = { params: {}, priorResponses: new Map<number, unknown>(), allowedHosts: ['loom.com'] };
+
+test('a learned step keeps its observed host, and build sends it there', () => {
+  const store = new SqliteStore(':memory:');
+  const tmpl = learnLoomTemplate(store);
+  const step = tmpl.steps.find((s) => s.path === '/v1/folders')!;
+  assert.equal(step.host, 'www.loom.com');
+  const req = buildFlowStepRequest(tmpl, step, loomSession(), LOOM_RAILS);
+  assert.equal(new URL(req!.url).hostname, 'www.loom.com');
+  store.close();
+});
+
+test('a fixed adapter host keeps precedence over the learned one', () => {
+  const store = new SqliteStore(':memory:');
+  seedBursts(store);
+  const tmpl = learnFlowTemplates(store, { adapterId: 'slack', persist: false })[0]!;
+  const primary = tmpl.steps.find((s) => s.role === 'primary')!;
+  const ctx = { params: { channel: 'C1' }, priorResponses: new Map<number, unknown>(), ...SLACK_RAILS };
+  for (const host of [undefined, 'acme.slack.com']) {
+    const req = buildFlowStepRequest(tmpl, { ...primary, host }, session(), ctx);
+    assert.equal(new URL(req!.url).hostname, 'slack.com', `learned host ${host}`);
+  }
+  store.close();
+});
+
+test('the host rail still refuses a learned host outside the adapter, and a malformed one falls back', () => {
+  const store = new SqliteStore(':memory:');
+  const tmpl = learnLoomTemplate(store);
+  const step = tmpl.steps.find((s) => s.path === '/v1/folders')!;
+  assert.throws(
+    () => buildFlowStepRequest(tmpl, { ...step, host: 'evil.example' }, loomSession(), LOOM_RAILS),
+    buildRefused('host_not_allowed'),
+  );
+  assert.throws(
+    () => buildFlowStepRequest(tmpl, { ...step, host: 'a.com/x@b' }, loomSession(), LOOM_RAILS),
+    (e: unknown) => buildRefused('host_not_allowed')(e) && /loom\.example/.test((e as Error).message),
+  );
   store.close();
 });

@@ -3,8 +3,7 @@
  * The captured data, read as data rather than as traffic.
  *
  * The traffic table answers "what did this app call?"; this answers "what is in
- * my account?" — the same captures, normalized into workspaces, containers and
- * items, which until now the runner streamed and the client threw away.
+ * my account?" — the same captures, normalized into workspaces, containers and items.
  *
  * Three panes, left to right: the tree, one container's items, one item's text.
  * Resizable, because which pane matters depends entirely on what you are doing —
@@ -25,7 +24,10 @@ import { useVirtualizer } from '@tanstack/react-virtual';
 import type { Container, Item, Workspace } from '@sluice/core';
 import { fetchContainers, fetchItems, fetchWorkspaces } from '../api.js';
 import type { ItemPage } from '../api.js';
+import { groupBy, toggled } from '../collections.js';
+import { errorMessage } from '../format.js';
 import { navigate } from '../router.js';
+import { useAsync } from '../use-async.js';
 import {
   ResizableHandle,
   ResizablePanel,
@@ -45,31 +47,21 @@ const MAX_THREAD = 500;
 const TREE_ROW = 26;
 const ITEM_ROW = 52;
 
+/** Stable empties, so the tree's memo does not recompute on every render before the load. */
+const NO_WORKSPACES: Workspace[] = [];
+const NO_CONTAINERS: Container[] = [];
+
 interface Props {
   /** From the URL, so a container view is a real link rather than a mode. */
   containerId?: string;
 }
 
 export function ExplorePage({ containerId }: Props) {
-  const [workspaces, setWorkspaces] = useState<Workspace[]>([]);
-  const [containers, setContainers] = useState<Container[]>([]);
-  const [error, setError] = useState<string | null>(null);
+  const { data: loaded, error } = useAsync(() => Promise.all([fetchWorkspaces(), fetchContainers()]), []);
+  const workspaces = loaded?.[0].workspaces ?? NO_WORKSPACES;
+  const containers = loaded?.[1].containers ?? NO_CONTAINERS;
   const [collapsed, setCollapsed] = useState<Set<string>>(new Set());
   const [selectedItem, setSelectedItem] = useState<Item | null>(null);
-
-  useEffect(() => {
-    let live = true;
-    Promise.all([fetchWorkspaces(), fetchContainers()])
-      .then(([w, c]) => {
-        if (!live) return;
-        setWorkspaces(w.workspaces);
-        setContainers(c.containers);
-      })
-      .catch((e: unknown) => live && setError(e instanceof Error ? e.message : String(e)));
-    return () => {
-      live = false;
-    };
-  }, []);
 
   // The container the URL names, or nothing. Resolved against what was loaded
   // rather than trusted: a stale link, or one typed by hand, names a container
@@ -89,11 +81,7 @@ export function ExplorePage({ containerId }: Props) {
   );
 
   const toggle = useCallback((workspaceId: string) => {
-    setCollapsed((prev) => {
-      const next = new Set(prev);
-      if (!next.delete(workspaceId)) next.add(workspaceId);
-      return next;
-    });
+    setCollapsed((prev) => toggled(prev, workspaceId));
   }, []);
 
   if (error !== null) {
@@ -136,12 +124,16 @@ export function treeRows(
   containers: Container[],
   collapsed: Set<string>,
 ): TreeRow[] {
-  const byWorkspace = new Map<string, Container[]>();
-  for (const c of containers) {
-    byWorkspace.set(c.workspaceId, [...(byWorkspace.get(c.workspaceId) ?? []), c]);
-  }
+  const byWorkspace = groupBy(containers, (c) => c.workspaceId);
   const rows: TreeRow[] = [];
-  for (const w of workspaces) {
+  // A container can arrive before (or without) its workspace — an adapter that
+  // never names its parent. It gets a group of its own, labelled with the id:
+  // never filed under another account, and never silently hidden.
+  const known = new Set(workspaces.map((w) => w.id));
+  const orphanGroups = [...byWorkspace.keys()]
+    .filter((id) => !known.has(id))
+    .map((id) => ({ id, name: id }));
+  for (const w of [...workspaces, ...orphanGroups]) {
     const own = byWorkspace.get(w.id) ?? [];
     // Threads are not places. There is one per conversation, so listing them
     // here buries the structure: the recorded mailbox had 24 labels among 94
@@ -225,14 +217,8 @@ function Tree({
               aria-level={row.kind === 'workspace' ? 1 : 2}
               aria-expanded={row.kind === 'workspace' ? !row.collapsed : undefined}
               tabIndex={-1}
-              style={{
-                position: 'absolute',
-                top: 0,
-                left: 0,
-                width: '100%',
-                height: v.size,
-                transform: `translateY(${v.start}px)`,
-              }}
+              className="absolute top-0 left-0 w-full"
+              style={{ height: v.size, transform: `translateY(${v.start}px)` }}
             >
               <button
                 type="button"
@@ -295,7 +281,7 @@ function ItemList({
     setError(null);
     fetchItems(id, PAGE, 0)
       .then((p) => live && setPage(p))
-      .catch((e: unknown) => live && setError(e instanceof Error ? e.message : String(e)))
+      .catch((e: unknown) => live && setError(errorMessage(e)))
       .finally(() => live && setLoading(false));
     return () => {
       live = false;
@@ -312,7 +298,7 @@ function ItemList({
         // down by one, and a counter would then skip exactly that many.
         setPage((cur) => (cur === null ? next : { ...next, items: [...cur.items, ...next.items] })),
       )
-      .catch((e: unknown) => setError(e instanceof Error ? e.message : String(e)))
+      .catch((e: unknown) => setError(errorMessage(e)))
       .finally(() => setLoading(false));
   }, [id, page, loading]);
 
@@ -353,15 +339,9 @@ function ItemList({
               if (item === undefined) return null;
               return (
                 <div
-                  key={`${item.containerId} ${item.id}`}
-                  style={{
-                    position: 'absolute',
-                    top: 0,
-                    left: 0,
-                    width: '100%',
-                    height: v.size,
-                    transform: `translateY(${v.start}px)`,
-                  }}
+                  key={`${item.containerId}\u0000${item.id}`}
+                  className="absolute top-0 left-0 w-full"
+                  style={{ height: v.size, transform: `translateY(${v.start}px)` }}
                 >
                   <button
                     type="button"
@@ -410,34 +390,20 @@ function ItemList({
  * while a row from a message fetch carries a body and is one message in one. The
  * link between them is that a thread row's `id` is the id of the CONTAINER its
  * messages were filed under — so a row with no `threadId` of its own is a thread
- * head, and its messages are one fetch away.
- *
- * Without this the two halves of a mailbox never meet: the labels list threads
- * that have no bodies, and the bodies sit in containers the tree deliberately
- * does not show.
+ * head, and its messages (hidden from the tree) are one fetch away.
  */
 function Reader({ item }: { item: Item | null }) {
   const [raw, setRaw] = useState(false);
-  const [thread, setThread] = useState<Item[] | null>(null);
   // A thread head, not a message: `threadId` is set on messages and only on
   // messages, by every adapter that threads at all.
   const headId = item !== null && item.threadId === undefined ? item.id : undefined;
-
-  useEffect(() => {
-    if (headId === undefined) {
-      setThread(null);
-      return;
-    }
-    let live = true;
-    fetchItems(headId, MAX_THREAD, 0)
-      .then((p) => live && setThread(p.items))
-      // A thread nobody fetched is the common case, not an error — the reader
-      // falls back to the snippet the list row already carries.
-      .catch(() => live && setThread(null));
-    return () => {
-      live = false;
-    };
-  }, [headId]);
+  // A thread nobody fetched is the common case, not an error — the error is
+  // ignored and the reader falls back to the snippet the list row already carries.
+  const { data: threadPage } = useAsync(
+    () => (headId === undefined ? null : fetchItems(headId, MAX_THREAD, 0)),
+    [headId],
+  );
+  const thread = threadPage?.items ?? null;
 
   if (item === null) return <Empty>Pick an item to read it.</Empty>;
 

@@ -38,6 +38,7 @@ import type {
   Container,
   CursorSeed,
   Edge,
+  EntityKind,
   Item,
   ParseContext,
   ParseResult,
@@ -46,29 +47,29 @@ import type {
   Session,
   Workspace,
 } from '@sluice/core';
-import { arr, num, safeJson, str } from '@sluice/adapter-sdk';
+import {
+  actionParam,
+  arr,
+  CHROME_UA,
+  fillPathParams,
+  injectedCookieHeader,
+  injectedHeaders,
+  num,
+  safeJson,
+  str,
+} from '@sluice/adapter-sdk';
 import { MAX_BODY_CHARS, htmlToText } from './html-to-text.js';
 
 export const ADAPTER_ID = 'gmail';
-
-/** A real Chrome macOS User-Agent. Google serves a different client to anything else. */
-export const CHROME_UA =
-  'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36';
 
 // ── Ids ──────────────────────────────────────────────────────────────────────────
 
 /**
  * The workspace id for one signed-in mailbox — `gmail:someone@example.com`.
  *
- * **The address is the identity; `/u/N/` is not.** This used to be keyed on the
- * URL's account index, on the reasoning that the index is the only thing every
- * capture carries. The reasoning was fine and the premise was false, and a real
- * two-account recording is what settled it: 391 captures over two mailboxes,
- * 2.5 hours apart, and EVERY ONE of them was `/u/0/`. Switching accounts in the
- * browser does not move you to `/u/1/` — it leaves the slot alone and changes
- * which mailbox is behind it. So a slot-keyed id merged two people's mail into
- * one workspace, labelled it with whichever address parsed first, and nothing
- * anywhere reported a conflict.
+ * **The address is the identity; `/u/N/` is not.** Switching accounts keeps the slot
+ * and changes the mailbox behind it (a two-account recording was `/u/0/` throughout),
+ * so a slot-keyed id merges two people's mail into one workspace.
  *
  * The address sits at `record[11][1]` of an `fd` message record (105 of 114 in
  * the first recording, every one of the 41 `fd` responses in the second). That
@@ -96,9 +97,8 @@ export function accountWorkspaceId(address: string): string {
  * rather than as a mailbox, and {@link reconcileAccounts} empties it by
  * re-parsing its captures once a neighbouring `fd` has named the slot.
  *
- * It is deliberately the SAME string the slot-keyed scheme used to mint, so rows
- * in a store written before this change keep exactly the meaning they had —
- * "some account's slot 0" — and are reconcilable rather than stranded.
+ * It is the same string the slot-keyed scheme minted, so older rows ("some
+ * account's slot 0") stay reconcilable rather than stranded.
  */
 export function provisionalWorkspaceId(slot: string): string {
   return `${ADAPTER_ID}:u${slot}`;
@@ -132,12 +132,8 @@ export function isProvisionalWorkspaceId(workspaceId: string): boolean {
  * A label Container's id: the account's workspace id, then Gmail's own label id —
  * `gmail:you@example.com/^i`.
  *
- * REGRESSION: this used to be the bare label id, and `containers.id` is a PRIMARY
- * KEY. Gmail's label vocabulary is per-account — every signed-in account has an
- * `^i`, an `^all`, an `^f`, its own `^smartlabel_*` — so the second account's
- * Inbox overwrote the first's row, took its `workspace_id` with it, and both
- * mailboxes' threads were then filed in one container. Nothing reported a
- * conflict, because at the store's grain nothing was wrong.
+ * Scoped because `containers.id` is a PRIMARY KEY and Gmail's label vocabulary
+ * (`^i`, `^all`, `^smartlabel_*`) is per-account.
  *
  * Thread containers are deliberately NOT scoped. A thread id is minted per
  * mailbox and never collides across accounts, so scoping it would only make the
@@ -510,10 +506,13 @@ export interface AddressRef {
 }
 
 /** One entry of an address list, or undefined when the slot is not an address. */
-function addressRef(fields: unknown[] | undefined): AddressRef | undefined {
-  const address = str(fields?.[ADDRESS.address]);
+function addressRef(
+  fields: unknown[] | undefined,
+  at: { address: number; name: number } = ADDRESS,
+): AddressRef | undefined {
+  const address = str(fields?.[at.address]);
   if (address === undefined || !address.includes('@')) return undefined;
-  const name = str(fields?.[ADDRESS.name]);
+  const name = str(fields?.[at.name]);
   return name !== undefined && name.length > 0 ? { address, name } : { address };
 }
 
@@ -531,15 +530,6 @@ function addressList(v: unknown): AddressRef[] {
     if (ref !== undefined) out.push(ref);
   }
   return out;
-}
-
-/** The message's From, from the sender card. */
-function senderOf(record: unknown[]): AddressRef | undefined {
-  const card = arr(record[REC.sender]);
-  const address = str(card?.[SENDER.address]);
-  if (address === undefined || !address.includes('@')) return undefined;
-  const name = str(card?.[SENDER.name]);
-  return name !== undefined && name.length > 0 ? { address, name } : { address };
 }
 
 /** Every HTML part, in array order, concatenated. `''` when there are none. */
@@ -587,17 +577,9 @@ function messageBody(record: unknown[]): string {
   const plain = (str(arr(block?.[BODY.plain])?.[PLAIN_TEXT]) ?? '').trim();
   const html = htmlToText(htmlBody(block));
 
-  // The `[4][6]` slot is NOT reliably plain text, and preferring it blindly was
-  // wrong. A real message in the recording — a marketing mail whose HTML part is
-  // 44 724 characters — carries 882 characters of raw CSS there, with no <style>
-  // wrapper for the stripper to catch, so the whole rendered body came out as
-  // `.msg-123 u+.m_123body img~div div{display:none}…`. Whatever that slot is, it
-  // is not "the text alternative" on every message.
-  //
-  // So the slot is used only when it looks like prose. That is cheap to test and
-  // fails safe in the direction that matters: mistaking prose for CSS costs the
-  // stripped HTML, which is a fine body; mistaking CSS for prose costs the reader
-  // the entire message.
+  // `[4][6]` is not reliably plain text: a real marketing mail carries raw CSS there with no
+  // <style> wrapper. So it is used only when it looks like prose; mistaking prose for CSS
+  // costs the stripped HTML, and the reverse costs the whole message.
   if (plain.length > 0 && !looksLikeCss(plain)) return clamp(plain) + note;
   if (html.length > 0) return html + note;
   if (plain.length > 0) return clamp(plain) + note; // CSS beats nothing at all
@@ -628,36 +610,21 @@ function looksLikeCss(text: string): boolean {
 /**
  * `Item.text` — the subject, then the body.
  *
- * `Item` has no subject field and is not getting one: a `subject` column in
- * `@sluice/core` would be a Gmail field in the spine that Slack, Trello and
- * fast.com have no answer for. Of the two places a generic consumer could still
- * find it, `text` is the one that works. `text` is what `items_fts` indexes and
- * what every reader — the webapp, `gmail_search`, an MCP client — renders; a
- * well-known key in `raw` would be searchable by nothing and rendered by
- * nothing, and `raw` is already lossless anyway (the subject is at index 4 of
- * the record sitting in it). The cost is that `text` is no longer purely a body,
- * which is exactly how every mail client on earth displays a message.
- *
- * {@link threadText} does the same for `bv` thread rows, and for the same
- * reasons. They used to carry the snippet alone, which is what Gmail renders as
- * the preview LINE — but it is not what Gmail renders as the thread's title, so
- * a generic reader listing items by their text showed every conversation by its
- * first few words of body and never by its subject. It also kept subjects out
- * of the FTS index for exactly the half of the mailbox that has no bodies
- * captured, which is the half a search is most needed for.
+ * `Item` has no subject field, because that would be a Gmail field in the spine.
+ * `text` is what `items_fts` indexes and every reader renders, and `raw` stays
+ * lossless. {@link threadText} does the same for `bv` rows, so a thread lists and
+ * searches by its subject.
  */
 function threadText(thread: unknown[]): string {
-  const subject = (str(thread[THREAD.subject]) ?? '').trim();
-  const snippet = (str(thread[THREAD.snippet]) ?? '').trim();
-  if (subject.length === 0) return snippet;
-  return snippet.length === 0 ? subject : `${subject}\n\n${snippet}`;
+  return [(str(thread[THREAD.subject]) ?? '').trim(), (str(thread[THREAD.snippet]) ?? '').trim()]
+    .filter((s) => s.length > 0)
+    .join('\n\n');
 }
 
 function messageText(record: unknown[]): string {
-  const subject = (str(record[REC.subject]) ?? '').trim();
-  const body = messageBody(record);
-  if (subject.length === 0) return body;
-  return body.length === 0 ? subject : `${subject}\n\n${body}`;
+  return [(str(record[REC.subject]) ?? '').trim(), messageBody(record)]
+    .filter((s) => s.length > 0)
+    .join('\n\n');
 }
 
 /**
@@ -718,7 +685,7 @@ export function gmailMessageView(raw: unknown): GmailMessageView {
     to: addressList(record[REC.to]),
     cc: addressList(record[REC.cc]),
   };
-  const from = senderOf(record);
+  const from = addressRef(arr(record[REC.sender]), SENDER);
   if (from !== undefined) view.from = from;
   const date = num(record[REC.date]);
   if (date !== undefined) view.date = date;
@@ -1035,11 +1002,7 @@ export function gmailCarriesEntities(capture: Capture): boolean {
  * that is the address answers both fields on its own, so every parse of every
  * capture of one mailbox produces byte-identical rows and order stops mattering.
  *
- * That is also why the provisional name says what it is. It reads as "we have
- * mail from slot 0 and do not yet know whose", because that is true, and a
- * workspace list is exactly where a person should find that out. Calling it
- * `Gmail (u0)` was the old spelling and it read as a mailbox — which is how two
- * accounts merged into one row without anyone noticing.
+ * The provisional name says it is unresolved, so it never reads as a mailbox.
  */
 function accountWorkspace(workspaceId: string, slot: string): Workspace {
   const address = addressOfWorkspaceId(workspaceId);
@@ -1126,17 +1089,8 @@ function parseBatchView(capture: Capture, body: unknown[], workspace: Workspace)
     // labels seen in THIS response would instead drop a real user label the moment
     // a response carried a partial list.
     for (const labelId of threadLabels(thread)) {
-      edges.push({
-        srcKind: 'item',
-        srcId: id,
-        rel: 'in-label',
-        dstKind: 'container',
-        // The same scoped id the container carries. An edge pointing at the bare
-        // `^i` would resolve to whichever account happened to write that row.
-        dstId: labelContainerId(workspaceId, labelId),
-        adapterId: ADAPTER_ID,
-        workspaceId,
-      });
+      const dst = labelContainerId(workspaceId, labelId);
+      edges.push(edge(workspaceId, 'item', id, 'in-label', 'container', dst));
     }
   }
   if (label === undefined && items.length > 0) {
@@ -1165,15 +1119,22 @@ function parseBatchView(capture: Capture, body: unknown[], workspace: Workspace)
  * capitalisation across headers, so lowering it is what makes one person one
  * actor.
  *
- * SCOPED for the same reason a label container is, and the bug was the same
- * shape: `actors.id` is a PRIMARY KEY, and two signed-in accounts that both
- * correspond with the same person — which is the ordinary case, not the corner
- * one — wrote one row whose `workspace_id` flipped to whichever mailbox parsed
- * last. Every `authored` edge from the other account then pointed at an actor
- * filed under a mailbox it was not in.
+ * SCOPED like a label container: `actors.id` is a PRIMARY KEY, and two accounts that
+ * correspond with one person would otherwise share a row.
  */
 function actorId(workspaceId: string, address: string): string {
   return `${workspaceId}/${address.toLowerCase()}`;
+}
+
+function edge(
+  workspaceId: string,
+  srcKind: EntityKind,
+  srcId: string,
+  rel: string,
+  dstKind: EntityKind,
+  dstId: string,
+): Edge {
+  return { srcKind, srcId, rel, dstKind, dstId, adapterId: ADAPTER_ID, workspaceId };
 }
 
 /** Remember one address as an Actor, upgrading it if this sighting has a name. */
@@ -1252,7 +1213,7 @@ function parseFetchData(capture: Capture, body: unknown[], workspace: Workspace)
         threadName = subject;
       }
 
-      const from = senderOf(record);
+      const from = addressRef(arr(record[REC.sender]), SENDER);
       const recipients = [...addressList(record[REC.to]), ...addressList(record[REC.cc])];
 
       const item: Item = {
@@ -1267,51 +1228,19 @@ function parseFetchData(capture: Capture, body: unknown[], workspace: Workspace)
         sourceCaptureIds: [capture.id],
         raw: record,
       };
-      if (from !== undefined) item.authorId = rememberActor(actors, from, workspaceId);
       items.push(item);
-
       if (from !== undefined) {
-        edges.push({
-          srcKind: 'actor',
-          // The SAME id `rememberActor` minted, not a second derivation of it.
-          // These two spellings drifted apart the moment actor ids became
-          // account-scoped, and an edge pointing at an actor row that does not
-          // exist fails silently — the edges table permits dangling endpoints
-          // by design, so nothing would have reported it.
-          srcId: actorId(workspaceId, from.address),
-          rel: 'authored',
-          dstKind: 'item',
-          dstId: id,
-          adapterId: ADAPTER_ID,
-          workspaceId,
-        });
+        item.authorId = rememberActor(actors, from, workspaceId);
+        edges.push(edge(workspaceId, 'actor', item.authorId, 'authored', 'item', id));
       }
       for (const ref of recipients) {
-        edges.push({
-          srcKind: 'item',
-          srcId: id,
-          rel: 'sent-to',
-          dstKind: 'actor',
-          dstId: rememberActor(actors, ref, workspaceId),
-          adapterId: ADAPTER_ID,
-          workspaceId,
-        });
+        const actor = rememberActor(actors, ref, workspaceId);
+        edges.push(edge(workspaceId, 'item', id, 'sent-to', 'actor', actor));
       }
-      // Same rule as `bv`: unfiltered, because most of these label ids never
-      // appear in any label list and so point at a Container that will not
-      // exist, which the edges table is explicitly built to allow.
+      // Unfiltered and scoped, as in bv.
       for (const labelId of labels.get(id) ?? []) {
-        edges.push({
-          srcKind: 'item',
-          srcId: id,
-          rel: 'in-label',
-          dstKind: 'container',
-          // Scoped, like `bv`'s: the same message in two accounts must not point
-          // both mailboxes at one label row.
-          dstId: labelContainerId(workspaceId, labelId),
-          adapterId: ADAPTER_ID,
-          workspaceId,
-        });
+        const dst = labelContainerId(workspaceId, labelId);
+        edges.push(edge(workspaceId, 'item', id, 'in-label', 'container', dst));
       }
     }
 
@@ -1377,21 +1306,28 @@ export function gmailNextCursors(): CursorSeed[] {
 const BV_FRAME_ARITY = 33;
 const BV_MAX_THREADS = 2000;
 
-const GMAIL_REPLAY_ACTIONS: ReplayAction[] = [
-  {
-    id: 'gmail.threads.list',
-    adapterId: ADAPTER_ID,
-    label: 'Threads in a label',
-    method: 'POST',
-    urlTemplate: 'https://mail.google.com/sync/u/{account}/i/bv',
-    params: [
-      { name: 'account', label: 'Account index', kind: 'string', default: '0' },
-      { name: 'label', label: 'Label id', kind: 'containerId', required: true, default: '^i' },
-      { name: 'viewType', label: 'View type', kind: 'number', default: '0' },
-      { name: 'max', label: 'Max threads', kind: 'number', default: String(BV_MAX_THREADS) },
-    ],
-  },
-];
+/**
+ * `bv` for one label — built and tested, and NOT advertised by
+ * `listReplayActions()`.
+ *
+ * Gmail has no credentials provider (see index.ts), so no host ever holds a
+ * Gmail session: the dashboard refuses it with an `extract-token` hint that
+ * cannot help, and the CLI and MCP send it unauthenticated. An action no one can
+ * run successfully is not offered. The provider that fills this seam lists it.
+ */
+export const GMAIL_THREADS_LIST: ReplayAction = {
+  id: 'gmail.threads.list',
+  adapterId: ADAPTER_ID,
+  label: 'Threads in a label',
+  method: 'POST',
+  urlTemplate: 'https://mail.google.com/sync/u/{account}/i/bv',
+  params: [
+    { name: 'account', label: 'Account index', kind: 'string', default: '0' },
+    { name: 'label', label: 'Label id', kind: 'containerId', required: true, default: '^i' },
+    { name: 'viewType', label: 'View type', kind: 'number', default: '0' },
+    { name: 'max', label: 'Max threads', kind: 'number', default: String(BV_MAX_THREADS) },
+  ],
+};
 
 /**
  * The positional frame a `bv` call is made of, rebuilt from the shape the real
@@ -1428,48 +1364,25 @@ function bvRequestBody(label: string, viewType: number, max: number): string {
 }
 
 /**
- * Google's cookie set (`SID`/`HSID`/`SSID`/`APISID`/`SAPISID`) as one header.
- *
- * Each `injection.cookies` entry maps a cookie NAME to the KEY in `values` that
- * holds its secret, falling back to a literal — reading it the other way round
- * emits the string `sidValue` as the cookie value, producing a request that looks
- * correct and is unauthenticated. `values.cookieHeader` behind it is the
- * pre-assembled form a Chrome-cookie provider hands over.
- */
-function cookieHeader(session: Session): string | undefined {
-  const creds = session.credentials;
-  const pairs: string[] = [];
-  for (const [name, ref] of Object.entries(creds.injection.cookies ?? {})) {
-    const value = creds.values[ref] ?? ref;
-    if (value) pairs.push(`${name}=${value}`);
-  }
-  return pairs.length > 0 ? pairs.join('; ') : creds.values.cookieHeader;
-}
-
-/** `{account}` in a urlTemplate — Gmail scopes by path segment, not by query. */
-const PATH_PARAM = /\{(\w+)\}/g;
-
-/**
  * Build the concrete request: the account index goes in the PATH, everything else
  * goes in the JSON body, and the session's cookies go in the `Cookie` header.
  *
  * No action param is ever appended to the query string. `bv` takes its arguments
  * positionally in the body and answers a query-only call with a frame it cannot
  * read; `hl` and `rt` are the client's own (locale, response encoding) and are
- * pinned rather than exposed.
+ * pinned rather than exposed. A missing path param throws by name; see
+ * `fillPathParams`.
  *
- * A missing path param THROWS by name rather than substituting `''`. The `''`
- * fallback builds `https://mail.google.com/sync/u//i/bv`, and `onReplayRun` in
- * packages/runner passes the UI's params through with no `required` check — so a
- * one-click replay comes back as an opaque 404 that names nothing.
+ * Google's cookie set (`SID`/`HSID`/`SSID`/`APISID`/`SAPISID`) comes from the
+ * `injection.cookies` map, resolved by value (`injectedCookieHeader`), else from
+ * `values.cookieHeader`, the pre-assembled form a Chrome-cookie provider hands over.
  */
 function buildReplayRequest(
   action: ReplayAction,
   params: Record<string, string>,
   session: Session,
 ): ReplayRequest {
-  const value = (name: string): string | undefined =>
-    params[name] ?? action.params.find((p) => p.name === name)?.default;
+  const value = (name: string): string | undefined => actionParam(action, params, name);
 
   // `label` is `kind: 'containerId'`, so the UI hands over whatever a Container
   // row is keyed by — a scoped label id like `gmail:you@example.com/^i`. The bare
@@ -1491,15 +1404,9 @@ function buildReplayRequest(
     ref?.workspaceId === undefined ? undefined : accountSlotOfWorkspaceId(ref.workspaceId);
   const account = params.account ?? labelSlot ?? value('account') ?? '0';
 
-  const template = action.urlTemplate.replace(PATH_PARAM, (_match, name: string) => {
-    const v = name === 'account' ? account : value(name);
-    if (v === undefined || v === '') {
-      throw new Error(
-        `Gmail replay action "${action.id}" needs a value for "${name}" — it is a path segment, not a query param.`,
-      );
-    }
-    return encodeURIComponent(v);
-  });
+  const { url: template } = fillPathParams(action, params, (name) =>
+    name === 'account' ? account : value(name),
+  );
 
   const u = new URL(template);
   u.searchParams.set('hl', 'en');
@@ -1508,17 +1415,12 @@ function buildReplayRequest(
   const headers: Record<string, string> = {
     'content-type': 'application/json',
     Accept: '*/*',
-    'User-Agent': CHROME_UA,
+    'User-Agent': CHROME_UA, // Google serves a different client to anything else
     Origin: 'https://mail.google.com',
     Referer: `https://mail.google.com/mail/u/${account}/`,
   };
-  // Same map semantics as cookies / flow-build: NAME → values KEY, with
-  // literal fallback so a pre-baked token still works.
-  for (const [k, ref] of Object.entries(session.credentials.injection.headers ?? {})) {
-    const v = session.credentials.values[ref] ?? ref;
-    if (v) headers[k] = v;
-  }
-  const cookie = cookieHeader(session);
+  Object.assign(headers, injectedHeaders(session));
+  const cookie = injectedCookieHeader(session) ?? session.credentials.values.cookieHeader;
   if (cookie) headers.Cookie = cookie;
 
   return {
@@ -1539,20 +1441,11 @@ export const gmailAdapter: Adapter = {
   id: ADAPTER_ID,
   displayName: 'Gmail',
   hosts: ['mail.google.com'],
-  matchRequest(input) {
-    return matchesGmail(input.host);
-  },
-  parse(capture, ctx) {
-    return parseGmailCapture(capture, ctx);
-  },
-  classify(capture) {
-    return classifyGmailCapture(capture);
-  },
-  nextCursors() {
-    return gmailNextCursors();
-  },
-  listReplayActions() {
-    return GMAIL_REPLAY_ACTIONS;
-  },
+  matchRequest: (input) => matchesGmail(input.host),
+  parse: parseGmailCapture,
+  classify: classifyGmailCapture,
+  nextCursors: gmailNextCursors,
+  // Not offered until a provider can supply a Gmail session; see GMAIL_THREADS_LIST.
+  listReplayActions: () => [],
   buildReplayRequest,
 };

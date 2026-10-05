@@ -17,6 +17,7 @@
  */
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
+import { LOOPBACK_HOST } from './config.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -32,6 +33,25 @@ export interface ProxyState {
   enabled: boolean;
   host?: string;
   port?: number;
+}
+
+/** Is the enabled system proxy Sluice's own — loopback, at this proxy port? */
+export function isOurProxy(st: ProxyState, port: number): boolean {
+  return Boolean(st.enabled && (st.host === LOOPBACK_HOST || st.host === 'localhost') && st.port === port);
+}
+
+/**
+ * Refuse to replace a system proxy somebody else set (a corporate proxy, another
+ * tool). Setting ours overwrites its host and port, and turning ours off only
+ * disables the proxy — so their settings would be gone for good.
+ */
+export function assertNoForeignProxy(st: ProxyState, port: number): void {
+  if (st.enabled && !isOurProxy(st, port)) {
+    throw new Error(
+      `A system proxy is already set → ${st.host ?? '?'}:${st.port ?? '?'}. Sluice will not replace it ` +
+        '(turning Sluice off could not restore it); turn that proxy off first.',
+    );
+  }
 }
 
 function assertDarwin(): void {

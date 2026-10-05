@@ -21,13 +21,6 @@ import { TrafficPage } from './pages/TrafficPage.js';
 /**
  * The shell: a persistent nav over one routed page.
  *
- * This replaces a single screen that stacked all four regions in collapsible
- * panels. Splitting the panels was the right fix for the panels; it was the
- * wrong fix for the product, because the interesting things about an app — its
- * MCP tools, its replay actions, the hosts the proxy decrypts for it — cannot be
- * said in a card in a panel that is 26% of a viewport, and there is nowhere else
- * to say them. Pages give each thing a whole screen and a URL.
- *
  * The shell owns exactly the state that must outlive a navigation: the selected
  * capture and the app the traffic table is scoped to. Everything else belongs to
  * the page that renders it. The store is a module-level WebSocket subscription,
@@ -97,7 +90,6 @@ export function App() {
     const t = setTimeout(() => setToast(null), 4500);
     return () => clearTimeout(t);
     // Keyed on the notice id so it fires once per notice, not once per frame.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [noticeId]);
 
   /** Open a capture found somewhere else (the overview) where it can be read. */
@@ -164,6 +156,7 @@ export function App() {
         <ReplayPage
           actionId={route.actionId}
           apps={s.apps}
+          sessions={s.sessions}
           replays={s.replays}
           budget={s.replayBudget}
         />

@@ -1,18 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 /**
- * How a capture's request/response body is stored.
- *
- * Bodies are the overwhelming majority of the store: the engines cap a single
- * body at 5 MB and a busy Slack workspace produces thousands of JSON responses
- * an hour, so `~/.sluice/sluice.db` was mostly uncompressed JSON. gzip is a very
- * good fit for it — API responses are repetitive, key-heavy text — and it costs
- * one stdlib call, no dependency.
- *
- * Each body carries its own encoding column, so a row self-describes and old
- * rows written before this existed keep working untouched: a NULL encoding means
- * "plain text", which is exactly what they are. Request and response are encoded
- * independently, because the common shape is a tiny request with a large
- * response and compressing the request would only add overhead.
+ * How a capture's request/response body is stored: plain text up to
+ * BODY_COMPRESS_THRESHOLD, gzip above it. Each body has its own encoding column,
+ * so rows self-describe; NULL means plain text (every row written before
+ * compression).
  *
  * Two invariants this module cannot enforce but everything depends on:
  *
@@ -28,12 +19,8 @@ import { gunzipSync, gzipSync } from 'node:zlib';
 export const BODY_ENCODING_GZIP = 'gzip';
 
 /**
- * Bodies at or below this stay plain text.
- *
- * gzip adds ~20 bytes of header and trailer and defeats SQLite's own record
- * packing, so compressing a 200-byte `{"ok":true}` makes the row bigger. It also
- * keeps small bodies greppable with the sqlite3 CLI, which is genuinely useful
- * when debugging a capture by hand.
+ * Bodies at or below this stay plain text: gzip's ~20-byte overhead makes small
+ * rows bigger, and small bodies stay greppable with the sqlite3 CLI.
  */
 export const BODY_COMPRESS_THRESHOLD = 2048;
 
@@ -51,13 +38,8 @@ export function encodeBody(text: string | null | undefined): EncodedBody {
 }
 
 /**
- * Read one body back out of SQLite.
- *
- * Deliberately total: a body that cannot be decoded returns null rather than
- * throwing. `listCaptures` feeds the WS backfill, the cartographer and the
- * api-map, so one truncated write — or a `--db` someone edited by hand — would
- * otherwise throw out of every one of those paths at once. This mirrors how the
- * store already treats malformed JSON columns.
+ * Read one body back out of SQLite. Total: an undecodable body returns null
+ * rather than throwing, so one bad row cannot break every reader of listCaptures.
  */
 export function decodeBody(value: unknown, encoding: string | null | undefined): string | null {
   if (value === null || value === undefined) return null;

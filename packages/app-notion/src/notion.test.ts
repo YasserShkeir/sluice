@@ -16,33 +16,40 @@
  * pins what is specific to Notion.
  */
 import assert from 'node:assert/strict';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import test from 'node:test';
 import { makeCapture, makeJsonCapture, runConformance } from '@sluice/adapter-sdk';
+import { isNoSessionError } from '@sluice/core';
 import type { Capture, ParseResult, Session } from '@sluice/core';
 import {
   classifyNotionCapture,
   notionAdapter,
   notionApp,
+  notionHeaders,
   notionNextCursors,
   parseNotionCapture,
   plainText,
+  readNotionCookieHeader,
   reconcileNotion,
   recordValue,
   toPageId,
 } from './index.js';
 
-const SPACE = '308d7257-5d64-49b2-a688-e9b8be83433f';
-const USER = 'c2bcad04-5d6c-4207-a594-1767a4cd95d8';
-const PAGE = '7bf74c6f-dcff-4013-a680-bf4fd4e5a048';
-const CHILD = '28bef5e0-60d9-4d48-86f3-93c3da361b91';
-const DB = '944a9618-5f3a-41a3-92d4-ebec167433a1';
-const VIEW = 'c94f8e36-82b4-4147-868c-b20b13193a49';
-const ROW = 'daddb957-afff-4603-9c59-77b042067e01';
-const TEAM = '2a06306b-b53e-456b-9bd4-ed0b2d7d4188';
-const DISCUSSION = '9b386453-7d7a-4ae3-ab3b-e5f2b61dadae';
-const COMMENT = '26be673b-4818-4c87-9bf9-b9b4a158b8a1';
-const ROW2 = 'daddb957-afff-4603-9c59-77b042067e02';
-const ROW3 = 'daddb957-afff-4603-9c59-77b042067e03';
+// Synthetic, Notion-shaped (dashed uuid) ids — never copied from a real workspace.
+const SPACE = '00000000-0000-4000-8000-000000000001';
+const USER = '00000000-0000-4000-8000-000000000002';
+const PAGE = '00000000-0000-4000-8000-000000000003';
+const CHILD = '00000000-0000-4000-8000-000000000004';
+const DB = '00000000-0000-4000-8000-000000000005';
+const VIEW = '00000000-0000-4000-8000-000000000006';
+const ROW = '00000000-0000-4000-8000-000000000e01';
+const TEAM = '00000000-0000-4000-8000-000000000008';
+const DISCUSSION = '00000000-0000-4000-8000-000000000009';
+const COMMENT = '00000000-0000-4000-8000-00000000000a';
+const ROW2 = '00000000-0000-4000-8000-000000000e02';
+const ROW3 = '00000000-0000-4000-8000-000000000e03';
 /** The shape Notion stores a person filter in — `query2.filter` on the view record. */
 const VIEW_FILTER = {
   operator: 'and',
@@ -86,7 +93,7 @@ const PAGE_CHUNK = {
       [PAGE]: wrap({
         id: PAGE,
         type: 'page',
-        properties: { title: [['Launch checklist']] },
+        properties: { title: [['Example page']] },
         content: [CHILD],
         parent_id: TEAM,
         parent_table: 'team',
@@ -99,7 +106,7 @@ const PAGE_CHUNK = {
       [CHILD]: wrap({
         id: CHILD,
         type: 'page',
-        properties: { title: [['Rollout notes']] },
+        properties: { title: [['Example child page']] },
         parent_id: PAGE,
         parent_table: 'block',
         created_by_id: USER,
@@ -119,7 +126,7 @@ const PAGE_CHUNK = {
     collection: {
       [DB]: wrap({
         id: DB,
-        name: [['Project plans']],
+        name: [['Example database']],
         schema: { title: { name: 'Name', type: 'title' }, _SiA: { name: 'Status', type: 'select' } },
         parent_id: PAGE,
         space_id: SPACE,
@@ -129,14 +136,14 @@ const PAGE_CHUNK = {
       [VIEW]: wrap({
         id: VIEW,
         type: 'board',
-        name: 'My tasks',
+        name: 'Example view',
         parent_id: 'b1000000-0000-4000-8000-000000000001',
         query2: { filter: VIEW_FILTER, sort: VIEW_SORT },
         space_id: SPACE,
       }),
     },
     notion_user: {
-      [USER]: wrap({ id: USER, email: 'someone@example.com', name: 'Some One' }),
+      [USER]: wrap({ id: USER, email: 'someone@example.com', name: 'Example Person' }),
     },
     discussion: {
       [DISCUSSION]: wrap({ id: DISCUSSION, parent_id: PAGE, parent_table: 'block', resolved: false }),
@@ -162,7 +169,7 @@ const USER_CONTENT = {
       [SPACE]: wrap({ id: SPACE, name: 'Example Space', pages: [PAGE], icon: '🧪' }),
     },
     team: {
-      [TEAM]: wrap({ id: TEAM, space_id: SPACE, name: 'Operations', team_pages: [PAGE, CHILD] }),
+      [TEAM]: wrap({ id: TEAM, space_id: SPACE, name: 'Example teamspace', team_pages: [PAGE, CHILD] }),
     },
     space_user: {
       [`${USER}|${SPACE}`]: wrap({
@@ -172,7 +179,7 @@ const USER_CONTENT = {
         membership_type: 'member',
       }),
     },
-    notion_user: { [USER]: wrap({ id: USER, email: 'someone@example.com', name: 'Some One' }) },
+    notion_user: { [USER]: wrap({ id: USER, email: 'someone@example.com', name: 'Example Person' }) },
   },
 };
 
@@ -189,7 +196,7 @@ const COLLECTION_ROWS = {
         type: 'page',
         parent_id: DB,
         parent_table: 'collection',
-        properties: { title: [['Export fails on large files']], _SiA: [['Draft']] },
+        properties: { title: [['Example row']], _SiA: [['Draft']] },
         created_by_id: USER,
         last_edited_time: 1_757_200_000_000,
         space_id: SPACE,
@@ -248,14 +255,14 @@ test('a page chunk yields pages, the database, its author and its comments', () 
   );
 
   const page = pages.find((p) => p.id === PAGE);
-  assert.equal(page?.text, 'Launch checklist');
+  assert.equal(page?.text, 'Example page');
   assert.equal(page?.containerId, TEAM, 'containerId is the parent whatever table it points at');
   assert.equal(page?.workspaceId, SPACE);
   assert.equal(page?.ts, 1_757_500_000_000, 'last_edited_time wins over created_time');
 
   const db = (out.containers ?? []).find((c) => c.id === DB);
   assert.equal(db?.kind, 'board');
-  assert.equal(db?.name, 'Project plans', "a collection's name is rich text, not a string");
+  assert.equal(db?.name, 'Example database', "a collection's name is rich text, not a string");
   assert.equal(db?.itemCount, undefined, 'a collection record does not know its row count');
 
   const comment = (out.items ?? []).find((i) => i.kind === 'message');
@@ -276,7 +283,7 @@ test('a database row is parsed as a page inside its database', () => {
   assert.equal(row?.id, ROW);
   assert.equal(row?.kind, 'page', 'Notion stores a row as a page block — same code path');
   assert.equal(row?.containerId, DB);
-  assert.equal(row?.text, 'Export fails on large files');
+  assert.equal(row?.text, 'Example row');
 });
 
 test('loadUserContent yields the space, its teamspaces and membership', () => {
@@ -361,7 +368,7 @@ test('reconcile gives each person both halves of their identity', () => {
   const profile = notionJson('syncRecordValues', {
     recordMap: {
       __version__: 3,
-      notion_user: { [USER]: wrap({ id: USER, email: '', name: 'Some One' }) },
+      notion_user: { [USER]: wrap({ id: USER, email: '', name: 'Example Person' }) },
     },
   });
 
@@ -370,7 +377,7 @@ test('reconcile gives each person both halves of their identity', () => {
   const beforeProfile = parseNotionCapture(profile).actors?.[0];
   assert.equal(beforeRoster?.handle, 'someone@example.com');
   assert.equal(beforeProfile?.handle, USER, 'an empty email must not become the handle');
-  assert.equal(beforeProfile?.displayName, 'Some One');
+  assert.equal(beforeProfile?.displayName, 'Example Person');
 
   const applied: ParseResult[] = [];
   const store = {
@@ -385,12 +392,47 @@ test('reconcile gives each person both halves of their identity', () => {
   assert.equal(outcome.changed, 1);
   const merged = applied[0]?.actors?.[0];
   assert.equal(merged?.handle, 'someone@example.com', 'the email survives');
-  assert.equal(merged?.displayName, 'Some One', 'and so does the name');
+  assert.equal(merged?.displayName, 'Example Person', 'and so does the name');
   assert.equal(merged?.workspaceId, SPACE);
 
   // Idempotent: same captures in, same row out.
   reconcileNotion(store);
   assert.deepEqual(applied[1]?.actors?.[0], merged);
+});
+
+test('reconcile lets the NEWEST capture win a person\'s name and email', () => {
+  // The regression: the store answers newest-first and the merge is
+  // last-write-wins, so the OLDEST name and email overwrote the current ones.
+  const profileAt = (name: string, ts: number) =>
+    notionJson(
+      'syncRecordValues',
+      { recordMap: { __version__: 3, notion_user: { [USER]: wrap({ id: USER, email: '', name }) } } },
+      { ts },
+    );
+  const rosterAt = (email: string, ts: number) =>
+    notionJson(
+      'getVisibleUsers',
+      { users: [{ userId: USER, aliases: [email], membershipType: 'member' }] },
+      { ts, reqBody: JSON.stringify({ spaceId: SPACE }) },
+    );
+  const applied: ParseResult[] = [];
+  const store = {
+    listWorkspaces: () => [],
+    // Newest-first, the way SqliteStore.listCaptures answers.
+    listCaptures: () => [
+      profileAt('New Name', 2000),
+      rosterAt('new@example.com', 2000),
+      profileAt('Old Name', 1000),
+      rosterAt('old@example.com', 1000),
+    ],
+    queryItems: () => [],
+    applyParseResult: (pr: ParseResult) => applied.push(pr),
+    deleteWorkspace: () => undefined,
+  };
+  reconcileNotion(store);
+  const merged = applied[0]?.actors?.[0];
+  assert.equal(merged?.displayName, 'New Name');
+  assert.equal(merged?.handle, 'new@example.com');
 });
 
 test('reconcile does nothing when there is nothing to settle', () => {
@@ -593,6 +635,9 @@ test('a replay request carries the cookie and the three notion client headers', 
     chunkNumber: 0,
     verticalColumns: false,
   });
+  const bare = notionHeaders();
+  assert.equal(bare.Cookie, undefined, 'no cookie, no Cookie header');
+  assert.equal(bare['x-notion-active-user-header'], undefined);
 });
 
 test('the collection query sends a loader Notion recognises', () => {
@@ -692,12 +737,10 @@ test('the two param-free actions come first, so `sluice sync` reconstructs struc
 // ── ids ──────────────────────────────────────────────────────────────────────────
 
 test('toPageId accepts the URL form people actually paste', () => {
-  assert.equal(
-    toPageId('https://app.notion.com/p/example-space/some-title-7bf74c6fdcff4013a680bf4fd4e5a048'),
-    PAGE,
-  );
+  const bare = PAGE.replace(/-/g, '');
+  assert.equal(toPageId(`https://app.notion.com/p/example-space/some-title-${bare}`), PAGE);
   assert.equal(toPageId(PAGE), PAGE);
-  assert.equal(toPageId('7bf74c6fdcff4013a680bf4fd4e5a048'), PAGE);
+  assert.equal(toPageId(bare), PAGE);
   assert.equal(toPageId('not a page'), undefined);
 });
 
@@ -728,15 +771,43 @@ test('redaction masks the session token by value, not by field name', () => {
 });
 
 test('sessionFromInput accepts a pasted token on a machine we cannot read Chrome on', () => {
-  const session = notionApp.credentials?.sessionFromInput?.({ token_v2: 'PASTED' });
-  assert.equal(session?.credentials.values.cookieHeader, 'token_v2=PASTED');
-  assert.equal(notionApp.credentials?.sessionFromInput?.({}), undefined);
+  const fromInput = notionApp.credentials!.sessionFromInput!;
+  const tok = `v02:user_token_or_cookies:${'A'.repeat(64)}`;
+  assert.equal(fromInput({ token_v2: tok })?.credentials.values.cookieHeader, `token_v2=${tok}`);
+  // The runner's generic pair: `--token <token_v2>` or `--cookie '<Cookie header>'`.
+  assert.equal(fromInput({ token: tok })?.credentials.values.cookieHeader, `token_v2=${tok}`);
+  const header = `foo=1; token_v2=${tok}`;
+  assert.equal(fromInput({ cookie: header })?.credentials.values.cookieHeader, header);
+  assert.equal(fromInput({}), undefined);
 });
 
-test('listWorkspaces is passive and never throws', { skip: process.platform !== 'darwin' }, async () => {
-  const out = await notionApp.credentials?.listWorkspaces?.();
-  assert.ok(Array.isArray(out));
+test('sessionFromInput refuses a token that is not Notion-shaped', () => {
+  // SLUICE_TOKEN is not scoped to one app: a pasted Slack or Toters credential
+  // must never become a `token_v2` cookie sent to notion.com.
+  const fromInput = notionApp.credentials!.sessionFromInput!;
+  assert.equal(fromInput({ token: 'xoxc-not-a-real-token', cookie: 'd=not-a-real-cookie' }), undefined);
+  assert.equal(fromInput({ token: 'PASTED' }), undefined);
+  assert.equal(fromInput({ cookie: 'd=not-a-real-cookie; foo=1' }), undefined);
 });
+
+test(
+  'a Chrome with no Notion session reads as signed out, not as a failure',
+  { skip: process.platform !== 'darwin' },
+  () => {
+    // An empty user-data dir: nothing is located, so nothing is decrypted and the
+    // Keychain is never asked. The provider treats this error as "no sessions";
+    // a decrypt failure must NOT look like this, or it would be swallowed.
+    const dir = mkdtempSync(join(tmpdir(), 'sluice-notion-'));
+    try {
+      assert.throws(
+        () => readNotionCookieHeader({ chromeUserDataDir: dir }),
+        (err: unknown) => isNoSessionError(err) && (err as { code?: string }).code === 'SLUICE_NO_CHROME_SESSION',
+      );
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  },
+);
 
 // ── the shared invariants ────────────────────────────────────────────────────────
 

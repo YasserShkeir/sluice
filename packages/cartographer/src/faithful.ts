@@ -33,11 +33,9 @@
  * request the way the real client did, within what Node's fetch can emit.
  */
 
-import { randomUUID } from 'node:crypto';
-import { decodeBody } from '@sluice/core';
+import { randomBytes, randomUUID } from 'node:crypto';
+import { decodeBody, headerValue, MASK, safeJsonObject, splitUrl } from '@sluice/core';
 import type { ReplayRequest, SqliteStore } from '@sluice/core';
-
-const MASK = '«redacted»';
 
 /** How many recent captures to diff when learning. More = better variance signal. */
 const SAMPLE_SIZE = 8;
@@ -60,10 +58,7 @@ const SKIP_HEADERS = new Set([
   'content-length',
   'host',
   'connection',
-  // NOT accept-encoding. It used to be skipped as "the client recomputes it" —
-  // but undici's recomputed default is `gzip, deflate`, which no modern browser
-  // sends, so skipping it replaced a real header with an anomalous one. It is
-  // learned now and applied capped to what undici can decode (capAcceptEncoding).
+  // NOT accept-encoding: undici's own default is anomalous; it is learned and capped (capAcceptEncoding).
   // Per-request by definition — replaying a stale value is worse than omitting it.
   'date',
   'if-none-match',
@@ -77,6 +72,13 @@ const SKIP_HEADERS = new Set([
   'x-request-id',
   'x-correlation-id',
   'x-amzn-trace-id',
+  // Never learned: a method override would turn an allowed POST into another
+  // verb, and auth is always the live session's (it is redacted at capture too).
+  'x-http-method-override',
+  'x-http-method',
+  'x-method-override',
+  'cookie',
+  'authorization',
 ]);
 
 /** Headers whose NAME matches a per-request shape (x-…-request-id, …-nonce, …). */
@@ -95,10 +97,7 @@ function regenerate(sample: string): string | undefined {
   if (/^\d{13}$/.test(sample)) return String(Date.now()); // epoch ms
   if (/^\d{10}$/.test(sample)) return String(Math.floor(Date.now() / 1000)); // epoch s
   if (/^[0-9a-f]{16,}$/i.test(sample)) {
-    // Fixed-length lowercase hex — reproduce the same length.
-    let out = '';
-    while (out.length < sample.length) out += Math.floor(Math.random() * 16).toString(16);
-    return out.slice(0, sample.length);
+    return randomBytes(sample.length).toString('hex').slice(0, sample.length); // same-length lowercase hex
   }
   return undefined; // unknown shape → safer to drop than to invent
 }
@@ -115,52 +114,54 @@ interface SampleRow {
 }
 
 function parseHeaders(json: string): Record<string, string> {
-  try {
-    const h = JSON.parse(json) as Record<string, unknown>;
-    const out: Record<string, string> = {};
-    for (const [k, v] of Object.entries(h)) {
-      if (typeof v !== 'string') continue;
-      out[k] = v;
-    }
-    return out;
-  } catch {
-    return {};
-  }
-}
-
-function parseFormBody(body: string | null): Record<string, string> | undefined {
-  if (!body || body.trimStart().startsWith('{')) return undefined;
-  try {
-    const out: Record<string, string> = {};
-    for (const [k, v] of new URLSearchParams(body)) out[k] = v;
-    return out;
-  } catch {
-    return undefined;
-  }
+  const out: Record<string, string> = {};
+  for (const [k, v] of Object.entries(safeJsonObject(json) ?? {})) if (typeof v === 'string') out[k] = v;
+  return out;
 }
 
 /**
- * Learn a template from the recent REAL captured requests for method+path.
+ * Whether a body is a urlencoded form, the only shape whose params are learned
+ * and merged. JSON (object or array) never is, and a declared content-type
+ * other than urlencoded wins; a form sent without one still counts.
+ */
+function isFormBody(body: string, contentType: string | undefined): boolean {
+  const t = body.trimStart();
+  if (t.startsWith('{') || t.startsWith('[')) return false;
+  return contentType === undefined || /x-www-form-urlencoded/i.test(contentType);
+}
+
+function parseFormBody(body: string | null, contentType: string | undefined): Record<string, string> | undefined {
+  if (!body || !isFormBody(body, contentType)) return undefined;
+  return Object.fromEntries(new URLSearchParams(body));
+}
+
+/**
+ * Learn a template from the recent REAL captured requests for method+path on
+ * `host` or one of its subdomains.
  *
- * Reading a single capture (as this used to) cannot distinguish "the client
- * always sends this" from "the client sent this once" — so every per-request
- * value got baked into the template and replayed forever.
+ * The host scope is a trust boundary: MITM and CDP see every site, so method +
+ * path alone (`POST /graphql`) would let any other site's captures supply the
+ * headers and params sent to this one with the user's live session. Subdomains
+ * count so a `slack.com` replay still learns from `acme.slack.com` captures.
  */
 export function learnRequestTemplate(
   store: SqliteStore,
   method: string,
   path: string,
+  host: string,
 ): RequestTemplate | undefined {
+  if (!host) return undefined;
   const rows = store.db
     .prepare(
       `SELECT req_headers AS reqHeaders, req_body AS reqBody,
               req_body_encoding AS reqBodyEncoding
          FROM captures
         WHERE method = @method AND path = @path AND source IN ('mitm', 'cdp')
+          AND (host = @host OR substr(host, -length(@host) - 1) = '.' || @host)
         ORDER BY ts DESC
         LIMIT @limit`,
     )
-    .all({ method, path, limit: SAMPLE_SIZE }) as SampleRow[];
+    .all({ method, path, host: host.toLowerCase(), limit: SAMPLE_SIZE }) as SampleRow[];
   if (rows.length === 0) return undefined;
 
   // ── Headers: keep only those present and identical across every sample ──────
@@ -168,34 +169,30 @@ export function learnRequestTemplate(
   const first = headerSamples[0] ?? {};
   const headers: Record<string, string> = {};
   for (const [k, v] of Object.entries(first)) {
-    if (v.includes(MASK)) continue; // redacted (cookie/auth) → re-injected live
-    if (isSkippableHeader(k)) continue;
-    const stable = headerSamples.every((h) => h[k] === v);
-    if (stable) headers[k] = v;
+    // A masked (cookie/auth) value is re-injected live.
+    if (!v.includes(MASK) && !isSkippableHeader(k) && headerSamples.every((h) => h[k] === v)) headers[k] = v;
   }
 
   // ── Body params: split stable from varying ─────────────────────────────────
   const bodySamples = rows
-    .map((r) => parseFormBody(decodeBody(r.reqBody, r.reqBodyEncoding)))
+    .map((r, i) =>
+      parseFormBody(decodeBody(r.reqBody, r.reqBodyEncoding), headerValue(headerSamples[i], 'content-type')),
+    )
     .filter(Boolean) as Array<Record<string, string>>;
   const bodyParams: Record<string, string> = {};
   const volatileParams: string[] = [];
 
-  if (bodySamples.length > 0) {
-    const firstBody = bodySamples[0] ?? {};
-    for (const [k, v] of Object.entries(firstBody)) {
-      if (v.includes(MASK)) continue; // the redacted token → re-injected live
-      // With only one sample there is no variance signal, so fall back to the
-      // old behaviour (copy it) rather than guessing.
-      const varies = bodySamples.length > 1 && bodySamples.some((b) => b[k] !== undefined && b[k] !== v);
-      if (varies) {
-        volatileParams.push(k);
-        const fresh = regenerate(v);
-        if (fresh !== undefined) bodyParams[k] = fresh;
-        // else: deliberately omitted — see the docstring.
-      } else {
-        bodyParams[k] = v;
-      }
+  for (const [k, v] of Object.entries(bodySamples[0] ?? {})) {
+    if (v.includes(MASK)) continue; // the redacted token → re-injected live
+    // One sample gives no variance signal, so copy it rather than guess.
+    const varies = bodySamples.length > 1 && bodySamples.some((b) => b[k] !== undefined && b[k] !== v);
+    if (varies) {
+      volatileParams.push(k);
+      const fresh = regenerate(v);
+      if (fresh !== undefined) bodyParams[k] = fresh;
+      // else: deliberately omitted — see the docstring.
+    } else {
+      bodyParams[k] = v;
     }
   }
 
@@ -289,7 +286,7 @@ export function makeFaithful(base: ReplayRequest, tmpl: RequestTemplate): Replay
   }
 
   let body = base.body;
-  if (base.body !== undefined && !base.body.trimStart().startsWith('{')) {
+  if (base.body !== undefined && isFormBody(base.body, headers.get('content-type'))) {
     const merged = new URLSearchParams();
     for (const [k, v] of Object.entries(tmpl.bodyParams)) merged.set(k, v); // client's _x_* first
     for (const [k, v] of new URLSearchParams(base.body)) merged.set(k, v); // base wins (token + targets)
@@ -300,12 +297,7 @@ export function makeFaithful(base: ReplayRequest, tmpl: RequestTemplate): Replay
 
 /** Build a faithful request if a template exists for the endpoint, else the base unchanged. */
 export function faithfulReplayRequest(store: SqliteStore, base: ReplayRequest): ReplayRequest {
-  let path = base.url;
-  try {
-    path = new URL(base.url).pathname;
-  } catch {
-    /* keep raw */
-  }
-  const tmpl = learnRequestTemplate(store, base.method, path);
+  const { host, path } = splitUrl(base.url);
+  const tmpl = learnRequestTemplate(store, base.method, path, host);
   return tmpl ? makeFaithful(base, tmpl) : base;
 }

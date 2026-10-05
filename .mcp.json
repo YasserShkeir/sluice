@@ -1,0 +1,15 @@
+{
+  "mcpServers": {
+    "sluice-project": {
+      "command": "pnpm",
+      "args": [
+        "exec",
+        "tsx",
+        "packages/project-graph/src/cli.ts",
+        "mcp",
+        "--root",
+        "."
+      ]
+    }
+  }
+}

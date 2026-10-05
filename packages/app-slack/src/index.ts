@@ -2,15 +2,8 @@
 /**
  * @sluice/app-slack — the self-contained Slack app.
  *
- * Bundles three things that used to be scattered across the engine packages:
- *   - the Slack adapter + parser (was `@sluice/adapter-slack`),
- *   - the macOS credential extractor (was `@sluice/interceptor`'s
- *     slack-token-extract), wrapped as a generic `CredentialProvider`,
- *   - the Slack desktop path helpers (were in `@sluice/runner`'s config).
- *
- * The primary export is `slackApp: App` — an `Adapter` plus a `credentials`
- * provider. The lower-level named exports (`slackAdapter`, `parseSlackCapture`,
- * `extractAllSlackSessions`, …) remain available for direct use and testing.
+ * The Slack adapter + parser and the macOS credential extractor, exported as
+ * `slackApp: App` (an Adapter plus a `credentials` provider).
  */
 import type { App, AppRedaction, CredentialProvider } from '@sluice/core';
 import { slackAdapter, slackSessionFromCreds } from './slack-adapter.js';
@@ -25,13 +18,10 @@ import { extractAllSlackSessions, listSlackWorkspaces } from './slack-credential
  */
 const slackRedaction: AppRedaction = {
   patterns: [
-    // ONE pattern, not a narrow one plus a wide one. `redactText` applies patterns
-    // in registration order, so the narrow `xox[abcdeprs]-[A-Za-z0-9-]{8,}` ran
-    // first and — having no `%` in its class — masked only `xoxd-FAKEdCOOKIE1` of
-    // a percent-escaped `d` cookie, leaving 40 of its 57 characters in SQLite AND
-    // eating the `xoxd-` the wider pattern behind it needed to anchor on. One
-    // class covering every byte Slack puts in a token, escaped (`%2F`) or raw
-    // (`+/=`), cannot be shadowed whatever order the patterns are applied in.
+    // ONE class covering every byte Slack puts in a token, escaped (`%2F`) or raw
+    // (`+/=`). `redactText` applies patterns in order, so a narrower pattern first
+    // would mask only a prefix of a percent-escaped `d` cookie and eat the `xoxd-`
+    // anchor that a wider pattern needs.
     /xox[abcdeprs]-[A-Za-z0-9%+/=._-]{8,}/g,
   ],
   headers: ['x-slack-auth', 'x-slack-session'],
@@ -42,9 +32,11 @@ const slackCredentials: CredentialProvider = {
   extractSessions: (opts) => extractAllSlackSessions(opts),
   listWorkspaces: (opts) => listSlackWorkspaces(opts),
   sessionFromInput: (input) => {
-    const token = input.token;
-    const cookie = input.cookie;
-    if (!token || !cookie) return undefined;
+    const { token, cookie } = input;
+    // Only a Slack-shaped token: the runner scopes paste-in to one app, and this
+    // keeps another service's pasted credential from ever becoming a Slack
+    // session sent to slack.com.
+    if (!token || !cookie || !/^xox[a-z]-/.test(token)) return undefined;
     return slackSessionFromCreds(token, cookie, { label: 'Slack (paste-in)' });
   },
 };
@@ -71,16 +63,3 @@ export const slackApp: App = {
     },
   ],
 };
-
-// ── Named re-exports (adapter alias + raw pieces for callers/tests) ─────────────
-export { slackAdapter, slackSessionFromCreds, extractSlackCredentialHints } from './slack-adapter.js';
-export {
-  parseSlackCapture,
-  classifySlackCapture,
-  slackNextCursors,
-  slackMethod,
-  ADAPTER_ID,
-} from './parse.js';
-export { extractAllSlackSessions, listSlackWorkspaces } from './slack-credentials.js';
-export type { SlackWorkspaceInfo } from './slack-credentials.js';
-export { slackAppSupportDir, slackLevelDbDir, slackCookiesPath } from './paths.js';

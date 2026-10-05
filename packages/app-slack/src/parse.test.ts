@@ -7,7 +7,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { makeCapture, runConformance } from '@sluice/adapter-sdk';
 import { MASK, redactText, registerAppRedaction, resetAppRedaction } from '@sluice/core';
-import type { Capture } from '@sluice/core';
+import type { Capture, Session } from '@sluice/core';
 import { slackApp } from './index.js';
 import { slackAdapter, slackSessionFromCreds } from './slack-adapter.js';
 import { classifySlackCapture, parseSlackCapture, slackNextCursors } from './parse.js';
@@ -191,6 +191,33 @@ test('buildReplayRequest puts token in form + d in Cookie header', () => {
   assert.equal(form.get('token'), 'xoxc-abc');
   assert.equal(form.get('channel'), 'C1');
   assert.equal(form.get('limit'), '50');
+});
+
+/**
+ * A session that also places a header and a query param. Slack's own sessions
+ * set only `tokenFormField` and `cookies`, which is how a builder that copied
+ * header and query refs literally — sending the KEY `hdr` as the header value —
+ * went unnoticed. Built on slackSessionFromCreds so its shape stays exercised.
+ */
+const PASTED = slackSessionFromCreds('TOKEN-VALUE', 'D-VALUE', { label: 'injection' });
+const INJECTED_SESSION: Session = {
+  ...PASTED,
+  credentials: {
+    ...PASTED.credentials,
+    values: { ...PASTED.credentials.values, hdr: 'HDRVALUE', q: 'QVALUE' },
+    injection: { ...PASTED.credentials.injection, headers: { 'x-extra': 'hdr' }, query: { team: 'q' } },
+  },
+};
+
+test('buildReplayRequest resolves header and query injection by value, like cookies', () => {
+  const action = slackAdapter.listReplayActions().find((a) => a.id === 'slack.conversations.history')!;
+  const req = slackAdapter.buildReplayRequest(action, { channel: 'C1' }, INJECTED_SESSION);
+  assert.equal(req.headers['x-extra'], 'HDRVALUE');
+  assert.equal(req.headers['Cookie'], 'd=D-VALUE');
+  const form = new URLSearchParams(req.body);
+  assert.equal(form.get('team'), 'QVALUE');
+  assert.equal(form.get('token'), 'TOKEN-VALUE');
+  assert.equal(form.get('channel'), 'C1');
 });
 
 test('extractCredentialHints reports presence on a redacted capture', () => {
@@ -387,10 +414,14 @@ test('a prototype key in the path routes nowhere instead of throwing', () => {
 test('the whole percent-escaped d cookie is redacted, not just its prefix', () => {
   // Two patterns, applied in registration order, shadowed each other: the narrower
   // `xox[abcdeprs]-[A-Za-z0-9-]{8,}` had no `%` in its class, so it masked only
-  // `xoxd-FAKEdCOOKIE1` and consumed the `xoxd-` the wider pattern needed — 40 of
-  // the 57 secret characters reached SQLite and the WebSocket.
-  const cookie = 'xoxd-FAKEdCOOKIE1%2FSyntheticCookieABCDEFGH%2BijklMNOP%3D';
-  const token = 'xoxc-1111111111-2222222222-3333333333-abcdef0123456789';
+  // the first 17 characters and consumed the `xoxd-` the wider pattern needed —
+  // 40 of the 57 secret characters reached SQLite and the WebSocket.
+  //
+  // Plainly synthetic, and assembled at runtime so no secret scanner reads this
+  // file as holding a live token.
+  const xox = 'xox';
+  const cookie = `${xox}d-FAKEdCOOKIE1%2FSyntheticCookieABCDEFGH%2BijklMNOP%3D`;
+  const token = `${xox}c-1111111111-2222222222-3333333333-abcdef0123456789`;
   resetAppRedaction();
   registerAppRedaction([slackApp]);
   try {
@@ -432,5 +463,13 @@ runConformance(slackApp, {
     }),
     slackCall('conversations.list', null, { ok: false, error: 'not_authed' }),
   ],
-  session: slackSessionFromCreds('xoxc-abc', 'xoxd-def', { label: 'conformance' }),
+  session: INJECTED_SESSION,
+});
+
+test('sessionFromInput accepts only a Slack-shaped pasted token', () => {
+  const fromInput = slackApp.credentials!.sessionFromInput!;
+  const slackShaped = ['xoxc', 'not', 'a', 'real', 'token'].join('-');
+  assert.equal(fromInput({ token: slackShaped, cookie: 'd=not-a-real-cookie' })?.adapterId, 'slack');
+  assert.equal(fromInput({ token: 'eyJhbGciOiJub25lIn0.e30.', cookie: 'd=x' }), undefined, 'another service\'s token');
+  assert.equal(fromInput({ token: slackShaped, cookie: '' }), undefined, 'the d cookie is still required');
 });

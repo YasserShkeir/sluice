@@ -23,6 +23,7 @@
  */
 import { createInterface } from 'node:readline';
 import { writeSync } from 'node:fs';
+import { errorMessage } from '@sluice/core';
 import { MitmEngine } from '@sluice/interceptor';
 
 // fd 3 is the clean data channel the parent opened; writing there never collides
@@ -43,14 +44,14 @@ function emit(frame: unknown): void {
   }
 }
 
+const list = (v: string | undefined): string[] => (v ?? '').split(',').map((s) => s.trim()).filter(Boolean);
 const port = Number(process.env.SLUICE_CHILD_PORT ?? '0');
-const hosts = (process.env.SLUICE_CHILD_HOSTS ?? '')
-  .split(',')
-  .map((s) => s.trim())
-  .filter(Boolean);
+const hosts = list(process.env.SLUICE_CHILD_HOSTS);
 // Unset → all hosts (product default). Explicit '0' → scoped to SLUICE_CHILD_HOSTS.
 const allHosts = process.env.SLUICE_CHILD_ALL_HOSTS !== '0';
 const captureWebSockets = process.env.SLUICE_CHILD_WS !== '0';
+const listenHost = process.env.SLUICE_CHILD_LISTEN_HOST?.trim() || undefined;
+const lanClients = list(process.env.SLUICE_CHILD_LAN_CLIENTS);
 
 const engine = new MitmEngine({
   port,
@@ -58,28 +59,26 @@ const engine = new MitmEngine({
   interceptHosts: hosts,
   interceptAllHosts: allHosts,
   captureWebSockets,
+  listenHost,
+  lanClients,
   onCapture: (capture) => emit({ t: 'capture', capture }),
   onStatus: (status) => emit({ t: 'status', status }),
-  onError: (e) => emit({ t: 'error', message: e instanceof Error ? e.message : String(e) }),
+  onError: (e) => emit({ t: 'error', message: errorMessage(e) }),
 });
 
 // The reason this file exists: a crash here is contained. Report it, then exit so
 // the parent's supervisor can respawn a fresh child.
 process.on('uncaughtException', (e) => {
-  emit({ t: 'error', message: `uncaughtException: ${e instanceof Error ? e.message : String(e)}` });
+  emit({ t: 'error', message: `uncaughtException: ${errorMessage(e)}` });
   process.exit(1);
 });
 process.on('unhandledRejection', (e) => {
-  emit({ t: 'error', message: `unhandledRejection: ${e instanceof Error ? e.message : String(e)}` });
+  emit({ t: 'error', message: `unhandledRejection: ${errorMessage(e)}` });
   process.exit(1);
 });
 
 async function shutdown(code: number): Promise<void> {
-  try {
-    await engine.stop();
-  } catch {
-    /* already down */
-  }
+  await engine.stop().catch(() => {}); // already down
   process.exit(code);
 }
 
@@ -100,7 +99,7 @@ process.stdin.on('end', () => void shutdown(0));
 engine.start().then(
   ({ port: boundPort, caPath }) => emit({ t: 'started', port: boundPort, caPath }),
   (e) => {
-    emit({ t: 'error', message: e instanceof Error ? e.message : String(e) });
+    emit({ t: 'error', message: errorMessage(e) });
     process.exit(1);
   },
 );

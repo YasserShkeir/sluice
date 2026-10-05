@@ -17,7 +17,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { makeCapture, runConformance } from '@sluice/adapter-sdk';
-import { apps, getApp } from './index.js';
+import { apps } from './index.js';
 
 test('every adapter id is unique', () => {
   const ids = apps.map((a) => a.id);
@@ -28,11 +28,6 @@ test('apps[0] is the default and is Slack', () => {
   // Not decoration: `sluice start` names apps[0] in its routing instructions and
   // defaultCaptureUrl() derives the landing page from apps[0].hosts.
   assert.equal(apps[0]?.id, 'slack');
-});
-
-test('getApp resolves every registered app and nothing else', () => {
-  for (const app of apps) assert.equal(getApp(app.id)?.id, app.id);
-  assert.equal(getApp('not-installed'), undefined);
 });
 
 test('no two adapters claim the same request', () => {

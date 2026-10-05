@@ -15,7 +15,8 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { makeCapture, makeJsonCapture, runConformance } from '@sluice/adapter-sdk';
 import type { AppToolContext, Capture } from '@sluice/core';
-import { classifyFastCapture, configUrl, fastApp, fetchConfig, parseFastCapture, rangeUrl } from './index.js';
+import { classifyFastCapture, fastApp, parseFastCapture } from './index.js';
+import { configUrl, fetchConfig, rangeUrl } from './speedtest.js';
 
 /** The config call, since that is what most of these tests are about. */
 function capture(over: Partial<Capture> = {}): Capture {
@@ -143,6 +144,13 @@ test('parse turns a config response into one container per CDN target', () => {
   assert.equal(result.containers?.[0]?.name, 'London a');
   assert.equal(result.containers?.[0]?.adapterId, 'fast');
   assert.ok(result.containers?.[0]?.raw, 'raw payload is kept for the cartographer');
+  // The parent comes with its children: nothing else ever creates the `fast`
+  // workspace, and a container under a workspace nobody wrote is never listed.
+  assert.deepEqual(
+    result.workspaces?.map((w) => [w.id, w.adapterId]),
+    [['fast', 'fast']],
+  );
+  for (const c of result.containers ?? []) assert.equal(c.workspaceId, result.workspaces?.[0]?.id);
 });
 
 test('parse ignores anything that is not the config endpoint', () => {

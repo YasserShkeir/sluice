@@ -2,9 +2,8 @@
 /**
  * Coercion helpers for adapter parsers.
  *
- * Every parser in the repo grew its own near-identical copy of these, because
- * they all obey the same hard rule: `parse()` runs inside the ingest funnel for
- * EVERY capture, so a throw does not fail one row — it poisons the pipeline for
+ * Every parser obeys the same hard rule: `parse()` runs inside the ingest funnel
+ * for EVERY capture, so a throw does not fail one row — it poisons the pipeline for
  * all of them. The discipline that enforces it is total functions: an
  * unrecognized shape yields `undefined` and the entity is simply omitted, never
  * an exception.
@@ -13,6 +12,9 @@
  * does not control and that changes without notice; "reject the payload" is
  * never the right answer, "take what I recognise" always is.
  */
+
+/** `safeJson` parses any JSON value; `safeJsonObject` only a plain object. Never throw. */
+export { safeJsonParse as safeJson, safeJsonObject } from '@sluice/core';
 
 /** A string, or undefined for anything else (including a number). */
 export function str(v: unknown): string | undefined {
@@ -44,21 +46,6 @@ export function obj(v: unknown): Record<string, unknown> | undefined {
   return v !== null && typeof v === 'object' && !Array.isArray(v)
     ? (v as Record<string, unknown>)
     : undefined;
-}
-
-/** Parse JSON that may be null, empty, truncated or not JSON at all. */
-export function safeJson(text: string | null | undefined): unknown {
-  if (text === null || text === undefined || text.length === 0) return undefined;
-  try {
-    return JSON.parse(text) as unknown;
-  } catch {
-    return undefined;
-  }
-}
-
-/** Parse a JSON *object* body; undefined for anything that is not one. */
-export function safeJsonObject(text: string | null | undefined): Record<string, unknown> | undefined {
-  return obj(safeJson(text));
 }
 
 /** Drop undefined values so an entity does not carry explicit `undefined` keys. */

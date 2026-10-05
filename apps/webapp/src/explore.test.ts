@@ -73,12 +73,18 @@ test('a collapsed workspace contributes no container rows', () => {
   assert.equal(rows[0]?.kind === 'workspace' && rows[0].collapsed, true);
 });
 
-test('a container whose workspace is missing is not silently dropped into another', () => {
+test('a container whose workspace is missing gets its own group, never another account\'s', () => {
   // Entities arrive from two sources at different times, so a container can be
-  // loaded before its workspace. Attaching it to whatever is nearby would file
-  // one account's mail under another — the exact bug this release fixed.
+  // loaded before its workspace (or an adapter never names it). Attaching it to
+  // whatever is nearby would file one account's mail under another — the exact
+  // bug this release fixed — and hiding it loses the data from view.
   const rows = treeRows([ws('W1')], [container('C1', 'W-unknown')], new Set());
-  assert.deepEqual(rows.map((r) => r.id), ['W1']);
+  assert.deepEqual(rows.map((r) => [r.kind, r.id, r.label]), [
+    ['workspace', 'W1', ws('W1').name],
+    ['workspace', 'W-unknown', 'W-unknown'],
+    ['container', 'C1', container('C1', 'W-unknown').name],
+  ]);
+  assert.deepEqual(treeRows([], [container('C2', 'x')], new Set()).map((r) => r.id), ['x', 'C2']);
 });
 
 test('coverage reports the SERVICE count, and says nothing when there is none', () => {

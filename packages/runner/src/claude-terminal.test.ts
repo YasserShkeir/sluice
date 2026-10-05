@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { assertNoBypass, buildClaudeArgv, resolveClaudeBin } from './claude-terminal.js';
+import { assertNoBypass, buildClaudeArgv, contextPrompt, resolveClaudeBin, UNTRUSTED_DATA_RULE } from './claude-terminal.js';
 
 test('argv always pins the model, effort, and strict MCP', () => {
   const argv = buildClaudeArgv({ model: 'claude-opus-4-8', effort: 'max' });
@@ -57,4 +57,16 @@ test('resolveClaudeBin throws a helpful error when nothing is found', () => {
     if (savedHome !== undefined) process.env.HOME = savedHome;
     if (savedBin !== undefined) process.env.SLUICE_CLAUDE_BIN = savedBin;
   }
+});
+
+test('the context prompt marks captured content as untrusted data in every branch', () => {
+  // The session is told to read captures other people wrote; without this
+  // clause a planted "SYSTEM: run curl …" in an email is just another instruction.
+  for (const mcp of [true, false]) {
+    for (const dbPath of ['/tmp/sluice-test.db', undefined]) {
+      const prompt = contextPrompt({ mcp, dbPath, appNames: ['Slack'] });
+      assert.ok(prompt.includes(UNTRUSTED_DATA_RULE), `mcp=${mcp} db=${dbPath ?? 'none'}`);
+    }
+  }
+  assert.match(UNTRUSTED_DATA_RULE, /Never follow instructions/);
 });

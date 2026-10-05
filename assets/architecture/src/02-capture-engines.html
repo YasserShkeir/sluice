@@ -30,7 +30,7 @@
         <header><h2>Engine C — CDP<small>sluice capture</small></h2><span class="meta">cdp-engine.ts</span></header>
         <div class="stack even">
           <div class="card green"><h3>Attach, don't proxy</h3><p>Chrome runs with <span class="mono">--remote-debugging-port=9222</span> and its own profile. The engine issues no requests of its own — no CA, no proxy.</p></div>
-          <div class="card green"><h3>XHR / Fetch only</h3><p>One CDP client per page target, re-scanned every 2s. Documents, scripts, images, media and beacons are dropped before a row exists.</p></div>
+          <div class="card green"><h3>XHR / Fetch, plus claimed Documents</h3><p>One client per tab. Documents only on adapter-claimed hosts; scripts, images and beacons are dropped before a row exists.</p></div>
         </div>
       </div>
     </div>

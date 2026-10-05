@@ -42,7 +42,7 @@ PR. Note that `pnpm doctor` is **pnpm's own** builtin; the project's check is
 ### `pnpm build`
 
 `pnpm build` is `pnpm webapp:build && node scripts/build.mjs`. It produces the
-three shipping bundles and the dashboard the runner serves:
+four shipping bundles and the dashboard the runner serves:
 
 ```
 packages/runner/dist/cli.js           # the `sluice` binary
@@ -50,6 +50,7 @@ packages/runner/dist/engine-child.js  # the `serve --isolated` capture process
 packages/runner/dist/chunks/*.js      # code-split chunks shared by the two above
 packages/runner/dist/webapp/          # copy of apps/webapp/dist
 packages/mcp/dist/cli.js              # the `sluice-mcp` binary
+packages/project-graph/dist/cli.js    # the source-knowledge/GraphRAG MCP binary
 ```
 
 Three constraints in `scripts/build.mjs` are not obvious and are easy to undo:
@@ -59,13 +60,13 @@ Three constraints in `scripts/build.mjs` are not obvious and are easy to undo:
   `ERR_REQUIRE_ESM`. Bundling resolves the require-of-ESM at build time.
   `splitting: true` then keeps that ~12 MB inlined copy in its own lazily-loaded
   chunk, so every command other than `start` parses a ~395 KB entry plus a
-  ~120 KB shared chunk instead of the 12 MB. The MCP
-  target adds `mockttp` to *its* externals because the MCP server never starts a
-  capture engine and must not carry the 12 MB.
+  ~120 KB shared chunk instead of the 12 MB. Both MCP targets add `mockttp` to
+  their externals because neither MCP server starts a capture engine or should
+  carry the 12 MB.
 - **Native addons stay external:** `better-sqlite3`, `classic-level` and
   `node-pty` break their `.node`/spawn-helper lookup if the JS wrapper is
-  bundled. `chrome-remote-interface`, `ws`, `zod` and the MCP SDK are external
-  too, as ordinary runtime deps of the published packages.
+  bundled. `chrome-remote-interface`, `ws`, `zod`, TypeScript and the MCP SDK are
+  external too, as ordinary runtime deps of the relevant packages.
 - **The shebang is rewritten by hand.** esbuild carries the source `#!` in
   *after* the banner, which is a syntax error, so every `#!` line is stripped and
   exactly one `#!/usr/bin/env node` is written back at line 1 before `chmod 755`.
@@ -94,10 +95,16 @@ packages/apps          the installed-apps registry                       (AGPL)
 packages/app-*         one service each: slack fast trello gmail loom linkedin (AGPL)
 packages/runner        the `sluice` CLI, HTTP/WS server, HTTP API        (AGPL)
 packages/mcp           the `sluice-mcp` stdio MCP server                 (AGPL)
+packages/project-graph source graph, retrieval, CLI and source MCP       (AGPL)
 packages/extension     the MV3 browser capture engine (POSTs /api/ingest) (AGPL)
 packages/cli           the `sluicejs` bare-name launcher                 (AGPL)
 apps/webapp            the React dashboard                               (AGPL)
 ```
+
+Agents use the source graph workflow in [`AGENTS.md`](./AGENTS.md). In short:
+status/refresh, query, inspect impact, verify authoritative source, edit/test,
+then refresh and validate. The project graph is never a substitute for source
+verification and must not contain credentials, captures or ignored private docs.
 
 `packages/protocol` is separate from `core` for one reason: zod is a runtime
 *value* and `core` pulls in better-sqlite3 and `node:fs`, so a zod schema living
@@ -121,23 +128,29 @@ service-specific token shapes belong in that app's `redaction` field, which
 `@sluice/apps` registers at import time. Add a test in `redact.test.ts` for any
 new shape — it is the one file where a regression is a credential leak.
 
-**Replay is read-only.** `runReplay` enforces the GET/HEAD/POST method allowlist
-and the 60-request/60s token budget in `packages/interceptor/src/replay-policy.ts`.
-The write/admin **operation denylist** is not there: it lives in
-`packages/core/src/replay-deny.ts` (`REPLAY_DENIED_OPERATION_PATTERNS`,
-`looksLikeDeniedOperation`) because flow *learning* (`flow-learn.ts`) and flow
-*building* (`flow-build.ts`) apply the same list — change it in one place and all
-three rails move together. Those checks sit below every caller on purpose. Do not
-add a network path that bypasses them.
+**Replay is for reads, behind best-effort rails.** `runReplay` (in
+`packages/interceptor/src/replay.ts`, rails in `replay-policy.ts`) enforces the
+GET/HEAD/POST method allowlist, the operation denylist, the owning app's hosts
+(`allowedHosts` is a required option: `runReplay(req, { allowedHosts: app.hosts })`)
+and the 60-request/60s token budget, which is **per process**. It never follows a redirect.
+The shared pieces live in `packages/core/src/replay-deny.ts`: `isReplayMethodAllowed`,
+`looksLikeDeniedReplay` (the whole-request operation rail: path, query and body as
+sent and percent-decoded, plus method-override headers and `_method`),
+`REPLAY_DENIED_OPERATION_PATTERNS` and `replayHostAllowed` — flow *learning*
+(`flow-learn.ts`) and flow *building* (`flow-build.ts`) apply the same checks, so
+change them in one place and every rail moves together. These are heuristics, not a
+proof that an allowed request does not mutate: describe them that way. Those checks
+sit below every caller on purpose. Do not add a network path that bypasses them.
 
 **Single vs flow replay.** One request goes through `faithfulReplayRequest` →
 `runReplay` (CLI `sluice replay <actionId>`, MCP `replay` — the single-request
 tool is deliberately *not* `sluice_`-prefixed; only the three flow tools are). A multi-step
 **interaction flow** is learned from observed/pinned bursts (`sluice learn-flows`),
-built per step with `buildFlowStepRequest` (pass `allowedHosts: app.hosts`), and
-executed by `runFlowReplay` (CLI `sluice replay --flow`, MCP `sluice_replay_flow`).
-Each step still pays the same rails and budget. Templates never train on prior
-replay traffic.
+built per step with `flowStepBuilder(template, app)` (it fills both of the app's
+rails: its hosts, and its replay actions as the read surface a non-GET step must
+match), and executed by `runFlowReplay` (CLI `sluice replay --flow`, MCP
+`sluice_replay_flow`). Each step still pays the same rails and budget. Templates never
+train on prior replay traffic.
 
 Flow details agents must know (also in MCP tool descriptions and
 `packages/mcp/README.md`):
@@ -149,7 +162,9 @@ Flow details agents must know (also in MCP tool descriptions and
   template steps; prefer API `primaryKey`s with `sampleCount ≥ 2`.
 - **Correlation** (`loaderId` / `pageLoadId`) exists when CDP captured; MITM is
   time-window only. WS frames are not HTTP flow members.
-- **F4.4**: build refuses denied methods/ops and hosts outside the adapter list;
+- **F4.4**: build refuses denied methods/ops, hosts outside the adapter list, and
+  any non-GET/HEAD step that matches none of the adapter's replay actions (learning
+  drops those too, and never learns a non-GET step from an extension capture);
   `FlowBuildError` surfaces as replay `denied`.
 
 **Schema changes are additive.** `CREATE TABLE IF NOT EXISTS` does nothing to an
@@ -173,10 +188,10 @@ plus **three** registration edits:
    and `apps[0]` (Slack today) is what `sluice capture` and `sluice start` treat
    as the default.
 
-There are six installed apps: slack, fast, trello, gmail, loom, linkedin.
-Do **not** touch `PLANNED_APPS` in the runner — that list (notion, linear, jira,
-discord) is dashboard placeholders only, and it self-filters out any id that a
-registered adapter already claims.
+There are nine installed apps: slack, fast, trello, gmail, loom, linkedin, olx, notion, toters.
+Do **not** touch `PLANNED_APPS` in the runner — that list (linear, jira, discord)
+is dashboard placeholders only, and it self-filters out any id that a registered
+adapter already claims.
 
 `packages/app-fast` is the smallest complete example (credential-free);
 `packages/app-trello` is the smallest one *with* credentials.
@@ -223,8 +238,17 @@ Build against `@sluice/adapter-sdk` rather than hand-rolling: it ships the total
 `requestParam`/`requestParams`, the `makeCapture`/`makeJsonCapture` fixture
 factory (fixed ts `1_700_000_000_000`, sequential `cap_<n>` ids — this is the
 "fixed-timestamp `capture()` helper" the Tests section is describing), and
-`scrubCaptures`, the deterministic scrubber that turns a real `sluice record`
-NDJSON into a shareable fixture by preserving shape and replacing content.
+`scrubCaptures`, the scrubber that turns a real `sluice record` NDJSON into a
+shareable fixture by preserving shape and replacing content. It keys an
+HMAC-SHA256 with a random salt and shifts timestamps by a random offset on every
+call; pass `ScrubOptions.salt` / `shiftMs` only in deterministic tests, and never
+publish a fixture scrubbed with a fixed or committed salt. Re-scrub with
+`toNdjson(scrubCaptures(parseNdjson(text).captures))`. Its other helpers:
+`localSessionCredentials` (a Chrome-cookie credential provider), `replayAttempt` /
+`withCookieRefresh` (an MCP tool's live request through `ctx.replay`, with no bare
+`fetch` fallback), `requireStore` / `pageArgs` / `isoTime` / `previewText` (store-backed
+MCP tools), `actionParam` / `requireActionParam` / `fillPathParams` (replay builders)
+and `injectedHeaders` / `injectedQuery` / `injectedCookieHeader` (session injection).
 
 Run `pnpm sluice adapters` to see what's registered (it loads external adapters
 too, so a rejection is diagnosable without starting a capture), and `pnpm sluice
@@ -298,16 +322,20 @@ packages/core/src/oscrypt.ts          # decryptOscryptV10, keychainPassphrase, w
 packages/core/src/chrome-cookies.ts   # readChromeCookieHeader / locateChromeProfile
 ```
 
-App packages keep only domain wrappers (`app-trello` / `app-loom` /
-`app-linkedin` `chrome-cookies.ts`) and Slack's LevelDB + host-ranking path
-(`app-slack/src/slack-credentials.ts`). Callers still zero the passphrase
-`Buffer` after use. Windows (DPAPI + AES-256-GCM) and Linux (libsecret/kwallet)
-belong next to those core modules — not as a fifth paste in an app package.
+App packages keep only the domain-specific part: a `localSessionCredentials`
+spec (`@sluice/adapter-sdk`) naming the domain and label, plus, where needed, a
+`chrome-cookies.ts` holding the one cookie rule (`app-linkedin`'s CSRF token,
+`app-notion`'s `token_v2` probe and active user). Slack keeps its LevelDB +
+host-ranking path (`app-slack/src/slack-credentials.ts`). Callers still zero
+the passphrase `Buffer` after use. Windows (DPAPI + AES-256-GCM) and Linux
+(libsecret/kwallet) belong next to those core modules — not as another copy in
+an app package.
 
 Non-macOS users can paste credentials in only where the app implements
-`sessionFromInput`, and today that is **Slack alone** (`--token` / `--cookie`).
-Trello, Loom and LinkedIn have no non-macOS path at all — on Linux and Windows
-they cannot authenticate by any means. Gmail and Fast need no credentials.
+`sessionFromInput`, and today that is **Slack, Notion and Toters** (`--token` /
+`--cookie`, with `--adapter ID` for any but Slack). Trello, Loom and LinkedIn
+have no non-macOS path at all — on Linux and Windows they cannot authenticate by
+any means. Gmail, Fast and OLX need no credentials.
 
 ## Publishing the SDK packages
 

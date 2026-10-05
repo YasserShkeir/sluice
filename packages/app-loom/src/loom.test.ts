@@ -11,17 +11,21 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { makeCapture, runConformance } from '@sluice/adapter-sdk';
-import type { Capture, Session } from '@sluice/core';
+import type { AppToolContext, Capture, Session } from '@sluice/core';
 import {
   classifyLoomCapture,
+  createLoomMcpTools,
   graphqlOperationOf,
   loomApp,
+  loomNextCursors,
   matchesLoom,
   parseLoomCapture,
   parseVtt,
 } from './index.js';
 
+/** Synthetic, Loom-shaped (32 hex) video ids — never copied from a real account. */
 const VID = '00000000000040008000000000000a01';
+const VID2 = '00000000000040008000000000000a02';
 
 /** A captured Loom GraphQL exchange: request declares `operationName`, response carries `data`. */
 function loomGraphql(operationName: string, data: unknown, over: Partial<Capture> = {}): Capture {
@@ -43,7 +47,7 @@ const LIBRARY_RESPONSE = {
     videos: {
       edges: [
         { cursor: 'Y3Vyc29yOjA=', node: { id: VID, name: 'Example walkthrough', visibility: 'owner', createdAt: '2025-01-02T03:04:05.678Z' } },
-        { cursor: 'Y3Vyc29yOjE=', node: { id: '00000000000040008000000000000a02', name: 'Example overview', visibility: 'owner' } },
+        { cursor: 'Y3Vyc29yOjE=', node: { id: VID2, name: 'Example overview', visibility: 'owner' } },
       ],
       pageInfo: { endCursor: 'Y3Vyc29yOjE=', hasNextPage: true },
     },
@@ -61,7 +65,7 @@ test('parse: GetLoomsForLibrary → one workspace, one container, one item per v
   assert.equal(result.containers?.[0]?.id, 'loom:videos');
   assert.equal(result.items?.length, 2);
   const ids = result.items?.map((i) => i.id);
-  assert.deepEqual(ids, [VID, '00000000000040008000000000000a02']);
+  assert.deepEqual(ids, [VID, VID2]);
   // createdAt is normalized to epoch ms; the second video (no createdAt) → 0.
   assert.equal(result.items?.[0]?.ts, Date.parse('2025-01-02T03:04:05.678Z'));
   assert.equal(result.items?.[1]?.ts, 0);
@@ -260,3 +264,99 @@ test('nextCursors empty when hasNextPage is false', () => {
   assert.deepEqual(loomApp.nextCursors?.(cap) ?? [], []);
 });
 
+/** A library or notifications page whose request declares `variables` and whose answer has a next page. */
+function pagedCapture(operationName: string, variables: Record<string, unknown>, data: unknown): Capture {
+  return loomGraphql(operationName, data, {
+    reqBody: JSON.stringify({ operationName, query: `query ${operationName}`, variables }),
+  });
+}
+
+test('nextCursors keeps the page size the request asked for', () => {
+  // The regression: libraryOp / notificationsOp send `limit` / `first` as NUMBERS
+  // and the seed read them with str(), so every follow-up page reset to 12 / 20.
+  // The existing 12-based tests hid it by matching the default.
+  const nextPage = { pageInfo: { endCursor: 'cNEXT', hasNextPage: true } };
+  const library = loomNextCursors(
+    pagedCapture('GetLoomsForLibrary', { limit: 36, cursor: null }, { getLooms: { videos: { edges: [], ...nextPage } } }),
+  );
+  assert.equal(library[0]?.actionId, 'loom.videos.library');
+  assert.equal(library[0]?.params?.limit, '36');
+
+  const notifications = loomNextCursors(
+    pagedCapture(
+      'GetCurrentUserNotifications',
+      { first: 5, cursor: null },
+      { currentUser: { notification: { notificationConnection: { edges: [], ...nextPage } } } },
+    ),
+  );
+  assert.equal(notifications[0]?.actionId, 'loom.notifications.list');
+  assert.equal(notifications[0]?.params?.first, '5');
+
+  // A numeric string is a page size too; anything else falls back to the default.
+  const asString = loomNextCursors(
+    pagedCapture('GetLoomsForLibrary', { limit: '50' }, { getLooms: { videos: { edges: [], ...nextPage } } }),
+  );
+  assert.equal(asString[0]?.params?.limit, '50');
+  const missing = loomNextCursors(
+    pagedCapture('GetLoomsForLibrary', {}, { getLooms: { videos: { edges: [], ...nextPage } } }),
+  );
+  assert.equal(missing[0]?.params?.limit, '12');
+});
+
+// ── MCP tools ─────────────────────────────────────────────────────────────────────────
+
+/** A synthetic cookie source: the tools never reach Chrome or the Keychain here. */
+const SYNTHETIC_COOKIE = () => 'connect.sid=SYNTHETIC-COOKIE';
+
+function tool(name: string) {
+  const t = createLoomMcpTools(SYNTHETIC_COOKIE).find((x) => x.name === name);
+  assert.ok(t, `precondition: ${name} exists`);
+  return t;
+}
+
+test('loom_list_notifications passes the cursor through and returns the next one', async () => {
+  // The regression: the tool always sent `cursor: null`, took no cursor argument
+  // and returned no nextCursor, although the query selects pageInfo — so an
+  // agent could only ever see the first page.
+  const sent: Array<{ operationName?: string; variables?: Record<string, unknown> }> = [];
+  const ctx: AppToolContext = {
+    replay: async (req) => {
+      const body = JSON.parse(req.body ?? '{}') as { operationName?: string; variables?: Record<string, unknown> };
+      sent.push(body);
+      const data =
+        body.operationName === 'GetCurrentUserNotifications'
+          ? {
+              currentUser: {
+                notification: {
+                  notificationConnection: {
+                    edges: [{ cursor: 'n0', node: { id: 'n1', notificationType: 'comment', status: 'unseen' } }],
+                    pageInfo: { endCursor: 'cNEXT', hasNextPage: true },
+                  },
+                },
+              },
+            }
+          : { currentUser: { notification: { unseenNotificationsCount: { count: 3 } } } };
+      return loomGraphql(body.operationName ?? '', data, { status: 200 });
+    },
+  };
+
+  const out = (await tool('loom_list_notifications').run({ cursor: 'cPREV', limit: 5 }, ctx)) as {
+    count: number;
+    unseenCount?: number;
+    nextCursor: string | null;
+    hasNextPage: boolean;
+  };
+  assert.equal(sent[0]?.operationName, 'GetCurrentUserNotifications');
+  assert.equal(sent[0]?.variables?.cursor, 'cPREV', 'the caller\'s cursor reaches the request');
+  assert.equal(sent[0]?.variables?.first, 5);
+  assert.equal(out.count, 1);
+  assert.equal(out.nextCursor, 'cNEXT');
+  assert.equal(out.hasNextPage, true);
+  assert.equal(out.unseenCount, 3);
+});
+
+test('a tool run without a host context refuses rather than fetching directly', async () => {
+  // A bare fetch would send the live session cookie past the replay rails, the
+  // budget and the capture store. There is deliberately no such fallback.
+  await assert.rejects(tool('loom_list_videos').run({}, undefined), /replay pipeline/);
+});

@@ -19,6 +19,7 @@
  * web streams are used (available in Node 20).
  */
 import { arr, compact, obj, safeJsonObject, str } from '@sluice/adapter-sdk';
+import { errorMessage } from '@sluice/core';
 import type { AppToolContext } from '@sluice/core';
 
 /** The long-standing public fast.com token, used when live extraction fails. */
@@ -105,13 +106,8 @@ function toPlace(v: unknown): { city?: string; country?: string } | undefined {
 /**
  * A config body as a FastConfig, or a throw that says what was wrong with it.
  *
- * Regression: `JSON.parse(body ?? 'null') as FastConfig` was a cast nothing
- * checked, and `runReplay` falsifies it routinely — it records `resBody: null`
- * whenever `res.text()` rejects, e.g. the connection drops mid-body — so a 200
- * returned `null` here and `runSpeedTest` read `.targets` off it OUTSIDE the try
- * that exists to turn a bad config into a message. Coercing instead of casting
- * makes the declared shape true for every caller: `targets` really is an array,
- * and every target in it really does have a url.
+ * Coerced, not cast: runReplay records `resBody: null` when the body read fails, and
+ * this makes `targets` really an array whose entries all have a url.
  */
 function toFastConfig(body: string | null): FastConfig {
   const parsed = safeJsonObject(body);
@@ -203,12 +199,10 @@ export async function runSpeedTest(ctx?: AppToolContext): Promise<SpeedTestResul
     // put 25 MiB bodies in SQLite for no analytical value.
     cfg = await fetchConfig(token, ctx);
   } catch (e) {
-    throw new Error(`Could not fetch fast.com config: ${e instanceof Error ? e.message : String(e)}`);
+    throw new Error(`Could not fetch fast.com config: ${errorMessage(e)}`);
   }
 
-  // `fetchConfig` already dropped every target without a usable url and
-  // guarantees an array; the filter that used to stand here was itself a
-  // `?? []` on a field the service is free to send as something else.
+  // fetchConfig already dropped every target without a url and guarantees an array.
   const targets = cfg.targets ?? [];
   if (targets.length === 0) throw new Error('fast.com returned no download targets.');
 
@@ -228,7 +222,7 @@ export async function runSpeedTest(ctx?: AppToolContext): Promise<SpeedTestResul
         failures.push(`${bytes} bytes in ${ms}ms from ${new URL(target.url).host}`);
       }
     } catch (e) {
-      failures.push(e instanceof Error ? e.message : String(e));
+      failures.push(errorMessage(e));
     }
   }
 

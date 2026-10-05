@@ -34,7 +34,7 @@
 
     <label for="hosts">In-scope hosts (one per line or comma-separated)</label>
     <textarea id="hosts" placeholder="slack.com&#10;trello.com&#10;mail.google.com"></textarea>
-    <div class="hint">Only requests to these hosts (and their subdomains) are captured. Empty = capture nothing.</div>
+    <div class="hint">Only requests to these hosts, made from pages on these hosts (and their subdomains), are captured. Empty = capture nothing.</div>
 
     <div class="row">
       <input id="enabled" type="checkbox" checked />
@@ -43,6 +43,6 @@
 
     <button id="save">Save</button><span id="status"></span>
 
-    <script src="options.js"></script>
+    <script type="module" src="options.js"></script>
   </body>
 </html>

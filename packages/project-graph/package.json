@@ -1,0 +1,25 @@
+{
+  "name": "@sluice/project-graph",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Local knowledge graph and GraphRAG-style MCP for the Sluice source tree.",
+  "license": "AGPL-3.0-or-later",
+  "bin": {
+    "sluice-project-graph": "./dist/cli.js"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "node --import tsx --test src/*.test.ts"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.30.0",
+    "better-sqlite3": "^11.7.0",
+    "typescript": "^5.7.2",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.12",
+    "@types/node": "^20.10.0"
+  }
+}

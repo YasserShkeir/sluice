@@ -6,7 +6,7 @@ The `sluice` CLI and the loopback HTTP + WebSocket server behind it — the daem
 half of [Sluice](https://github.com/YasserShkeir/sluice), a local-only
 interceptor and explorer for **your own** SaaS API traffic.
 
-`src/cli.ts` dispatches 24 commands over `process.argv[2]`, each parsing its own
+`src/cli.ts` dispatches 25 commands over `process.argv[2]`, each parsing its own
 flags with `node:util` `parseArgs` (strict — an option a command does not declare
 is an error, not a warning). Four of them bind the loopback server. As a library the package
 exports only `startServer`, its option/result types, and everything from
@@ -55,8 +55,8 @@ everywhere; every listed flag below is the real, complete set for that command.
 
 | Command | Options |
 |---|---|
-| `serve` | `--port`, `--proxy-port`, `--db`, `--config`, `--token`, `--cookie`, `--app-support`, `--host` (repeatable), `--all-hosts`, `--isolated`, `--ingest`, `--terminal`, `--terminal-cwd`, `--terminal-model`, `--terminal-effort`, `--terminal-mcp`, `--terminal-no-mcp`, `--terminal-skip-permissions`, `--terminal-bin` |
-| `start` | `--port`, `--proxy-port`, `--db`, `--config`, `--token`, `--cookie`, `--app-support`, `--host` (repeatable), `--all-hosts` |
+| `serve` | `--port`, `--proxy-port`, `--db`, `--config`, `--token`, `--cookie`, `--adapter`, `--app-support`, `--host` (repeatable), `--all-hosts`, `--lan-proxy`, `--lan-allow` (repeatable), `--isolated`, `--ingest`, `--terminal`, `--terminal-cwd`, `--terminal-model`, `--terminal-effort`, `--terminal-mcp`, `--terminal-no-mcp`, `--terminal-skip-permissions`, `--terminal-bin` |
+| `start` | `--port`, `--proxy-port`, `--db`, `--config`, `--token`, `--cookie`, `--adapter`, `--app-support`, `--host` (repeatable), `--all-hosts`, `--lan-proxy`, `--lan-allow` (repeatable) |
 | `capture` | `--url`, `--cdp-port`, `--port`, `--db`, `--headless`, `--no-launch`, `--chrome-profile` (no `--config`) |
 | `mock <fixture.ndjson>` | `--speed` (default 10), `--port`, `--db`, `--config`, `--loop`, `--serve` |
 
@@ -68,7 +68,7 @@ not substituted for them.
 | Command | Options |
 |---|---|
 | `doctor` | `--db`, `--net` |
-| `proxy <on\|off\|status>` | `--service`, `--proxy-port` |
+| `proxy <on\|off\|status>` | `--service`, `--proxy-port`, `--force` (`on` refuses to replace a proxy someone else set; `off` clears only Sluice's own unless `--force`) |
 | `ca-install` | — |
 | `ca-uninstall` | — |
 | `status` | `--json`, `--db`, `--config` |
@@ -87,13 +87,16 @@ the exact `sudo networksetup …` commands for you to run.
 
 | Command | Options |
 |---|---|
-| `replay [actionId]` | `--action`, `--flow`, `--param k=v` (repeatable), `--adapter`, `--container`, `--all`, `--dry-run`, `--list`, `--db`, `--token`, `--cookie`, `--app-support` |
-| `sync` | `--workspace`, `--db`, `--token`, `--cookie`, `--app-support` |
+| `replay [actionId]` | `--action`, `--flow`, `--param k=v` (repeatable), `--adapter`, `--container`, `--all`, `--dry-run`, `--list`, `--db`, `--workspace`, `--token`, `--cookie`, `--app-support` |
+| `sync` | `--workspace`, `--adapter`, `--db`, `--token`, `--cookie`, `--app-support` |
 | `extract-token` | `--adapter`, `--token`, `--cookie`, `--app-support`, `--db` |
 | `auth` | `--app`, `--json`, `--hints`, `--db`, `--config` |
 
-`replay --all` drains the `cursors` worklist in batches of 25 claims, releasing
-stale claims before and after, and stops cleanly on a `ReplayDeniedError`
+`replay --all` drains the `cursors` worklist in batches of 25 claims. At startup
+it releases only claims past a 15-minute lease (a killed drainer's), and at the end
+only its own unsettled claims — never a concurrent drainer's live ones. Ctrl-C
+returns this run's claims at once; the lease covers only a hard kill. It stops
+cleanly on a `ReplayDeniedError`
 (exit 0 for a spent rate budget, 1 otherwise). `sync` replays only the actions
 with no required params, each session against its **own** adapter, then runs
 reconcile + materialize. `extract-token` stores and prints a redacted summary
@@ -124,7 +127,7 @@ and reporting only `hasRequestTemplate: boolean`.
 | `apidoc` | `--host` (comma-separated substrings), `--app`, `--out`, `--db` |
 | `export [containerId]` | `--container`, `--format` (`json\|ndjson\|markdown\|sqlite`), `--out`, `--all`, `--list`, `--db` |
 | `record` | `--out`, `--adapter`, `--limit` (default 10000), `--since` (minutes), `--include-assets`, `--db` |
-| `prune` | `--days`, `--max-rows`, `--vacuum`, `--db` |
+| `prune` | `--days`, `--max-rows`, `--vacuum`, `--db` (drops and rebuilds the derived per-app tables after deleting, so pruned text does not survive there) |
 | `wipe` | `--all`, `--yes`/`-y`, `--db` |
 
 `prune` refuses with exit 1 when neither `--days` nor `--max-rows` is given.
@@ -133,7 +136,8 @@ its `-wal`/`-shm`, and with `--all` also the CA directory and `~/.sluice/chrome`
 untrusting the CA first. `record` re-redacts on the way out even though captures
 were redacted on ingest, and skips `asset`/`binary` classifications unless
 `--include-assets`. The `sqlite` export writes a fresh standalone store holding
-entities only.
+entities only. `export --out` and `record --out` warn on stderr when the file lands
+inside a Git worktree at a path Git does not ignore (never blocking the write).
 
 ### Apps
 
@@ -219,22 +223,24 @@ secrets**, each 32 bytes of hex, each gating a different door:
 
 | Secret | Minted | Gates |
 |---|---|---|
-| read token | always | the `/ws` upgrade and every `GET /api/*` |
+| session token | always | the `/ws` upgrade and every `GET /api/*` — **full dashboard control**: reads, replay and flows against your live accounts, sync, engine and system-proxy control, and every `data.*` operation including wipe. It is not read-only; treat a leak of it as exactly that |
 | pty token | only with `--terminal` | the `/pty` upgrade, and nothing else |
 | ingest token | only with `--ingest` | `POST /api/ingest`, and nothing else |
 
-Tokens travel in the **URL fragment** the CLI prints (`#k=<read>` plus
+Tokens travel in the **URL fragment** the CLI prints (`#k=<session>` plus
 `&p=<pty>`), which a browser never sends to a server. Only
 `{__SLUICE_WS_PATH__, __SLUICE_PORT__}` are injected into the served document —
-the read token is not. That is what makes it safe for static assets to be served
-unauthenticated.
+the session token is not. That is what makes it safe for static assets to be served
+unauthenticated. The banner prints the token lines only to a terminal: when stdout
+is redirected (a background launch's `runner.log`), every token is masked there and
+the full lines go to the controlling terminal instead, if there is one.
 
 | Door | Conditions |
 |---|---|
-| `GET /api/*` | loopback `Host`, loopback `Origin` *if one is sent*, read token via `?token=` or `Authorization: Bearer`, compared with `timingSafeEqual`. GET only — the API is read-only and answers 405 otherwise |
+| `GET /api/*` | loopback `Host`, an `Origin` *if one is sent* that is the runner's own (`http://127.0.0.1\|localhost\|[::1]:<port>`) or the pinned dev UI's (`:5273`) — any other port is refused — and the session token via `?token=` or `Authorization: Bearer`, compared with `timingSafeEqual`. GET only — the API is read-only and answers 405 otherwise |
 | `POST /api/ingest` | loopback `Host` + the ingest secret (`Authorization: Bearer` or `X-Sluice-Ingest`). **No Origin requirement** — the poster is a `chrome-extension://` origin. 404 `ingest_disabled` without `--ingest`; 413 above 32 MiB or 500 captures |
-| `/ws` upgrade | loopback `Host`, loopback `Origin` (**absent Origin allowed**, so CLIs and tests can connect), read token. Plain `GET /ws` over HTTP answers 426 |
-| `/pty` upgrade | loopback `Host`, a **present** loopback `Origin` (fails closed on absence), and the separate pty secret. The read token cannot open a terminal |
+| `/ws` upgrade | loopback `Host`, the same `Origin` rule (**absent Origin allowed**, so CLIs and tests can connect), session token. Plain `GET /ws` over HTTP answers 426 |
+| `/pty` upgrade | loopback `Host`, a **present** `Origin` under the same rule (fails closed on absence), and the separate pty secret. The session token cannot open a terminal |
 
 Every response carries `X-Content-Type-Options: nosniff`, `Referrer-Policy:
 no-referrer`, and a CSP whose `connect-src` is limited to `'self'` plus `ws://`
@@ -245,7 +251,10 @@ the webapp dist root, with SPA fallback to `index.html`.
 `/storage`, `/adapters`, `/captures`, `/captures/search`, `/captures/:id/body`,
 `/captures/:id/entities`, `/sessions`, `/workspaces`, `/containers`, `/actors`,
 `/items`, `/flows`, `/flow-templates`, `/apidoc`, `/tables`, `/tables/:name`.
-Paging caps at 1000 (default 100), and `?ids=` at 500. `/api/tables/:name`
+Paging caps at 1000 (default 100), and `?ids=` at 500. `/captures` and
+`/captures/search` return body **previews** (`previewCapture`: each body cut to
+64 KiB, with the full `bodyLengths` when cut), as do
+`capture.new` and backfill frames; `/captures/:id/body` returns the whole body. `/api/tables/:name`
 interpolates a table name into SQL only after an exact match against
 materialized tables read live from `sqlite_master`.
 
@@ -271,7 +280,8 @@ was passed explicitly.
 ## Ingest
 
 All four producers — the in-process MITM engine, the isolated child engine, the
-CDP engine or extension POST, and replay/sync — converge on **one** funnel:
+CDP engine or extension POST, and replay/sync — converge on **one** funnel,
+core's `persistCapture` (the MCP server's record paths use it too):
 re-redact → attribute to an adapter → classify → `insertCapture` →
 `adapter.parse` → `applyParseResult` → enqueue `nextCursors` seeds → broadcast
 `capture.new` + `entity.upsert`, then a 1 s-debounced app catalog and a
@@ -290,18 +300,27 @@ lose:
 - the system proxy (`/usr/sbin/networksetup`, `/sbin/route`),
 - CA trust and its removal (`/usr/bin/security` against
   `~/Library/Keychains/login.keychain-db`),
-- credential extraction for four of the six installed apps (Slack from Slack
-  desktop's LevelDB + Keychain; Trello, Loom and LinkedIn from a Chrome profile's
-  cookie DB + Keychain), which return `[]` or throw elsewhere.
+- credential extraction for the installed apps that read a local session (Slack
+  from Slack desktop's LevelDB + Keychain; Trello, Loom, LinkedIn and Notion from
+  a Chrome profile's cookie DB + Keychain), which return `[]` or throw elsewhere.
 
-Pass `--token` / `--cookie` by hand instead — though paste-in only works where the
-app implements `sessionFromInput`, which today is Slack alone. The CA lives at
+Paste credentials in instead — though only where the app implements
+`sessionFromInput` (Slack, Notion and Toters today). A pasted pair is for ONE app:
+`--adapter ID`, else Slack — also for `replay <action>`, `--flow` and `--all`,
+whose own app never receives it otherwise; no other app's provider ever sees it,
+and an app that cannot take or refuses the paste is an error. Prefer the
+`SLUICE_TOKEN` / `SLUICE_COOKIE` environment variables, or `--token -` to read the
+value from stdin: a literal `--token`/`--cookie` value is readable by every local
+account through `ps` for as long as the process runs, and lands in shell history,
+so the CLI warns when one is used. The CA lives at
 `~/Library/Application Support/Sluice/ca` on macOS (`~/.sluice/ca` elsewhere), and
 that directory is created automatically the first time the MITM engine starts.
 
 ## Files on disk
 
-`~/.sluice` is where the runner keeps its own state:
+`~/.sluice` is where the runner keeps its own state. It is created owner-only
+(`0700`) and an existing, more open one is tightened on the next run; the files
+the runner writes there (`runner.json`, `config.json`) are `0600`:
 
 - `~/.sluice/sluice.db` (+ `-wal`, `-shm`) — the capture store.
 - `~/.sluice/config.json` — the home config, and the only source of the

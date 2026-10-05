@@ -12,10 +12,14 @@
  * upgrade path and the header handling, which a mock would not exercise.
  */
 import assert from 'node:assert/strict';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import test, { after, before } from 'node:test';
 import { SqliteStore, WS_PROTOCOL_VERSION } from '@sluice/core';
-import type { AppCatalogEntry, Capture } from '@sluice/core';
+import type { App, AppCatalogEntry, Capture, ReplayAction, Session } from '@sluice/core';
 import { apps } from '@sluice/apps';
+import { MATERIALIZE_WATERMARK_KEY, materialize } from '@sluice/cartographer';
 import { startServer, type StartServerResult } from './server.js';
 
 const PORT = 7899;
@@ -211,7 +215,7 @@ test('the WS upgrade accepts the right token from loopback', async () => {
 
 test('/pty is refused entirely when the terminal is disabled', async () => {
   // The shared `server` was started without --terminal, so there is no /pty at all
-  // and no pty token — the read token must not open a shell either.
+  // and no pty token — the session token must not open a shell either.
   assert.equal(server.ptyToken, '', 'no pty token is minted without --terminal');
   assert.match(await rawUpgrade('/pty', ORIGIN), /403/);
   assert.match(await rawUpgrade(`/pty?token=${server.token}`, ORIGIN), /403/);
@@ -241,8 +245,8 @@ test('/pty enforces the separate secret and a present loopback Origin', async ()
   const O2 = `http://127.0.0.1:${PTY_PORT}`;
   try {
     assert.notEqual(s2.ptyToken, '', 'a pty token is minted when the terminal is on');
-    assert.notEqual(s2.ptyToken, s2.token, 'the pty token is distinct from the read token');
-    // The READ token cannot open /pty — it is a different capability.
+    assert.notEqual(s2.ptyToken, s2.token, 'the pty token is distinct from the session token');
+    // The session token cannot open /pty — it is a different capability.
     assert.match(await rawUpgrade(`/pty?token=${s2.token}`, O2, PTY_PORT), /403/);
     // Wrong pty token is refused.
     assert.match(await rawUpgrade('/pty?token=nope', O2, PTY_PORT), /403/);
@@ -281,9 +285,9 @@ test('/api/ingest enforces its own secret and stores through the redacting funne
     fetch(`${O2}/api/ingest`, { method: 'POST', headers: { 'Content-Type': 'application/json', ...headers }, body: JSON.stringify(body) });
   try {
     assert.notEqual(s2.ingestToken, '', 'an ingest token is minted with --ingest');
-    assert.notEqual(s2.ingestToken, s2.token, 'the ingest token is distinct from the read token');
+    assert.notEqual(s2.ingestToken, s2.token, 'the ingest token is distinct from the session token');
 
-    // No token, wrong token, and the READ token are all refused.
+    // No token, wrong token, and the session token are all refused.
     assert.equal((await post({}, { captures: [] })).status, 403);
     assert.equal((await post({ Authorization: 'Bearer nope' }, { captures: [] })).status, 403);
     assert.equal((await post({ Authorization: `Bearer ${s2.token}` }, { captures: [] })).status, 403);
@@ -291,32 +295,60 @@ test('/api/ingest enforces its own secret and stores through the redacting funne
     // GET is not allowed even with the ingest token — only POST.
     assert.equal((await fetch(`${O2}/api/ingest?token=x`, { headers: { Origin: O2 } })).status, 405);
 
+    // A row the post will try to overwrite by naming its id.
+    store2.insertCapture(
+      capture({ id: 'victim', host: 'victim.example.test', url: 'https://victim.example.test/original' }),
+    );
+    const live = await subscribed({ port: INGEST_PORT, token: s2.token });
+
     // A real batch with the ingest token: stored, and the belt-and-braces
-    // redaction runs on the way in (an ext-supplied auth header is scrubbed).
+    // redaction runs on the way in — headers, and every URL-like field too.
     const ok = await post(
       { Authorization: `Bearer ${s2.ingestToken}` },
       {
         captures: [
           {
+            id: 'victim',
             method: 'GET',
-            url: 'https://api.example.com/v1/thing?x=1',
+            url: 'https://api.example.com/v1/thing?x=1&token=abcd1234efgh5678&code=FAKEVALUE1234',
+            tabUrl: 'https://app.example.com/cb?access_token=zzzz9999yyyy#access_token=FAKEVALUE1234',
+            tabId: 'tab-forged',
             status: 200,
             reqHeaders: { authorization: 'Bearer super-secret-ext-value' },
             resBody: '{"ok":true}',
           },
+          // Host and path come from the URL, never from the poster.
+          { method: 'GET', url: 'https://evil.example.test/a', host: 'slack.com', path: '/api/conversations.history' },
         ],
       },
     );
     assert.equal(ok.status, 200);
-    assert.deepEqual(await ok.json(), { ingested: 1 });
-    const stored = store2.listCaptures().find((c) => c.host === 'api.example.com');
+    assert.deepEqual(await ok.json(), { ingested: 2 });
+    await settle();
+
+    const victim = store2.getCapture('victim');
+    assert.equal(victim?.url, 'https://victim.example.test/original', 'a caller-supplied id cannot overwrite a row');
+
+    const stored = store2.listCaptures().find((c) => c.source === 'ext' && c.host === 'api.example.com');
     assert.ok(stored, 'the ingested capture is in the store');
-    assert.equal(stored?.source, 'ext');
-    assert.equal(stored?.path, '/v1/thing?x=1', 'host/path derived from the URL when omitted');
+    assert.notEqual(stored?.id, 'victim', 'the id is minted by the server');
+    assert.equal(stored?.path, '/v1/thing', 'path is the pathname, as every engine records it');
+    assert.equal(stored?.tabUrl ?? null, null, 'tab fields are not accepted from a poster');
+    assert.equal(stored?.tabId ?? null, null);
+    for (const secret of ['abcd1234efgh5678', 'zzzz9999yyyy', 'FAKEVALUE1234', 'super-secret-ext-value']) {
+      assert.ok(!JSON.stringify(stored).includes(secret), `${secret} must not reach any stored column`);
+      const frames = JSON.stringify(live.frames.filter((f) => f.type === 'capture.new'));
+      assert.ok(!frames.includes(secret), `${secret} must not reach a capture.new frame`);
+    }
     assert.ok(
-      !JSON.stringify(stored?.reqHeaders).includes('super-secret-ext-value'),
-      'ext-supplied secrets are redacted by the same funnel the proxy uses',
+      live.frames.some((f) => f.type === 'capture.new' && (f.capture as Capture).host === 'api.example.com'),
+      'precondition: the capture was streamed',
     );
+
+    const forged = store2.listCaptures().find((c) => c.url === 'https://evil.example.test/a');
+    assert.equal(forged?.host, 'evil.example.test', 'a poster cannot claim another host');
+    assert.equal(forged?.path, '/a');
+    live.close();
   } finally {
     await s2.close();
     store2.close();
@@ -724,6 +756,494 @@ test('a malformed subscribe is refused out loud, not quietly widened', async () 
     // field can never recover by sending a good one.
     assert.equal(s.ws.readyState, s.ws.OPEN);
   } finally {
+    s.close();
+  }
+});
+
+// ── helpers for the servers below ────────────────────────────────────────────
+
+/** The last op.progress for a request, once it has left 'running' (or undefined after ~3 s). */
+async function finalOp(s: Subscribed, match: (op: Frame) => boolean): Promise<Frame | undefined> {
+  for (let i = 0; i < 30; i++) {
+    const ops = s.frames.filter((f) => f.type === 'op.progress').map((f) => f.op as Frame);
+    const last = ops.filter(match).at(-1);
+    if (last && last.state !== 'running') return last;
+    await new Promise((r) => setTimeout(r, 100));
+  }
+  return undefined;
+}
+
+/** The replay.error / replay.result for a request (or undefined after ~3 s). */
+async function replayReply(s: Subscribed, requestId: string): Promise<Frame | undefined> {
+  for (let i = 0; i < 30; i++) {
+    const hit = s.frames.find(
+      (f) => (f.type === 'replay.error' || f.type === 'replay.result') && f.requestId === requestId,
+    );
+    if (hit) return hit;
+    await new Promise((r) => setTimeout(r, 100));
+  }
+  return undefined;
+}
+
+/** A structural App whose request builder records the session it was handed and never sends. */
+function fakeApp(id: string, over: Partial<App> = {}, seen: Session[] = []): App {
+  const action: ReplayAction = {
+    id: `${id}.list`,
+    adapterId: id,
+    label: 'List',
+    method: 'GET',
+    urlTemplate: `https://${id}.example.test/list`,
+    params: [{ name: 'channel', label: 'Channel', kind: 'containerId', required: false }],
+  };
+  return {
+    id,
+    displayName: id.charAt(0).toUpperCase() + id.slice(1),
+    hosts: [`${id}.example.test`],
+    matchRequest: (r) => r.host === `${id}.example.test`,
+    parse: () => ({}),
+    listReplayActions: () => [action],
+    buildReplayRequest: (_a, _p, session) => {
+      seen.push(session);
+      throw new Error('built, not sent'); // nothing reaches the network
+    },
+    ...over,
+  };
+}
+
+function fakeSession(id: string, adapterId: string, workspaceId?: string): Session {
+  return {
+    id,
+    adapterId,
+    label: `Label ${id}`,
+    workspaceId,
+    credentials: { kind: 'none', values: {}, injection: {} },
+    discoveredAt: 0,
+    source: 'manual',
+  };
+}
+
+// ── a throwing parser loses nothing ──────────────────────────────────────────
+
+test('a capture whose parser throws is still stored, streamed, and left unparsed', async () => {
+  const BOOM_PORT = PORT + 2;
+  const s = new SqliteStore(':memory:');
+  const boom = fakeApp('boom', {
+    parse: () => {
+      throw new Error('parser exploded');
+    },
+  });
+  const srv = await startServer({ store: s, adapters: [boom], port: BOOM_PORT, getSessions: () => [] });
+  const c = await subscribed({ port: BOOM_PORT, token: srv.token });
+  try {
+    srv.ingest(capture({ id: 'boom-1', host: 'boom.example.test', url: 'https://boom.example.test/x', adapterId: null }));
+    await settle();
+    assert.ok(streamedIds(c).includes('boom-1'), 'capture.new still went out');
+    const stored = s.getCapture('boom-1');
+    assert.equal(stored?.adapterId, 'boom');
+    assert.equal(stored?.parsedAt ?? null, null, 'a failed parse is not stamped as parsed');
+  } finally {
+    c.close();
+    await srv.close();
+    s.close();
+  }
+});
+
+// ── data.* ids are allowlisted ───────────────────────────────────────────────
+
+test('data.rematerialize and data.clearApp refuse an id that is not an installed app', async () => {
+  // 'interaction' and 'flow' are prefixes of the core flow tables; a
+  // caller-supplied id used to become a DROP TABLE prefix and take them out.
+  const c = await subscribed();
+  try {
+    c.ws.send(JSON.stringify({ type: 'data.rematerialize', adapterId: 'interaction', requestId: 'rm-bad' }));
+    c.ws.send(JSON.stringify({ type: 'data.clearApp', adapterId: 'flow', includeCaptures: false, requestId: 'ca-bad' }));
+    for (const id of ['rm-bad', 'ca-bad']) {
+      const op = await finalOp(c, (o) => o.requestId === id);
+      assert.equal(op?.state, 'error', `${id} must be refused`);
+      assert.match(String(op?.detail), /Unknown app/);
+    }
+    const n = (
+      store.db
+        .prepare(
+          "SELECT COUNT(*) AS n FROM sqlite_master WHERE type='table' AND name IN ('interaction_flows','interaction_flow_steps','flow_templates')",
+        )
+        .get() as { n: number }
+    ).n;
+    assert.equal(n, 3, 'the core flow tables survive');
+    assert.doesNotThrow(() => store.listFlows());
+
+    c.ws.send(JSON.stringify({ type: 'data.rematerialize', requestId: 'rm-ok' }));
+    assert.equal((await finalOp(c, (o) => o.requestId === 'rm-ok'))?.state, 'ok', 'no id still rebuilds everything');
+  } finally {
+    c.close();
+  }
+});
+
+test('wipe also forgets the materialize watermark', async () => {
+  const WIPE_PORT = PORT + 5;
+  const s = new SqliteStore(':memory:');
+  s.insertCapture(capture());
+  s.setMetaNumber(MATERIALIZE_WATERMARK_KEY, 123);
+  const srv = await startServer({ store: s, adapters: [], port: WIPE_PORT, getSessions: () => [] });
+  const c = await subscribed({ port: WIPE_PORT, token: srv.token });
+  try {
+    const wipedAt = Date.now();
+    c.ws.send(JSON.stringify({ type: 'data.wipe', confirm: 'wipe', requestId: 'w1' }));
+    assert.equal((await finalOp(c, (o) => o.requestId === 'w1'))?.state, 'ok');
+    // The rebuild over the emptied store may set a fresh one; the old one is gone.
+    const w = s.getMetaNumber(MATERIALIZE_WATERMARK_KEY);
+    assert.ok(w === undefined || w >= wipedAt - 10_000, 'the pre-wipe watermark must not survive a delete');
+  } finally {
+    c.close();
+    await srv.close();
+    s.close();
+  }
+});
+
+test('data.vacuum completes on an in-memory store and on disk', async () => {
+  // ':memory:' has no file to measure, so the free-space pre-check is skipped;
+  // on disk it runs statfsSync and, with room to spare, lets the VACUUM through.
+  const c = await subscribed();
+  try {
+    c.ws.send(JSON.stringify({ type: 'data.vacuum', requestId: 'vac-1' }));
+    assert.equal((await finalOp(c, (o) => o.requestId === 'vac-1'))?.state, 'ok');
+  } finally {
+    c.close();
+  }
+
+  const VAC_PORT = PORT + 10;
+  const dir = mkdtempSync(join(tmpdir(), 'sluice-vacuum-'));
+  const s = new SqliteStore(join(dir, 'sluice.db'));
+  s.insertCapture(capture());
+  const srv = await startServer({ store: s, adapters: [], port: VAC_PORT, getSessions: () => [] });
+  const d = await subscribed({ port: VAC_PORT, token: srv.token });
+  try {
+    d.ws.send(JSON.stringify({ type: 'data.vacuum', requestId: 'vac-2' }));
+    assert.equal((await finalOp(d, (o) => o.requestId === 'vac-2'))?.state, 'ok');
+  } finally {
+    d.close();
+    await srv.close();
+    s.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('pruning drops the derived rows of the captures it deleted', async () => {
+  const PRUNE_PORT = PORT + 8;
+  const s = new SqliteStore(':memory:');
+  s.insertCapture(
+    capture({ id: 's1', resBody: JSON.stringify({ ok: true, channels: [{ id: 'C1', name: 'general' }] }) }),
+  );
+  materialize(s);
+  const rows = (): number => {
+    const t = s.db
+      .prepare("SELECT COUNT(*) AS n FROM sqlite_master WHERE type='table' AND name='slack_channel'")
+      .get() as { n: number };
+    return t.n === 0 ? 0 : (s.db.prepare('SELECT COUNT(*) AS n FROM slack_channel').get() as { n: number }).n;
+  };
+  assert.equal(rows(), 1, 'precondition: the channel was materialized');
+  const srv = await startServer({ store: s, adapters: apps, port: PRUNE_PORT, getSessions: () => [] });
+  const c = await subscribed({ port: PRUNE_PORT, token: srv.token });
+  try {
+    c.ws.send(JSON.stringify({ type: 'data.prune', maxRows: 0, requestId: 'p1' }));
+    assert.equal((await finalOp(c, (o) => o.requestId === 'p1'))?.state, 'ok');
+    assert.equal(rows(), 0);
+  } finally {
+    c.close();
+    await srv.close();
+    s.close();
+  }
+});
+
+// ── error text that reaches a dashboard is redacted ──────────────────────────
+
+test('a sync failure broadcast to every dashboard carries no secret', async () => {
+  const ERR_PORT = PORT + 7;
+  const s = new SqliteStore(':memory:');
+  const errapp = fakeApp('errapp', {
+    credentials: { extractSessions: async () => [] },
+    buildReplayRequest: () => {
+      throw new Error('boom token=abcd1234secretvalue');
+    },
+  });
+  const srv = await startServer({
+    store: s,
+    adapters: [errapp],
+    port: ERR_PORT,
+    getSessions: () => [fakeSession('s1', 'errapp')],
+  });
+  const c = await subscribed({ port: ERR_PORT, token: srv.token });
+  try {
+    c.ws.send(JSON.stringify({ type: 'sync' }));
+    const op = await finalOp(c, (o) => o.kind === 'sync');
+    assert.equal(op?.state, 'error');
+    assert.match(String(op?.detail), /«redacted»/);
+    assert.ok(!String(op?.detail).includes('abcd1234secretvalue'));
+  } finally {
+    c.close();
+    await srv.close();
+    s.close();
+  }
+});
+
+test('sessions found after a dashboard subscribed are sent to it, redacted', async () => {
+  // serve/start bind before the session scan, so a dashboard opened from the
+  // banner subscribes to an empty list; without the announcement its picker
+  // stays empty and every multi-workspace replay is refused until a reload.
+  const ANNOUNCE_PORT = PORT + 12;
+  const s = new SqliteStore(':memory:');
+  const sessions: Session[] = [];
+  const srv = await startServer({ store: s, adapters: [], port: ANNOUNCE_PORT, getSessions: () => sessions });
+  const c = await subscribed({ port: ANNOUNCE_PORT, token: srv.token });
+  try {
+    const found = fakeSession('late', 'slack', 'T1');
+    found.credentials.values.token = 'late-session-secret-value';
+    sessions.push(found);
+    srv.announceSessions([found]);
+    await settle();
+    const got = c.frames.filter((f) => f.type === 'session.discovered');
+    assert.equal(got.length, 1);
+    assert.equal((got[0]?.session as { id?: string } | undefined)?.id, 'late');
+    assert.ok(!JSON.stringify(got).includes('late-session-secret-value'), 'only the redacted session is sent');
+  } finally {
+    c.close();
+    await srv.close();
+    s.close();
+  }
+});
+
+// ── dashboard replay acts as the right account, or not at all ────────────────
+
+test('dashboard replay honours sessionId and never falls back to another account', async () => {
+  const SESS_PORT = PORT + 6;
+  const s = new SqliteStore(':memory:');
+  s.applyParseResult(
+    { containers: [{ id: 'C_W2', workspaceId: 'W2', adapterId: 'authapp', kind: 'channel', name: 'two' }] },
+    1,
+  );
+  const seen: Session[] = [];
+  const authapp = fakeApp('authapp', { credentials: { extractSessions: async () => [] } }, seen);
+  const anonapp = fakeApp('anonapp', {}, seen);
+  const lonely = fakeApp('lonely', { credentials: { extractSessions: async () => [] } }, seen);
+  const sessions = [fakeSession('s1', 'authapp', 'W1'), fakeSession('s2', 'authapp', 'W2')];
+  const srv = await startServer({
+    store: s,
+    adapters: [authapp, anonapp, lonely],
+    port: SESS_PORT,
+    getSessions: () => sessions,
+  });
+  const c = await subscribed({ port: SESS_PORT, token: srv.token });
+  const replay = async (requestId: string, over: Record<string, unknown>): Promise<Frame | undefined> => {
+    c.ws.send(JSON.stringify({ type: 'replay.run', requestId, params: {}, ...over }));
+    return replayReply(c, requestId);
+  };
+  try {
+    const unknown = await replay('r1', { actionId: 'authapp.list', sessionId: 'nope' });
+    assert.equal(unknown?.type, 'replay.error');
+    assert.match(String(unknown?.error), /nope/);
+    assert.equal(seen.length, 0, 'an unknown session is refused, not substituted');
+
+    const ambiguous = await replay('r2', { actionId: 'authapp.list' });
+    assert.equal(ambiguous?.type, 'replay.error');
+    assert.match(String(ambiguous?.error), /2 Authapp workspaces/);
+    assert.equal(seen.length, 0, 'two sessions and nothing to choose: nothing is built');
+
+    await replay('r3', { actionId: 'authapp.list', sessionId: 's2' });
+    assert.equal(seen.at(-1)?.id, 's2');
+
+    await replay('r4', { actionId: 'authapp.list', params: { channel: 'C_W2' } });
+    assert.equal(seen.at(-1)?.id, 's2', "the channel's workspace picks its session");
+
+    await replay('r5', { actionId: 'anonapp.list' });
+    assert.equal(seen.at(-1)?.adapterId, 'anonapp', 'a credential-free app replays anonymously');
+    assert.deepEqual(seen.at(-1)?.credentials.values, {});
+
+    const none = await replay('r6', { actionId: 'lonely.list' });
+    assert.match(String(none?.error), /extract-token/);
+  } finally {
+    c.close();
+    await srv.close();
+    s.close();
+  }
+});
+
+// ── Origin must be ours, not merely loopback ─────────────────────────────────
+
+test('another local port is refused on /api and /ws; the pinned dev UI is not', async () => {
+  // A page on any other localhost port (a compromised dev server) used to pass.
+  const other = 'http://localhost:9999';
+  assert.equal(
+    (await fetch(`${ORIGIN}/api/status`, { headers: { Origin: other, Authorization: `Bearer ${server.token}` } }))
+      .status,
+    403,
+  );
+  assert.match(await rawUpgrade(`/ws?token=${server.token}`, other), /403/);
+
+  const dev = 'http://localhost:5273';
+  assert.equal(
+    (await fetch(`${ORIGIN}/api/status`, { headers: { Origin: dev, Authorization: `Bearer ${server.token}` } }))
+      .status,
+    200,
+  );
+  assert.match(await rawUpgrade(`/ws?token=${server.token}`, dev), /101/);
+  assert.match(await rawUpgrade(`/ws?token=${server.token}`, 'http://[::1]:5273'), /101/, 'IPv6 loopback too');
+});
+
+// ── a malformed request cannot take the runner down ──────────────────────────
+
+/** Send raw bytes and return the status line (or '' when the socket just closes). */
+async function rawRequest(text: string): Promise<string> {
+  const { connect } = await import('node:net');
+  return new Promise((resolve) => {
+    const sock = connect({ port: PORT, host: '127.0.0.1' }, () => sock.write(text));
+    let buf = '';
+    sock.setTimeout(3000, () => {
+      sock.destroy();
+      resolve(buf.split('\r\n')[0] ?? '');
+    });
+    sock.on('data', (d) => {
+      buf += String(d);
+      if (buf.includes('\r\n')) {
+        sock.destroy();
+        resolve(buf.split('\r\n')[0] ?? '');
+      }
+    });
+    sock.on('error', () => resolve(buf.split('\r\n')[0] ?? ''));
+    sock.on('close', () => resolve(buf.split('\r\n')[0] ?? ''));
+  });
+}
+
+test('a malformed Host or request target is answered, and the runner survives it', async () => {
+  // One `Host: [` used to throw ERR_INVALID_URL out of the request handler and
+  // exit the process — stranding a system proxy pointed at a dead port.
+  assert.match(await rawRequest('GET / HTTP/1.1\r\nHost: [\r\n\r\n'), /^HTTP\/1\.1 /, 'answered');
+  assert.match(await rawRequest(`GET //[ HTTP/1.1\r\nHost: 127.0.0.1:${PORT}\r\n\r\n`), /400/);
+  assert.match(
+    await rawRequest(
+      'GET //[ HTTP/1.1\r\nHost: [\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: AAAAAAAAAAAAAAAAAAAAAA==\r\n\r\n',
+    ),
+    /400/,
+    'the upgrade path too',
+  );
+  const res = await fetch(`${ORIGIN}/api/status`, { headers: { Authorization: `Bearer ${server.token}` } });
+  assert.equal(res.status, 200, 'the runner is still up');
+});
+
+// ── a sort column never becomes SQL text ─────────────────────────────────────
+
+test('orderBy on a column whose name carries SQL sorts correctly and runs nothing', async () => {
+  // Materialized column names are raw response-body keys, and they used to be
+  // quoted with JSON.stringify — which SQLite does not read as an escape.
+  const ORDER_PORT = PORT + 9;
+  const s = new SqliteStore(':memory:');
+  const evil = 'x" , (SELECT abs(-9223372036854775808)) , "y';
+  s.db.exec(`CREATE TABLE acme_things ("id" TEXT, "${evil.replace(/"/g, '""')}" TEXT, "b""q" TEXT)`);
+  s.db.prepare('INSERT INTO acme_things VALUES (?, ?, ?)').run('1', 'C1', 'a');
+  s.db.prepare('INSERT INTO acme_things VALUES (?, ?, ?)').run('2', 'C2', 'b');
+  const srv = await startServer({ store: s, adapters: [fakeApp('acme')], port: ORDER_PORT, getSessions: () => [] });
+  const base = `http://127.0.0.1:${ORDER_PORT}/api/tables/acme_things`;
+  const auth = { Authorization: `Bearer ${srv.token}` };
+  try {
+    for (const col of [evil, 'b"q']) {
+      const res = await fetch(`${base}?orderBy=${encodeURIComponent(col)}&dir=desc`, { headers: auth });
+      assert.equal(res.status, 200, `${col} must not break the query`);
+      const body = (await res.json()) as { rows: Array<{ id: string }> };
+      assert.deepEqual(
+        body.rows.map((r) => r.id),
+        ['2', '1'],
+      );
+    }
+    const list = (await (await fetch(`http://127.0.0.1:${ORDER_PORT}/api/tables`, { headers: auth })).json()) as {
+      tables: Array<{ name: string; app: string }>;
+    };
+    assert.deepEqual(
+      list.tables.map((t) => [t.name, t.app]),
+      [['acme_things', 'acme']],
+    );
+  } finally {
+    await srv.close();
+    s.close();
+  }
+});
+
+// ── flow listings are secret-free projections ────────────────────────────────
+
+test('/api/flows and /api/flow-templates carry summaries, never a literal param value', async () => {
+  store.upsertFlow({
+    id: 'flow-api',
+    adapterId: 'slack',
+    primaryCaptureId: 'c1',
+    startedAt: 1,
+    endedAt: 2,
+    source: 'observed',
+    steps: [{ captureId: 'c1', seq: 0, role: 'primary', operation: 'conversations.list', required: true }],
+  });
+  store.upsertFlowTemplate({
+    id: 'tmpl-api',
+    adapterId: 'slack',
+    primaryKey: 'conversations.list',
+    sampleCount: 1,
+    version: 1,
+    learnedAt: 1,
+    flowParams: [],
+    steps: [
+      {
+        seq: 0,
+        role: 'primary',
+        method: 'POST',
+        path: '/api/conversations.list',
+        operation: 'conversations.list',
+        required: true,
+        support: 1,
+        delayMsP50: 0,
+        params: { team: { kind: 'literal', value: 'synthetic-literal-value-0000' } },
+      },
+    ],
+  });
+  const auth = { Authorization: `Bearer ${server.token}` };
+  const flows = (await (await fetch(`${ORIGIN}/api/flows`, { headers: auth })).json()) as {
+    flows: Array<{ id: string; primaryOp?: string; stepCount: number }>;
+  };
+  const f = flows.flows.find((x) => x.id === 'flow-api');
+  assert.equal(f?.primaryOp, 'conversations.list');
+  assert.equal(f?.stepCount, 1);
+
+  const res = await fetch(`${ORIGIN}/api/flow-templates`, { headers: auth });
+  const text = await res.text();
+  assert.ok(!text.includes('synthetic-literal-value-0000'), 'a literal param value is captured text');
+});
+
+test('lists and WebSocket frames carry body previews; the full body comes by id', async () => {
+  const PREVIEW_PORT = PORT + 11;
+  const big = `{"blob":"${'x'.repeat(200 * 1024)}"}`;
+  const s = new SqliteStore(':memory:');
+  s.insertCapture(capture({ id: 'big-old', resBody: big }));
+  const srv = await startServer({ store: s, adapters: [], port: PREVIEW_PORT, getSessions: () => [] });
+  const origin = `http://127.0.0.1:${PREVIEW_PORT}`;
+  const c = await subscribed({ port: PREVIEW_PORT, token: srv.token });
+  try {
+    srv.ingest(capture({ id: 'big-new', resBody: big }));
+    await settle();
+    const frames = [
+      ...backfilled(c).filter((x) => x.id === 'big-old'),
+      ...c.frames.filter((f) => f.type === 'capture.new').map((f) => f.capture as Capture),
+    ];
+    assert.equal(frames.length, 2, 'one backfilled and one streamed');
+    for (const f of frames) {
+      assert.ok((f.resBody ?? '').length <= 64 * 1024, `${f.id} carries at most 64 KiB`);
+      assert.equal(f.bodyLengths?.res, big.length, 'the preview still knows the real size');
+    }
+
+    const get = async (path: string): Promise<Record<string, unknown>> =>
+      (await (await fetch(`${origin}${path}`, { headers: { Origin: origin, Authorization: `Bearer ${srv.token}` } })).json()) as Record<string, unknown>;
+    const listed = (await get('/api/captures')).captures as Capture[];
+    assert.ok(listed.every((x) => (x.resBody ?? '').length <= 64 * 1024 && x.bodyLengths !== undefined));
+    const full = await get('/api/captures/big-old/body');
+    assert.equal(full.resBody, big, 'the body endpoint returns it whole');
+    assert.equal(s.getCapture('big-new')?.resBody, big, 'the store keeps it whole');
+  } finally {
+    c.close();
+    await srv.close();
     s.close();
   }
 });

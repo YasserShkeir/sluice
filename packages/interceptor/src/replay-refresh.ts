@@ -2,42 +2,20 @@
 /**
  * 401 → re-extract the local credential → retry once.
  *
- * This is what the roadmap chose INSTEAD of a keychain-backed credential vault.
- * A vault would make an agent workflow survive cookie expiry, but it would also
- * make `~/.sluice/sluice.db` a durable store of live sessions for every app you
- * have ever used — and SECURITY.md leads with the opposite claim, that the store
- * has nowhere to put a secret. That is not an implementation gap; it is why the
- * threat model is small. Re-extracting per call is slower and strictly safer:
- * the OS already solves storage, and it already asks permission.
+ * Re-extracting instead of keeping a credential vault: a vault would make the
+ * store a durable home for live sessions, and the store must have nowhere to put
+ * a secret (SECURITY.md). This function stores nothing. It re-runs the app's own
+ * extractor (the same consent boundary as the first call) and discards the
+ * fresh Session after the retry.
  *
- * So this function stores nothing. It re-runs the app's own extractor, which is
- * the same consent boundary as the first call, and throws the fresh Session away
- * as soon as the retry completes.
- *
- * ── Why it lives ABOVE runReplay, and must ─────────────────────────────────
- *
- * `withReplaySlot` chains on a module-level in-flight promise that only settles
- * once the current replay resolves. Calling `runReplay` again from inside
- * anything `runReplay` invoked — a hook, a callback, an adapter method — awaits a
- * promise that is waiting on the outer call, and the process hangs with no error
- * and no stack. The retry therefore has to be a plain sequential second call
- * from a layer above, which is exactly what this is. Do not "simplify" it into
- * replay.ts.
- *
- * ── The other three rules ──────────────────────────────────────────────────
- *
- * ONCE. `replayBudget` is a process-global 60-per-60s bucket, and a sync run
- * replays N actions per session. A retry that loops turns one expired cookie
- * into a rate-limit trip mid-sync, and re-extraction can raise a Keychain
- * prompt, so a loop is also a prompt storm.
- *
- * REBUILD, never reuse. The first attempt's request carries the STALE credential
- * in its headers. Retrying with it sends the dead cookie straight back, gets the
- * same 401, and looks like the refresh did not work.
- *
- * RECORD BOTH. The failed attempt is evidence — it is what makes "your Slack
- * session expired at 14:03" answerable later. Dropping it from the store to keep
- * the audit trail tidy is exactly backwards.
+ * The retry must stay a plain sequential second call from a layer above, never
+ * moved into replay.ts: `withReplaySlot` chains on a module-level in-flight
+ * promise, so calling `runReplay` from inside anything `runReplay` invoked hangs
+ * silently. ONCE, because `replayBudget` is a process-global 60/60s bucket and a
+ * looping retry trips the rate limit mid-sync and causes a Keychain prompt storm.
+ * Rebuild and record both: see {@link RefreshableReplay.build} and
+ * {@link RefreshableReplay.record}; the failed attempt is recorded as evidence of
+ * when the session expired.
  */
 import { isAuthFailure } from '@sluice/core';
 import type { Capture, ReplayRequest, Session } from '@sluice/core';

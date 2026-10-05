@@ -1,19 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 /**
- * "Did this call fail because the session is no longer good?"
- *
- * One shared answer, because getting it wrong in either direction is expensive.
- * Too narrow and a long-running agent workflow dies on a cookie that could have
- * been re-read in a millisecond. Too broad and every ordinary 403 — a private
- * channel, a board you were removed from — triggers a Keychain prompt.
- *
- * The trap this exists to avoid: a `status === 401` check LOOKS complete and
- * silently misses Slack entirely. Slack answers an expired session with
- * **HTTP 200** and `{"ok":false,"error":"not_authed"}`, and Slack is the app with
- * the most session churn — so the naive version would have made this feature
- * look finished while the case that motivated it stayed broken.
+ * "Did this call fail because the session is no longer good?" — one shared
+ * answer. Too narrow and a workflow dies on a cookie that could be re-read; too
+ * broad and every ordinary 403 triggers a Keychain prompt. A `status === 401`
+ * check alone misses Slack, which answers an expired session with HTTP 200 and
+ * `{"ok":false,"error":"not_authed"}`.
  */
 import type { Capture } from './types.js';
+import { safeJsonObject } from './util.js';
 
 /**
  * Service-level error codes that mean "your credential is no longer valid",
@@ -40,21 +34,18 @@ const EXPIRED_CODES: ReadonlySet<string> = new Set([
   'session_expired',
 ]);
 
-/** The service's own error code, if the body carries one. Never throws. */
-function serviceErrorCode(body: string | null | undefined): string | undefined {
-  if (!body || body.length === 0 || !body.includes('"')) return undefined;
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(body);
-  } catch {
-    return undefined;
-  }
-  if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) return undefined;
-  const o = parsed as { ok?: unknown; error?: unknown };
-  // `ok: false` is the shape that makes a 200 a failure. Without it, an `error`
-  // key could just as easily be a field of a successful payload.
-  if (o.ok !== false) return undefined;
-  return typeof o.error === 'string' ? o.error : undefined;
+/**
+ * A Slack-style `{ ok:false, error?, needed?, provided? }` failure body, else
+ * undefined. Never throws. `ok: false` is what makes a 200 a failure; without
+ * it, an `error` key could just as easily be a field of a successful payload.
+ */
+export function serviceError(
+  body: string | null | undefined,
+): { error?: string; needed?: string; provided?: string } | undefined {
+  const o = body?.includes('"') ? safeJsonObject(body) : undefined;
+  if (o?.ok !== false) return undefined;
+  const s = (v: unknown): string | undefined => (typeof v === 'string' ? v : undefined);
+  return { error: s(o.error), needed: s(o.needed), provided: s(o.provided) };
 }
 
 /**
@@ -66,11 +57,6 @@ function serviceErrorCode(body: string | null | undefined): string | undefined {
  */
 export function isAuthFailure(capture: Pick<Capture, 'status' | 'resBody'>): boolean {
   if (capture.status === 401) return true;
-  const code = serviceErrorCode(capture.resBody);
+  const code = serviceError(capture.resBody)?.error;
   return code !== undefined && EXPIRED_CODES.has(code);
-}
-
-/** The service error code behind a failure, for a message a human can act on. */
-export function authFailureReason(capture: Pick<Capture, 'status' | 'resBody'>): string {
-  return serviceErrorCode(capture.resBody) ?? (capture.status === 401 ? 'HTTP 401' : 'auth failure');
 }

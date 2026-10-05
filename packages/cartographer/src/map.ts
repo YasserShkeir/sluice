@@ -8,10 +8,10 @@
  * Only names are ever collected — never a param value or a header value — so the
  * catalog cannot carry a secret.
  */
+import { headerValue, safeJsonParse } from '@sluice/core';
 import type { Capture, SqliteStore } from '@sluice/core';
 import { inferJsonSchema } from './infer.js';
 import type { JsonSchema } from './infer.js';
-import { headerValue, parseJsonValue } from './util.js';
 
 export interface ApiEndpoint {
   /** `${method} ${path}`, the group key */
@@ -44,7 +44,6 @@ const ALL = 1_000_000;
 
 /** Does a path segment look like an id we should collapse to `{id}`? */
 export function isIdLikeSegment(seg: string): boolean {
-  if (seg.length === 0) return false;
   if (/^\d{5,}$/.test(seg)) return true; // pure numeric id (5+ digits; keeps version tags like /1/, /2/)
   if (/^\d[\d.]+\d$/.test(seg)) return true; // decimal / timestamp id (e.g. 1700000000.001500)
   if (/^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/.test(seg)) {
@@ -144,24 +143,21 @@ export function buildApiMap(store: SqliteStore, opts: ApiMapOptions = {}): ApiMa
     if (c.status !== null) g.statuses.add(c.status);
     for (const h of Object.keys(c.resHeaders)) g.headers.add(h.toLowerCase());
     for (const p of requestParamNames(c)) g.params.add(p);
-    const body = parseJsonValue(c.resBody);
+    const body = safeJsonParse(c.resBody);
     if (body !== undefined) g.bodies.push(body);
   }
 
-  const endpoints: ApiEndpoint[] = [];
-  for (const [key, g] of groups) {
-    endpoints.push({
-      key,
-      method: g.method,
-      path: g.path,
-      requestParams: [...g.params].sort(),
-      responseHeaders: [...g.headers].sort(),
-      statuses: [...g.statuses].sort((a, b) => a - b),
-      hosts: [...g.hosts].sort(),
-      sampleCount: g.sampleCount,
-      responseSchema: inferJsonSchema(g.bodies),
-    });
-  }
+  const endpoints: ApiEndpoint[] = [...groups].map(([key, g]) => ({
+    key,
+    method: g.method,
+    path: g.path,
+    requestParams: [...g.params].sort(),
+    responseHeaders: [...g.headers].sort(),
+    statuses: [...g.statuses].sort((a, b) => a - b),
+    hosts: [...g.hosts].sort(),
+    sampleCount: g.sampleCount,
+    responseSchema: inferJsonSchema(g.bodies),
+  }));
   endpoints.sort((a, b) => a.key.localeCompare(b.key));
   return { endpoints, generatedAt: Date.now() };
 }

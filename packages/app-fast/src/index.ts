@@ -16,8 +16,7 @@
  * four endpoints total. The contract has to tolerate that, and this package is
  * where "tolerates it" is demonstrated rather than assumed.
  *
- * The primary export is `fastApp: App`. Lower-level helpers are re-exported for
- * direct use and testing.
+ * The primary export is `fastApp: App`.
  */
 import { arr, obj, safeJson, str } from '@sluice/adapter-sdk';
 import type {
@@ -31,11 +30,24 @@ import type {
   ParseResult,
   ReplayAction,
   ReplayRequest,
+  Workspace,
 } from '@sluice/core';
-import { FAST_FALLBACK_TOKEN, runSpeedTest } from './speedtest.js';
+import { FAST_FALLBACK_TOKEN, configUrl, runSpeedTest } from './speedtest.js';
 
 export const ADAPTER_ID = 'fast';
 const WORKSPACE_ID = 'fast';
+
+/**
+ * The one workspace every target lives in. Emitted beside its containers because
+ * nothing else ever creates it: there is no credentials provider to seed it, and
+ * a reader that walks workspaces first never reaches an orphaned container.
+ */
+const FAST_WORKSPACE: Workspace = {
+  id: WORKSPACE_ID,
+  adapterId: ADAPTER_ID,
+  name: 'fast.com',
+  domain: 'fast.com',
+};
 
 // ── Matching ─────────────────────────────────────────────────────────────────────
 
@@ -43,11 +55,6 @@ const WORKSPACE_ID = 'fast';
 const FAST_HOSTS = new Set(['fast.com', 'api.fast.com', 'nflxvideo.net']);
 
 /**
- * The `.fast.com` suffix rule this used to carry was wrong in both directions:
- * it claimed every subdomain Netflix might ever serve (including `notapi.fast.com`,
- * which is exactly the shape the conformance lookalike probe rejects) while still
- * missing the bare `nflxvideo.net` this adapter declares in `hosts`.
- *
  * Only the OCA fleet is genuinely a wildcard — every range download comes from a
  * per-POP hostname like `ipv4-c001.lhr001.ix.nflxvideo.net`. The leading dot is
  * load-bearing: a bare `endsWith('nflxvideo.net')` also accepts `notnflxvideo.net`.
@@ -62,20 +69,6 @@ function matchesFast(host: string): boolean {
 const OCA_RANGE_PATH = /\/speedtest\/range\/\d+-\d+$/;
 /** The hashed bundle `fetchToken()` scrapes the API token out of, e.g. `/app-a1b2c3.js`. */
 const APP_BUNDLE_PATH = /^\/app-[^/]+\.js$/;
-
-/**
- * The one parseable exchange. These are the three conditions `parseFastCapture`
- * used to open with; they live here so the parser and the classifier cannot
- * drift apart about what "the config call" is.
- */
-function isSpeedtestConfig(capture: Capture): boolean {
-  return (
-    capture.host === 'api.fast.com' &&
-    capture.path.startsWith('/netflix/speedtest') &&
-    typeof capture.resBody === 'string' &&
-    capture.resBody.length > 0
-  );
-}
 
 /** What an exchange DOES, named the same way whether it succeeded or failed. */
 function fastOperation(capture: Capture): string | undefined {
@@ -99,12 +92,10 @@ function fastOperation(capture: Capture): string | undefined {
  * reads only the url triple and the status code, and never touches a body, so
  * there is no shape a service can send that makes it throw.
  *
- * `binary` is the class that changes what a caller DOES. An OCA range download is
- * ~25 MiB of throwaway bytes whose entire purpose is to be timed, and keeping it
- * out of the capture store was until now enforced by a comment in `speedtest.ts`
- * and nothing else — a comment cannot stop a recorder. It is scoped to the exact
- * ranged path rather than to the whole OCA host because dropping a capture is
- * lossy, and under-claiming is the recoverable mistake.
+ * An OCA range download is ~25 MiB of throwaway bytes whose only purpose is to be
+ * timed, so it is classed `binary` to keep it out of the capture store. It is scoped
+ * to the exact ranged path rather than to the whole OCA host because dropping a
+ * capture is lossy, and under-claiming is the recoverable mistake.
  *
  * Status is decided first: a 4xx on the config endpoint carries an error body,
  * not a config, and calling that `structure` is precisely what makes `parse()`
@@ -113,7 +104,8 @@ function fastOperation(capture: Capture): string | undefined {
 export function classifyFastCapture(capture: Capture): { class: CaptureClass; operation?: string } {
   const operation = fastOperation(capture);
   if (typeof capture.status === 'number' && capture.status >= 400) return { class: 'error', operation };
-  if (isSpeedtestConfig(capture)) return { class: 'structure', operation };
+  const hasBody = typeof capture.resBody === 'string' && capture.resBody.length > 0;
+  if (operation === 'speedtest.config' && hasBody) return { class: 'structure', operation };
   if (operation === 'speedtest.range') return { class: 'binary', operation };
   if (operation === 'app.shell' || operation === 'app.bundle') return { class: 'asset', operation };
   // Includes a config call with no response body: still named `speedtest.config`
@@ -130,11 +122,7 @@ export function classifyFastCapture(capture: Capture): { class: CaptureClass; op
  * fan-out COUNT the server honours once, and the response carries no token,
  * offset or has-more flag to continue from. There is no second page to seed.
  *
- * Implemented rather than omitted on purpose. `nextCursors` is optional, so an
- * absent one is ambiguous — it reads as "nobody got round to it" exactly as much
- * as "there is nothing here to paginate". An adapter with no pagination at all is
- * a case the contract has to tolerate, and this is the only place a reader can be
- * told which of the two fast.com is.
+ * Implemented rather than omitted so readers can tell "nothing to paginate" from "not written yet".
  */
 export function fastNextCursors(): CursorSeed[] {
   return [];
@@ -148,24 +136,11 @@ export function fastNextCursors(): CursorSeed[] {
  * malformed body) yields an empty ParseResult.
  */
 export function parseFastCapture(capture: Capture): ParseResult {
-  // `structure` IS the triple guard this used to inline; re-testing host, path
-  // and body here would be a second copy of the rule, free to drift.
   if (classifyFastCapture(capture).class !== 'structure') return {};
-
-  // A body that is not JSON at all is a different answer from a config with no
-  // targets in it, and `safeJson` collapses both to `undefined` — so the
-  // not-JSON case is separated out here to keep returning the empty ParseResult
-  // it always has.
+  // Not JSON returns the empty result. arr() rather than ?? []: a present-but-non-array
+  // `targets` (a map keyed by index) would throw in for...of.
   const body = safeJson(capture.resBody);
   if (body === undefined) return {};
-
-  // Regression, twice over. `JSON.parse(… ?? 'null')` typed as `FastConfig`
-  // meant a 200 whose body is literally `null` died on the `.targets` read that
-  // sat OUTSIDE the try; widening the type to `| null` fixed that one and left
-  // the second, which `?? []` cannot reach: `targets` sent as an object (a map
-  // keyed by index — real APIs do this) is PRESENT, so `??` passes it straight
-  // through and `for…of` throws "object is not iterable" into the ingest funnel.
-  // Only `arr()` rejects a present-but-wrong-typed field.
   const containers: Container[] = [];
   for (const target of arr(obj(body)?.targets) ?? []) {
     const t = obj(target);
@@ -181,7 +156,7 @@ export function parseFastCapture(capture: Capture): ParseResult {
       raw: t,
     });
   }
-  return { containers };
+  return containers.length > 0 ? { workspaces: [FAST_WORKSPACE], containers } : { containers };
 }
 
 // ── Replay ───────────────────────────────────────────────────────────────────────
@@ -199,12 +174,7 @@ const FAST_REPLAY_ACTIONS: ReplayAction[] = [
 
 /** GET the config URL. No credentials — the session argument is ignored. */
 function buildReplayRequest(action: ReplayAction, params: Record<string, string>): ReplayRequest {
-  const token = params.token && params.token.length > 0 ? params.token : FAST_FALLBACK_TOKEN;
-  const u = new URL(action.urlTemplate);
-  u.searchParams.set('https', 'true');
-  u.searchParams.set('token', token);
-  u.searchParams.set('urlCount', '5');
-  return { method: action.method, url: u.toString(), headers: {} };
+  return { method: action.method, url: configUrl(params.token || FAST_FALLBACK_TOKEN), headers: {} };
 }
 
 // ── MCP tool ───────────────────────────────────────────────────────────────────────
@@ -223,10 +193,8 @@ const fastMcpTools: AppMcpTool[] = [
 /**
  * fast.com's `token` query param is PUBLIC — it is served in the page's own JS
  * bundle to anyone who loads fast.com, and the speedtest API rejects a request
- * without it. The generic redactor masks any `token=…`, which made every
- * captured fast.com URL unreproducible and forced `speedtest.ts` to re-scrape
- * the token from the HTML on each run. Declaring it public keeps the capture
- * faithful; there is no secret here to protect.
+ * without it. The generic redactor masks any `token=…`. Declaring it public keeps
+ * the capture faithful; there is no secret here to protect.
  */
 const fastRedaction: AppRedaction = {
   publicParams: [{ hosts: ['fast.com', 'nflxvideo.net'], params: ['token'] }],
@@ -239,36 +207,12 @@ export const fastApp: App = {
   id: ADAPTER_ID,
   displayName: 'Fast.com',
   hosts: ['fast.com', 'api.fast.com', 'nflxvideo.net'],
-  matchRequest(input) {
-    return matchesFast(input.host);
-  },
-  parse(capture) {
-    return parseFastCapture(capture);
-  },
-  classify(capture) {
-    return classifyFastCapture(capture);
-  },
-  nextCursors() {
-    return fastNextCursors();
-  },
-  listReplayActions() {
-    return FAST_REPLAY_ACTIONS;
-  },
+  matchRequest: (input) => matchesFast(input.host),
+  parse: parseFastCapture,
+  classify: classifyFastCapture,
+  nextCursors: fastNextCursors,
+  listReplayActions: () => FAST_REPLAY_ACTIONS,
   buildReplayRequest,
-  mcpTools() {
-    return fastMcpTools;
-  },
+  mcpTools: () => fastMcpTools,
   redaction: fastRedaction,
 };
-
-// ── Named re-exports ───────────────────────────────────────────────────────────────
-export {
-  runSpeedTest,
-  rangeUrl,
-  fetchToken,
-  fetchConfig,
-  configUrl,
-  measureDownload,
-  FAST_FALLBACK_TOKEN,
-} from './speedtest.js';
-export type { FastConfig, FastTarget, SpeedTestResult } from './speedtest.js';

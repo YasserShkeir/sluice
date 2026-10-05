@@ -20,13 +20,9 @@ import { fileURLToPath } from 'node:url';
 import { makeCapture, parseNdjson } from '@sluice/adapter-sdk';
 import { readOnlyStore, SqliteStore } from '@sluice/core';
 import type { AppMcpTool, AppToolContext, Capture } from '@sluice/core';
-import {
-  accountWorkspaceId,
-  containerKind,
-  gmailApp,
-  parseGmailCapture,
-  reconcileGmailAccounts,
-} from './index.js';
+import { accountWorkspaceId, containerKind, parseGmailCapture } from './gmail-adapter.js';
+import { gmailApp } from './index.js';
+import { reconcileGmailAccounts } from './reconcile.js';
 
 // ── The store under test ─────────────────────────────────────────────────────────
 
@@ -513,6 +509,15 @@ test("both accounts' inboxes survive as separate containers", async () => {
   // Every label in the recording repeats, and none of them lost a row.
   assert.equal(new Set(labels.map((l) => l.containerId)).size, labels.length);
   assert.equal(new Set(labels.map((l) => l.id)).size * 2, labels.length);
+  // `held` is an exact count of the rows under each label, and each account's
+  // own — counted, not read back as up to 20k full rows per label and measured.
+  const held = labels as Array<LabelRow & { held: number }>;
+  for (const label of held) {
+    assert.equal(label.held, store.countItems({ containerId: label.containerId }), label.containerId);
+  }
+  for (const inbox of held.filter((l) => l.id === '^i')) {
+    assert.ok(inbox.held > 0, `precondition: ${inbox.containerId} holds the recorded threads`);
+  }
   store.close();
 });
 
@@ -822,6 +827,10 @@ test('gmail_get_thread says so when the thread was listed but never fetched', as
   assert.deepEqual(thread.messages, []);
   assert.equal(thread.messagesHeld, 0);
   assert.match(String(thread.note), /has not captured/);
+  // Only advice the caller can act on: Gmail offers no replay action (nothing can
+  // supply its session), and a `bv` replay carries no bodies anyway — only `fd` does.
+  assert.ok(!String(thread.note).includes('gmail.threads.list'), 'the note points at no replay action');
+  assert.match(String(thread.note), /Open the thread in Gmail/);
   // Still useful: what the batch view DID say survives, so the answer is "here is
   // what is known and how to get the rest" rather than a bare empty list.
   assert.equal(thread.subject, unfetched.subject);

@@ -45,7 +45,7 @@ const SESSION: Session = {
   credentials: {
     kind: 'linkedin-session',
     values: {
-      cookieHeader: 'li_at=REAL; JSESSIONID="ajax:TESTCSRF"',
+      cookieHeader: 'li_at=FAKE-LI-AT; JSESSIONID="ajax:TESTCSRF"',
       csrfToken: 'ajax:TESTCSRF',
     },
     injection: {
@@ -291,6 +291,26 @@ test('buildReplayRequest injects Cookie and csrf-token', () => {
   assert.equal(jreq.headers?.['csrf-token'], 'ajax:TESTCSRF');
 });
 
+test('jobs.search escapes keywords so they cannot add query params or a fragment', () => {
+  const jobs = linkedinAdapter.listReplayActions().find((a) => a.id === 'linkedin.jobs.search')!;
+  const keys = (url: string) => [...new URL(url).searchParams.keys()].sort();
+
+  const req = buildLinkedInReplayRequest(jobs, { keywords: 'a&b (c)#d' }, SESSION);
+  // On the RAW url: searchParams would hand back the decoded value.
+  assert.ok(req.url.includes('keywords:a%26b%20%28c%29%23d'), req.url);
+  assert.equal(new URL(req.url).hash, '');
+  assert.equal(new URL(req.url).searchParams.getAll('count').length, 1);
+
+  for (const keywords of ['a)&q=x#', 'C#', "x',start:99)&decorationId=Y"]) {
+    const u = buildLinkedInReplayRequest(jobs, { keywords }, SESSION).url;
+    assert.deepEqual(keys(u), ['count', 'decorationId', 'q', 'query', 'start'], u);
+    assert.equal(new URL(u).hash, '');
+    const query = new URL(u).searchParams.get('query') ?? '';
+    assert.ok(query.endsWith(',spellCorrectionEnabled:true)'), query);
+    assert.equal(new URL(u).searchParams.get('q'), 'jobSearch');
+  }
+});
+
 test('csrfTokenFromCookieHeader reads quoted JSESSIONID', () => {
   assert.equal(
     csrfTokenFromCookieHeader('li_at=x; JSESSIONID="ajax:ABC123"; foo=bar'),
@@ -313,6 +333,19 @@ test('extractCredentialHints reports presence without secrets', () => {
   for (const h of hints) {
     assert.ok(!h.valuePreview.includes('ajax:'));
   }
+});
+
+test('an unredacted credential hint previews a head only, and a short one nothing', () => {
+  const csrf = `ajax:${'0123456789abcdefghijklmno'}`; // 30 chars, synthetic
+  const [long] = extractLinkedInCredentialHints(capture({ reqHeaders: { 'csrf-token': csrf } }));
+  assert.ok(long);
+  assert.ok(long.valuePreview.startsWith(csrf.slice(0, 6)));
+  assert.ok(long.valuePreview.includes('…(+24)'), long.valuePreview);
+  assert.ok(long.valuePreview.length <= 64);
+  assert.ok(!long.valuePreview.includes(csrf));
+
+  const [short] = extractLinkedInCredentialHints(capture({ reqHeaders: { 'csrf-token': 'ajax:12345' } }));
+  assert.equal(short?.valuePreview, '«present»');
 });
 
 test('MCP tools are named linkedin_* and declare schemas', () => {
@@ -341,6 +374,27 @@ test('MCP store tools refuse without store and empty-store safely', async () => 
   assert.equal(out.jobs, 0);
   assert.equal(out.items, 0);
   assert.equal(out.captures, 0);
+});
+
+test('linkedin_fetch_me runs the declared me action under the host session, never a bare replay', async () => {
+  const fetchMe = linkedinMcpTools().find((t) => t.name === 'linkedin_fetch_me')!;
+  const calls: Array<{ actionId: string; params?: Record<string, string> }> = [];
+  const out = (await fetchMe.run(
+    {},
+    {
+      replay: async () => {
+        throw new Error('a bare replay injects no session');
+      },
+      replayAction: async (actionId, params) => {
+        calls.push({ actionId, params });
+        return { ...capture(), id: 'cap-me', status: 200 };
+      },
+    },
+  )) as { status: number; captureId: string };
+  assert.deepEqual(calls, [{ actionId: 'linkedin.me', params: undefined }]);
+  assert.equal(out.status, 200);
+  assert.equal(out.captureId, 'cap-me');
+  await assert.rejects(() => fetchMe.run({}, { replay: async () => capture() }), /replayAction/);
 });
 
 test('app exports id linkedin and mcpTools', () => {

@@ -10,10 +10,7 @@
  * half-HTML-parser on Gmail's account.
  *
  * The contract is the same one `parse` has: TOTAL. It runs inside the ingest
- * funnel on a string Google controls, so every branch has to end in a string —
- * which is why entity decoding is guarded rather than trusting
- * `String.fromCodePoint`, whose contract is to THROW `RangeError` on a code
- * point above 0x10FFFF. `&#9999999;` is four keystrokes in a marketing email.
+ * funnel on a string Google controls, so every branch has to end in a string.
  *
  * It is deliberately not a parser. It does not resolve nesting, it does not know
  * that `<td>` implies a column, and it will happily flatten a layout table into
@@ -83,19 +80,15 @@ const NAMED_ENTITIES = new Map<string, string>([
   ['pound', 'GBP'],
 ]);
 
-const MAX_CODE_POINT = 0x10_ff_ff;
-
 /** One entity → its character, or the entity verbatim when it is not one we know. */
 function decodeEntity(match: string, body: string): string {
   const lower = body.toLowerCase();
   if (lower.startsWith('#')) {
     const digits = lower.startsWith('#x') ? body.slice(2) : body.slice(1);
     const code = Number.parseInt(digits, lower.startsWith('#x') ? 16 : 10);
-    // The guards are the whole reason this is a function: `fromCodePoint` throws
-    // on a value out of range or a lone surrogate, and a throw here is a throw in
-    // the ingest funnel.
-    if (!Number.isInteger(code) || code <= 0 || code > MAX_CODE_POINT) return match;
-    if (code >= 0xd8_00 && code <= 0xdf_ff) return match;
+    // `fromCodePoint` throws above 0x10FFFF (caught below) but happily returns NUL and lone
+    // surrogates, so those stay verbatim; a throw here is a throw in the ingest funnel.
+    if (!(code > 0) || (code >= 0xd8_00 && code <= 0xdf_ff)) return match;
     try {
       return String.fromCodePoint(code);
     } catch {

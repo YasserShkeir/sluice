@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 /**
- * Bundle the two shipping entrypoints into runnable JavaScript.
+ * Bundle the four shipping entrypoints into runnable JavaScript.
  *
  * Until now the `bin` fields pointed at `.ts` files carrying a `#!/usr/bin/env
  * node` shebang, which crash with ERR_UNKNOWN_FILE_EXTENSION the moment anything
@@ -48,6 +48,9 @@ const external = [
   'zod',
   '@modelcontextprotocol/sdk',
   '@modelcontextprotocol/sdk/*',
+  // The source graph uses the compiler API at runtime. Keep the installed
+  // compiler external instead of adding ~20 MB to its local MCP bundle.
+  'typescript',
 ];
 
 const targets = [
@@ -63,6 +66,15 @@ const targets = [
   {
     entry: 'packages/mcp/src/cli.ts',
     outdir: 'packages/mcp/dist',
+    bin: 'cli.js',
+    external: [...external, 'mockttp'],
+  },
+  // Source architecture and GraphRAG retrieval live in a separate process and
+  // database from captured SaaS data. This entry never imports app adapters or
+  // the runtime capture store.
+  {
+    entry: 'packages/project-graph/src/cli.ts',
+    outdir: 'packages/project-graph/dist',
     bin: 'cli.js',
     external: [...external, 'mockttp'],
   },

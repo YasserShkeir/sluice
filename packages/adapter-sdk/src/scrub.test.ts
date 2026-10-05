@@ -74,6 +74,15 @@ const BV_BODY: unknown[] = [
 /** The real endpoint answers without a preamble; checkbuild answers with one. */
 const PREAMBLE = ")]}'\n\n";
 
+/**
+ * Gmail's `x-framework-xsrf-token` SHAPE — `<34-character token>:<epoch ms>` —
+ * with an obviously synthetic token, so no real session value sits in source.
+ */
+const XSRF_TOKEN = 'SYNTHETICxsrfTOKENforSCRUBtests000';
+
+/** One fixed salt and shift, for the tests that are about determinism. */
+const FIXED = { salt: 'scrub-test-salt', shiftMs: -40_000_000_000 };
+
 function bvCapture(over: Partial<Capture> = {}): Capture {
   return makeCapture({
     host: 'mail.google.com',
@@ -85,7 +94,7 @@ function bvCapture(over: Partial<Capture> = {}): Capture {
       'content-type': 'application/json',
       cookie: MASK,
       referer: 'https://mail.google.com/mail/u/0/?compose=new',
-      'x-framework-xsrf-token': 'SYNTHETICxsrfTOKENforSCRUBtests000:1700000000123',
+      'x-framework-xsrf-token': `${XSRF_TOKEN}:1700000000123`,
     },
     reqBody: JSON.stringify([[9, 9, null, 'ji:^i', THREAD_ID]]),
     resHeaders: { 'content-type': 'application/json; charset=utf-8', 'set-cookie': MASK },
@@ -194,7 +203,7 @@ test('a session token that looks like a prefixed id is replaced, not preserved',
   // `<34-char token>:<epoch ms>` matched an unbounded `<name>:<digits>` rule and
   // was written into the fixture verbatim. The prefix bound is what stops it.
   const scrubbed = scrubOne(bvCapture());
-  assert.ok(!JSON.stringify(scrubbed).includes('SYNTHETICxsrfTOKENforSCRUBtests000'));
+  assert.ok(!JSON.stringify(scrubbed).includes(XSRF_TOKEN));
 });
 
 test('redaction masks are left exactly as the redactor wrote them', () => {
@@ -225,7 +234,8 @@ test('thread and message id FORM survives, with different digits of the same len
 });
 
 test('epoch-ms numbers shift by one constant, so ordering and gaps survive', () => {
-  const scrubbed = bodyJson(scrubOne(bvCapture()).resBody) as unknown[];
+  const capture = scrubOne(bvCapture());
+  const scrubbed = bodyJson(capture.resBody) as unknown[];
   const before = [1_700_000_100_000, 1_700_000_100_500, 1_700_000_101_000, 1_700_000_200_000];
   const found: number[] = [];
   (function walk(v: unknown): void {
@@ -238,7 +248,7 @@ test('epoch-ms numbers shift by one constant, so ordering and gaps survive', () 
   for (let i = 0; i < before.length; i++) {
     assert.equal(found[i], (before[i] ?? 0) + shift, 'one constant offset, or the gaps are lost');
   }
-  assert.equal(scrubOne(bvCapture()).ts, 1_700_000_400_000 + shift, 'the capture ts shifts with them');
+  assert.equal(capture.ts, 1_700_000_400_000 + shift, 'the capture ts shifts with them');
 });
 
 test('non-timestamp numbers pass through — a parser branching on kind === 2 needs 2', () => {
@@ -365,7 +375,128 @@ test('a URL keeps its exact length, whatever is nested inside it', () => {
   }
   assert.ok(!JSON.stringify(after).includes('hunter2'), 'userinfo is a credential');
   assert.ok(!JSON.stringify(after).includes('AbC123'), 'a tracking token is the user');
-  assert.ok(after[6]?.includes('?flag&'), 'a bare flag is a param name, not a value');
+  assert.match(after[6] ?? '', /\?[A-Za-z-]{4}&b=/, 'a bare flag keeps its length and its place');
+});
+
+// ── Nested and encoded URLs ──────────────────────────────────────────────────
+//
+// The regression: a redirect wrapper's inner URL whose own query was encoded
+// (`?email_token%3D…%26oid%3D…`) is ONE query part with no `=`, and a part with
+// no `=` passed through as a "bare flag" — so the whole encoded query, tokens
+// and all, rode into a published fixture with only `%` turned into `-`. Every
+// value below is synthetic.
+
+/** Scrub each string as an embedded URL (a body value) and return them in order. */
+function scrubEmbedded(urls: string[]): string[] {
+  return bodyJson(scrubOne(bvCapture({ resBody: JSON.stringify(urls) })).resBody) as string[];
+}
+
+const SECRETS = [
+  'SYNTHTOKENalpha0001',
+  'SYNTHTOKENbravo0002',
+  'SYNTHTOKENcharlie03',
+  'SYNTHSIGdelta0004',
+  '5550001234',
+  'travel.invalid',
+  'targetUrl',
+];
+
+test('tokens inside an encoded redirect never survive, at any encoding depth', () => {
+  const urls = [
+    // Percent-encoded inner query under a literal inner URL: the leak as found.
+    'https://www.google.com/url?q=https://m.shop.invalid/o/827?email_token%3DSYNTHTOKENalpha0001%26oid%3D5550001234&sa=D',
+    // The whole inner URL percent-encoded, and double-encoded one level down.
+    'https://www.google.com/url?q=https%3A%2F%2Fshop.invalid%2Fr%3FtargetUrl%3Dhttps%253A%252F%252Ftravel.invalid%252Fb%253Forderid%253D5550001234%2526sig%253DSYNTHSIGdelta0004',
+    // The `-3D`/`-26` form an earlier scrub left in a committed fixture, as a
+    // bare flag and with a later `=` that pulls it into the NAME position.
+    'https://joh.example.invalid/Iin?q=https://m.shop.invalid/o/827?email_token-3DSYNTHTOKENbravo0002-26v-3D5550001234',
+    'https://joh.example.invalid/Iin?q=https://m.shop.invalid/o/1?accesstoken-3DSYNTHTOKENcharlie03-26x=1',
+    // SendGrid-style click link: `-2F`, `-3D` escapes in one opaque value.
+    'https://u1.ct.sendgrid.invalid/ls/click?upn=u001.targetUrl-3Dhttps-253A-252F-252Ftravel.invalid-252F-253Ftoken-253DSYNTHTOKENalpha0001',
+  ];
+  const after = scrubEmbedded(urls);
+  const text = JSON.stringify(after);
+  for (const secret of SECRETS) assert.ok(!text.includes(secret), `${secret} survived the scrub`);
+  for (let i = 0; i < urls.length; i++) {
+    assert.equal(after[i]?.length, urls[i]?.length, `url ${i} changed length`);
+  }
+});
+
+test('the same holds for the capture’s own url, its :path, its path and its referer', () => {
+  const query = '?q=https://m.shop.invalid/o/827?email_token%3DSYNTHTOKENalpha0001%26oid%3D5550001234';
+  const scrubbed = scrubOne(
+    bvCapture({
+      url: `https://mail.google.com/mail/u/0/${query}`,
+      path: `/mail/u/0/${query}`,
+      reqHeaders: {
+        ':path': `/mail/u/0/${query}`,
+        referer: `https://mail.google.com/mail/u/0/${query}`,
+      },
+    }),
+  );
+  const text = JSON.stringify(scrubbed);
+  for (const secret of SECRETS) assert.ok(!text.includes(secret), `${secret} survived the scrub`);
+  assert.ok(scrubbed.url.startsWith('https://mail.google.com/mail/u/0/?q=https://'), 'the route survives');
+  assert.ok(scrubbed.path.startsWith('/mail/u/0/?q='), 'so does the path’s');
+});
+
+test('a bare query flag is scrubbed like a value, not kept as a name', () => {
+  const [after] = scrubEmbedded(['https://files.example.invalid/dl?SYNTHTOKENalpha0001&b=2']);
+  assert.ok(after);
+  assert.ok(!after.includes('SYNTHTOKENalpha0001'));
+  assert.match(after, /\?[A-Za-z-]{19}&b=.$/, 'its length and place survive, and b is still b');
+});
+
+test('a param NAME survives only while it looks like one', () => {
+  // A base64 JSON blob with `=` padding puts the whole token in the name slot.
+  const blob = 'eyJzeW50aGV0aWMiOiJmaXh0dXJlLXN0YXRlIn0';
+  const [after] = scrubEmbedded([`https://example.invalid/cb?${blob}=&state_id=abc&f.sid=1&x-y_z=2`]);
+  assert.ok(after);
+  assert.ok(!after.includes(blob), 'a base64 JSON blob is a token wherever it sits');
+  assert.match(after, /&state_id=[^&]{3}&f\.sid=.&x-y_z=.$/, 'real names are the API');
+});
+
+test('a base64 JSON blob in the capture’s own path is scrubbed; the rest of the route is not', () => {
+  const blob = 'eyJzeW50aGV0aWMiOiJmaXh0dXJlLXN0YXRlIn0';
+  const scrubbed = scrubOne(bvCapture({ url: `https://mail.google.com/mail/u/0/s/${blob}/x` }));
+  assert.ok(!scrubbed.url.includes(blob));
+  assert.ok(scrubbed.url.startsWith('https://mail.google.com/mail/u/0/s/'));
+  assert.ok(scrubbed.url.endsWith('/x'));
+  assert.equal(scrubbed.url.length, `https://mail.google.com/mail/u/0/s/${blob}/x`.length);
+});
+
+test('tabUrl is the user’s page, not a route: its host and path are scrubbed too', () => {
+  const tabUrl = 'https://www.notes.invalid/Quarterly-hedgehog-census-plan-0123abcd?pvs=4';
+  const scrubbed = scrubOne(bvCapture({ tabUrl }));
+  assert.equal(scrubbed.tabUrl?.length, tabUrl.length);
+  assert.ok(scrubbed.tabUrl?.startsWith('https://'));
+  assert.ok(!scrubbed.tabUrl?.includes('notes'));
+  assert.ok(!scrubbed.tabUrl?.includes('hedgehog'));
+});
+
+test('a caret passes through only when it is label-shaped', () => {
+  const [after] = scrubEmbedded(['^tok%3DSYNTHTOKENalpha0001']);
+  assert.ok(after && !after.includes('SYNTHTOKENalpha0001'));
+});
+
+test('a redirect chain nested past any real depth is bounded, not a stack overflow', () => {
+  const deep = `${'https://r.example.invalid/?q='.repeat(5_000)}SYNTHTOKENalpha0001`;
+  let after: string[] = [];
+  assert.doesNotThrow(() => {
+    after = scrubEmbedded([deep]);
+  });
+  assert.equal(after[0]?.length, deep.length);
+  assert.ok(!after[0]?.includes('SYNTHTOKENalpha0001'));
+});
+
+test('JSON nested past the recursion limit degrades to opaque text, not a throw', () => {
+  const body = `${'['.repeat(20_000)}"SYNTHTOKENalpha0001"${']'.repeat(20_000)}`;
+  let scrubbed: Capture | undefined;
+  assert.doesNotThrow(() => {
+    scrubbed = scrubOne(bvCapture({ resBody: body }));
+  });
+  assert.equal(scrubbed?.resBody?.length, body.length);
+  assert.ok(!scrubbed?.resBody?.includes('SYNTHTOKENalpha0001'));
 });
 
 test('a header value that is protocol vocabulary is not scrambled', () => {
@@ -381,19 +512,35 @@ test('a header value that is protocol vocabulary is not scrambled', () => {
 
 // ── Determinism ──────────────────────────────────────────────────────────────
 
-test('the same recording scrubs to the same bytes, so a re-scrub is an empty diff', () => {
+test('a fixed salt and shift scrub the same recording to the same bytes', () => {
   // Pinned ids: makeCapture hands out a fresh one per call, and this is about
   // the scrubber's determinism, not the factory's.
-  const a = scrubCaptures([bvCapture({ id: 'cap_pinned' })]);
-  const b = scrubCaptures([bvCapture({ id: 'cap_pinned' })]);
+  const a = scrubCaptures([bvCapture({ id: 'cap_pinned' })], FIXED);
+  const b = scrubCaptures([bvCapture({ id: 'cap_pinned' })], FIXED);
   assert.equal(JSON.stringify(a), JSON.stringify(b));
+  assert.equal(a[0]?.ts, 1_700_000_400_000 + FIXED.shiftMs, 'an explicit shift is the shift');
 });
 
 test('a salt changes the synthetic text without changing the shape', () => {
-  const plain = scrubCaptures([bvCapture()])[0];
-  const salted = scrubCaptures([bvCapture()], { salt: 'gmail-2026' })[0];
-  assert.notEqual(plain?.resBody, salted?.resBody, 'two fixtures must not line up against each other');
-  assert.equal(shapeOf(bodyJson(salted?.resBody ?? null)), shapeOf(BV_BODY));
+  const one = scrubCaptures([bvCapture()], { ...FIXED, salt: 'salt-one' })[0];
+  const two = scrubCaptures([bvCapture()], { ...FIXED, salt: 'salt-two' })[0];
+  assert.notEqual(one?.resBody, two?.resBody, 'two fixtures must not line up against each other');
+  assert.equal(shapeOf(bodyJson(two?.resBody ?? null)), shapeOf(BV_BODY));
+});
+
+test('the default salt and shift are random per run, so neither is a published constant', () => {
+  // A fixed default salt let anyone scrub a guessed name or address and look
+  // for the result in a published fixture; a fixed shift made every date exact.
+  const a = scrubOne(bvCapture({ id: 'cap_pinned' }));
+  const b = scrubOne(bvCapture({ id: 'cap_pinned' }));
+  assert.notEqual(a.resBody, b.resBody, 'the default salt must not be shared between runs');
+  assert.notEqual(a.ts, b.ts, 'the default shift must not be shared between runs');
+  for (const c of [a, b]) {
+    const back = 1_700_000_400_000 - c.ts;
+    assert.ok(back >= 180 * 86_400_000 && back <= 730 * 86_400_000, 'shifted 180–730 days back');
+    assert.equal(back % 1000, 0, 'whole seconds, so ms and seconds copies still agree');
+    assert.equal(shapeOf(bodyJson(c.resBody)), shapeOf(BV_BODY));
+  }
 });
 
 test('equal inputs scrub to equal outputs, so a repeated id stays repeated', () => {

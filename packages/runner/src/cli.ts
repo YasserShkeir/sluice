@@ -3,29 +3,47 @@
 /**
  * `sluice` — the local-only capture daemon + one-shot commands.
  *
- * Commands: doctor | extract-token | serve | start | replay | export
+ * Commands: see USAGE (dispatched by main()).
  *
  * Secrets rule, enforced everywhere below: the live Session (token + `d` cookie)
  * lives only in this process's memory. Only a RedactedSession is ever written to
- * SQLite, and error strings pass through `redactText` before printing.
+ * SQLite, every capture is stored through the redacting funnel (core persistCapture), and
+ * error strings pass through `errMsg` (core's redacting message) before printing.
  */
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawnSync } from 'node:child_process';
 import { closeSync, existsSync, mkdirSync, openSync, readFileSync, rmSync, statSync, writeFileSync, writeSync } from 'node:fs';
-import { homedir } from 'node:os';
+import { connect, createConnection, isIP } from 'node:net';
+import { homedir, networkInterfaces } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import process from 'node:process';
 import { fileURLToPath } from 'node:url';
 import { parseArgs } from 'node:util';
 
-import { redactHeaders, redactSession, redactText, redactUrl, SqliteStore } from '@sluice/core';
+import {
+  redactedErrorMessage as errMsg,
+  containerWorkspace,
+  KEYCHAIN_ALLOW_ADVICE,
+  matchAdapter,
+  paramSourcesSummary,
+  persistCapture,
+  primaryOperation,
+  redactCapture,
+  redactSession,
+  restrictToOwner,
+  SqliteStore,
+  sweepStaleTempDirs,
+  templateStepSummary,
+  workspaceOfParams,
+  workspaceOfValues,
+} from '@sluice/core';
 import type {
   Actor,
   App,
   Capture,
   Container,
+  CredentialHint,
   EngineStatus,
   Item,
-  ParseResult,
   Session,
   WorkItem,
   Workspace,
@@ -38,7 +56,7 @@ import {
   installExternalAdapters,
   readEnabledAdapterIds,
 } from '@sluice/apps';
-import { runMockCaptures } from '@sluice/adapter-sdk';
+import { isoTime, runMockCaptures } from '@sluice/adapter-sdk';
 import {
   CdpEngine,
   defaultChromeProfileDir,
@@ -46,22 +64,35 @@ import {
   sluiceCaCertPath,
   launchDebugChrome,
   mapAuthFlow,
+  LAN_LISTEN_HOST,
   MitmEngine,
+  NEVER_DECRYPT_HOSTS,
   reconstructCredentials,
   ReplayDeniedError,
-  resolveJsonPath,
   runFlowReplay,
-  runReplay,
   superviseEngine,
 } from '@sluice/interceptor';
-import type { LaunchedChrome, Supervisor } from '@sluice/interceptor';
-import { buildApiMap, buildFlowStepRequest, clusterCapturesIntoFlows, faithfulReplayRequest, learnFlowTemplates, materialize, renderMarkdown } from '@sluice/cartographer';
+import type { LaunchedChrome } from '@sluice/interceptor';
+import { buildApiMap, clusterCapturesIntoFlows, learnFlowTemplates, materializeIncremental, rebuildMaterialized, renderMarkdown } from '@sluice/cartographer';
 
+import { printSecretLines } from './banner.js';
 import * as config from './config.js';
+import { writePrivateFile } from './config.js';
+import { apiErrorText, drainOutcome } from './drain-outcome.js';
 import { readNdjsonFile } from './ndjson-file.js';
-import { clearProxy, detectNetworkService, getProxyState, setProxy } from './proxy.js';
+import {
+  anonymousSession,
+  defaultParams,
+  findReplayAction,
+  flowReplayIo,
+  pickSession,
+  runReplayAction,
+  sessionForItem,
+  structureActions,
+} from './replay-actions.js';
+import { assertNoForeignProxy, clearProxy, detectNetworkService, getProxyState, isOurProxy, setProxy } from './proxy.js';
 import { startServer, type StartServerResult } from './server.js';
-import { EngineController, type EngineHandle } from './engine-controller.js';
+import { EngineController, type EngineHandle, LAN_PROXY_REFUSAL } from './engine-controller.js';
 import { ChildEngine } from './child-engine.js';
 import { makeClaudeTerminal, type Effort, type TerminalHooks } from './claude-terminal.js';
 
@@ -69,18 +100,34 @@ interface CredFlags {
   token?: string;
   cookie?: string;
   'app-support'?: string;
+  /** The one app pasted `--token`/`--cookie` are for (else Slack); also scopes extraction. */
+  adapter?: string;
   /**
-   * Which signed-in workspace to act as, by label substring or exact team id.
-   * Without it a caller gets whichever workspace the extractor happened to
-   * return first, which is only ever right by luck once you are signed in to
-   * more than one. See `acquireSession`.
+   * Which signed-in workspace to act as: exact team id, then exact label
+   * (ignoring case), then label substring (see `selectWorkspace`). Without it,
+   * `sync` covers every signed-in workspace; `replay` uses the workspace its
+   * params name, else the sole session, and refuses when several remain.
    */
   workspace?: string;
 }
 
+const STORE_OPTIONS = { db: { type: 'string' }, help: { type: 'boolean', short: 'h' } } as const;
+const CRED_OPTIONS = { token: { type: 'string' }, cookie: { type: 'string' }, 'app-support': { type: 'string' } } as const;
+const DAEMON_OPTIONS = {
+  ...STORE_OPTIONS,
+  ...CRED_OPTIONS,
+  port: { type: 'string' },
+  'proxy-port': { type: 'string' },
+  adapter: { type: 'string' },
+  config: { type: 'string' },
+  host: { type: 'string', multiple: true },
+  'all-hosts': { type: 'boolean' },
+  'lan-proxy': { type: 'boolean' },
+  'lan-allow': { type: 'string', multiple: true },
+} as const;
+
 /** Can we open a TCP connection to this port? Used to spot a dangling system proxy. */
 async function isPortListening(port: number, host = config.LOOPBACK_HOST): Promise<boolean> {
-  const { createConnection } = await import('node:net');
   return new Promise((resolve) => {
     const sock = createConnection({ port, host });
     const done = (ok: boolean): void => {
@@ -94,25 +141,6 @@ async function isPortListening(port: number, host = config.LOOPBACK_HOST): Promi
 }
 
 // ── small shared helpers ─────────────────────────────────────────────────────
-
-function errMsg(e: unknown): string {
-  return redactText(e instanceof Error ? e.message : String(e));
-}
-
-/** Surface an app-style {ok:false,error} body (or an HTTP error) so failures are visible. */
-function apiErrorText(capture: Capture): string | null {
-  if (capture.resBody) {
-    try {
-      const b = JSON.parse(capture.resBody) as { ok?: boolean; error?: string; needed?: string; provided?: string };
-      if (b.ok === false) {
-        return `${b.error ?? 'error'}${b.needed ? ` (needed: ${b.needed}; provided: ${b.provided ?? '-'})` : ''}`;
-      }
-    } catch {
-      /* non-JSON body */
-    }
-  }
-  return capture.status != null && capture.status >= 400 ? `HTTP ${capture.status}` : null;
-}
 
 /**
  * The config file, loaded once per process.
@@ -132,9 +160,14 @@ function resolveDb(dbFlag?: string, configPath?: string): string {
   return dbFlag ?? fileConfig(configPath).db ?? config.defaultDbPath();
 }
 
-function openStore(dbPath?: string): SqliteStore {
+function openStore(dbPath: string): SqliteStore {
   config.ensureSluiceHome();
-  return new SqliteStore(dbPath ?? config.defaultDbPath());
+  return new SqliteStore(dbPath);
+}
+
+/** Open the store a command's flags resolve to: `--db` → config `db` → default. */
+function openStoreFor(flags: { db?: string; config?: string }): SqliteStore {
+  return openStore(resolveDb(flags.db, flags.config));
 }
 
 /** Passively seed named Workspace entities from each app's local config (no Keychain, no network). */
@@ -158,19 +191,20 @@ async function seedWorkspaces(store: SqliteStore, appSupport?: string): Promise<
 }
 
 /**
- * Build/refresh the per-app tables from existing captures. Non-fatal, but NOT
- * silent: materialize runs real DDL derived from arbitrary response bodies, so a
- * column type/name collision is a plausible failure — and swallowing it left the
- * user with an empty per-app DB and no explanation anywhere.
+ * Build/refresh the per-app tables from captures that arrived since the last
+ * pass. Non-fatal but reported: materialize runs DDL derived from arbitrary
+ * response bodies. Incremental via the store's watermark; the first pass on an
+ * older store is a full build, and says so.
  */
 function materializeQuiet(store: SqliteStore): void {
   try {
-    const { tables } = materialize(store);
+    const { tables, fullRebuild, elapsedMs } = materializeIncremental(store);
     if (tables.length) {
-      console.error(`Per-app DB: ${tables.map((t) => `${t.name}(${t.rows})`).join(', ')}`);
+      const how = fullRebuild ? `first full build, ${(elapsedMs / 1000).toFixed(1)}s` : 'incremental';
+      console.error(`Per-app DB (${how}): ${tables.map((t) => `${t.name}(${t.rows})`).join(', ')}`);
     }
   } catch (e) {
-    console.error(`Warning: per-app DB build failed — ${redactText(errMsg(e))}`);
+    console.error(`Warning: per-app DB build failed — ${errMsg(e)}`);
   }
 }
 
@@ -195,7 +229,7 @@ function reconcileAll(store: SqliteStore): void {
       if (changed === 0 && note === undefined) continue;
       console.error(`${app.id}: ${note ?? `${changed} identities settled`}`);
     } catch (e) {
-      console.error(`Warning: ${app.id} reconcile failed — ${redactText(errMsg(e))}`);
+      console.error(`Warning: ${app.id} reconcile failed — ${errMsg(e)}`);
     }
   }
 }
@@ -211,23 +245,28 @@ function parsePort(v: string | undefined, fallback: number): number {
  * Restrict the installed apps to the home-config allow-list.
  *
  * Delegates to `enabledApps` so CLI and MCP share one source of truth
- * (`~/.sluice/config.json` adapters[] via `readEnabledAdapterIds`). A
- * project-local `sluice.config.json` must not widen TLS intercept hosts.
- * `configPath` is accepted for call-site compatibility and ignored for allow-list.
+ * (`~/.sluice/config.json` adapters[] via `readEnabledAdapterIds`). Never reads
+ * `--config`: a project-local `sluice.config.json` must not widen TLS intercept
+ * hosts.
  */
-function selectApps(_configPath?: string): typeof apps {
+function selectApps(): typeof apps {
   return enabledApps(readEnabledAdapterIds());
 }
 
-/** Apply the config's retention bounds, if any. Reports what it removed. */
-function applyRetention(store: SqliteStore, configPath?: string): void {
+/**
+ * Apply the config's retention bounds, if any. Reports and returns how many
+ * captures it removed — the caller owes a derived-table rebuild when that is > 0
+ * (rebuildMaterialized), which it runs after the socket binds.
+ */
+function applyRetention(store: SqliteStore, configPath?: string): number {
   const { retentionDays, maxCaptures } = fileConfig(configPath);
-  if (retentionDays === undefined && maxCaptures === undefined) return;
+  if (retentionDays === undefined && maxCaptures === undefined) return 0;
   const removed = store.pruneCaptures({
     maxAgeMs: retentionDays === undefined ? undefined : retentionDays * 24 * 60 * 60 * 1000,
     maxRows: maxCaptures,
   });
   if (removed > 0) console.error(`Retention: pruned ${removed} old capture(s).`);
+  return removed;
 }
 
 /** Default landing URL for passive capture — the first app's web host (`app.*` preferred). */
@@ -237,15 +276,107 @@ function defaultCaptureUrl(): string {
   return host ? `https://${host}/` : 'about:blank';
 }
 
+/** The app `--token`/`--cookie` are for when `--adapter` does not say — the documented paste-in. */
+const PASTE_IN_DEFAULT_APP = 'slack';
+
+let pasteIn: { token?: string; cookie?: string } | undefined;
+
+/** All of stdin, for `--token -` / `--cookie -`. */
+async function readStdin(): Promise<string> {
+  const chunks: Buffer[] = [];
+  for await (const chunk of process.stdin) chunks.push(chunk as Buffer);
+  return Buffer.concat(chunks).toString('utf8');
+}
+
 /**
- * Gather sessions across every installed app: paste-in credentials when both
- * `--token` and `--cookie` are given, else each app's local-store extraction.
- * Propagates an app extractor's throw (e.g. off macOS); returns [] only when an
- * app simply has no signed-in workspace.
+ * The pasted credential pair: `--token` / `--cookie` (`-` reads the value from
+ * stdin), else the `SLUICE_TOKEN` / `SLUICE_COOKIE` environment variables.
+ *
+ * A literal value on the command line is readable by every local account for as
+ * long as the process runs (`ps -axo args` — and `serve`/`start` run for hours)
+ * and is saved in shell history, so using one earns a warning. Resolved once per
+ * process: stdin can only be read once.
+ */
+async function resolvePasteIn(flags: CredFlags): Promise<{ token?: string; cookie?: string }> {
+  if (pasteIn) return pasteIn;
+  if (flags.token === '-' && flags.cookie === '-') {
+    throw new Error('Only one of --token / --cookie can read stdin; put the other in SLUICE_TOKEN / SLUICE_COOKIE.');
+  }
+  const stdin = flags.token === '-' || flags.cookie === '-' ? (await readStdin()).trim() : '';
+  const pick = (flag: string | undefined, env: string | undefined): string | undefined =>
+    (flag === '-' ? stdin : flag || env) || undefined;
+  if ((flags.token && flags.token !== '-') || (flags.cookie && flags.cookie !== '-')) {
+    console.error(
+      'Warning: a --token/--cookie value on the command line is visible to other local users (ps) and ' +
+        'saved in shell history. Prefer SLUICE_TOKEN / SLUICE_COOKIE, or `--token -` to read it from stdin.',
+    );
+  }
+  pasteIn = { token: pick(flags.token, process.env.SLUICE_TOKEN), cookie: pick(flags.cookie, process.env.SLUICE_COOKIE) };
+  return pasteIn;
+}
+
+let keychainAdvised = false;
+
+/**
+ * Say "Allow, not Always Allow" once, before the first extraction that can raise
+ * a Keychain prompt. "Always Allow" adds `security` to the item's ACL, after
+ * which any same-user process reads the key without asking. Core never writes
+ * to the terminal, so the runner says it.
+ */
+function adviseKeychainOnce(): void {
+  if (keychainAdvised || process.platform !== 'darwin') return;
+  keychainAdvised = true;
+  console.error(KEYCHAIN_ALLOW_ADVICE);
+}
+
+/** Apps already told that the pasted pair is not theirs — once per app, not per drained page. */
+const pasteMismatchWarned = new Set<string>();
+
+/**
+ * Gather sessions: pasted credentials for ONE app, else each installed app's
+ * local-store extraction.
+ *
+ * Pasted credentials belong to `--adapter`, else Slack — never to the scope
+ * `adapterId` a command passes — and only that app's `sessionFromInput` ever
+ * sees them. SLUICE_TOKEN may be ambient in the shell, so a `replay` or drain
+ * of another app's work must not turn a Slack `xoxc-` pair into that app's
+ * Bearer. Any other scope ignores the paste and extracts as usual. A paste for
+ * an app that cannot take one, or refuses it, is an error: silently falling
+ * back to a desktop or Keychain session would act as a different identity.
+ *
+ * Extraction: a call scoped to one app propagates that app's throw. An unscoped
+ * call warns per failing app and carries on, so one app's Keychain or decrypt
+ * failure cannot cost every other app its sessions; it throws the first failure
+ * only when nothing at all was found. Returns [] when an app simply has no
+ * signed-in workspace.
  */
 async function extractAllSessions(flags: CredFlags, adapterId?: string): Promise<Session[]> {
+  const pasted = await resolvePasteIn(flags);
+  const pasteFor = flags.adapter ?? PASTE_IN_DEFAULT_APP;
+  if ((pasted.token || pasted.cookie) && (adapterId === undefined || adapterId === pasteFor)) {
+    const provider = apps.find((a) => a.id === pasteFor)?.credentials;
+    if (!provider) return []; // credential-free: the caller's anonymous session applies
+    if (!provider.sessionFromInput) {
+      throw new Error(`${pasteFor} does not accept pasted --token/--cookie; sign in to it locally instead.`);
+    }
+    const input: Record<string, string> = {};
+    if (pasted.token) input.token = pasted.token;
+    if (pasted.cookie) input.cookie = pasted.cookie;
+    // The provider decides what it needs (Toters takes a token alone).
+    const s = provider.sessionFromInput(input);
+    if (!s) throw new Error(`${pasteFor} did not accept the pasted credentials.`);
+    return [s];
+  }
+  if ((pasted.token || pasted.cookie) && adapterId !== undefined && !pasteMismatchWarned.has(adapterId)) {
+    pasteMismatchWarned.add(adapterId);
+    if (apps.find((a) => a.id === adapterId)?.credentials?.sessionFromInput) {
+      console.error(`Pasted credentials are for ${pasteFor}, not ${adapterId} — pass --adapter ${adapterId} to use them there.`);
+    }
+  }
+
   const opts = flags['app-support'] ? { appSupportDir: flags['app-support'] } : undefined;
   const out: Session[] = [];
+  const errors: unknown[] = [];
   for (const app of apps) {
     // Scoping matters beyond tidiness: every extractor that runs may raise its
     // own Keychain prompt, so asking three apps for credentials when one was
@@ -253,71 +384,82 @@ async function extractAllSessions(flags: CredFlags, adapterId?: string): Promise
     if (adapterId && app.id !== adapterId) continue;
     const provider = app.credentials;
     if (!provider) continue;
-    if (flags.token && flags.cookie) {
-      const s = provider.sessionFromInput?.({ token: flags.token, cookie: flags.cookie });
-      if (s) out.push(s);
-      continue;
+    adviseKeychainOnce();
+    try {
+      out.push(...(await provider.extractSessions(opts)));
+    } catch (e) {
+      if (adapterId) throw e;
+      errors.push(e);
+      console.error(`Warning: ${app.displayName} credentials unavailable (${errMsg(e)}).`);
     }
-    out.push(...(await provider.extractSessions(opts)));
   }
+  if (out.length === 0 && errors.length > 0) throw errors[0];
   return out;
 }
 
 /**
- * Paste-in credentials if given, else extract from the app's local store.
+ * The one session a CLI replay acts as: paste-in or extracted, and only one
+ * belonging to `adapterId`. Another adapter's builder must never receive it: a
+ * Trello session in Slack's builder emits a literal `Cookie: cookieHeader`, and
+ * a Slack session in Trello's fires unauthenticated.
  *
- * `adapterId` is not optional in spirit. Handing a session to another app's
- * request builder is the bug the WS sync path already guards against: a Trello
- * session reaching Slack's builder emits a literal `Cookie: cookieHeader`
- * header, and a Slack session reaching Trello's fires unauthenticated. Since
- * `apps[0]` is Slack, `sluice replay <any trello action>` did exactly that.
- *
- * `flags.workspace` is the same class of bug one level down, between workspaces
- * of ONE adapter. Without it this returned `sessions[0]` — whichever team the
- * extractor listed first — so on a machine signed in to several Slack
- * workspaces, a replay against any other one came back HTTP 200 carrying
- * `channel_not_found`: a real answer, from the wrong workspace, that reads like
- * a missing channel. `cmdSync` already takes `--workspace`; this is the same
- * selector so the two commands cannot disagree about what a workspace name means.
+ * Chosen by `--workspace`, else the workspace `inferWorkspace` reads off the
+ * params, else the sole session; ambiguity is an error naming the candidates.
  */
-async function acquireSession(flags: CredFlags, adapterId?: string): Promise<Session> {
+async function acquireSession(
+  flags: CredFlags,
+  adapterId?: string,
+  inferWorkspace?: () => string | undefined,
+): Promise<Session> {
   const sessions = await extractAllSessions(flags, adapterId);
   const scoped = selectWorkspace(sessions, flags.workspace);
-  const first = scoped[0];
-  if (!first) {
-    if (flags.workspace && sessions.length > 0) {
-      // Naming what IS available turns a dead end into the next command to run.
-      throw new Error(
-        `No workspace matching "${flags.workspace}". Have: ${sessions.map((s) => s.label).join(', ')}`,
-      );
-    }
+  if (scoped.length > 0) {
+    const c = pickSession(scoped, { workspaceId: scoped.length > 1 ? inferWorkspace?.() : undefined }, adapterId ?? 'app');
+    if (c.ok) return c.session;
     throw new Error(
-      adapterId
-        ? `No signed-in ${adapterId} workspace found — sign in to it, or pass --token/--cookie.`
-        : 'No signed-in workspace found — sign in, or pass --token/--cookie.',
+      `${flags.workspace ? `"${flags.workspace}" matches` : 'Signed in to'} ${scoped.length} workspaces — ` +
+        `pass --workspace <name|team-id>. Have: ${scoped.map((s) => `${s.label} (${s.workspaceId ?? '?'})`).join(', ')}`,
     );
   }
-  return first;
+  if (flags.workspace && sessions.length > 0) {
+    // Naming what IS available turns a dead end into the next command to run.
+    throw new Error(
+      `No workspace matching "${flags.workspace}". Have: ${sessions.map((s) => s.label).join(', ')}`,
+    );
+  }
+  const app = adapterId ? apps.find((a) => a.id === adapterId) : undefined;
+  if (adapterId && app && !app.credentials) return anonymousSession(adapterId);
+  throw new Error(
+    adapterId
+      ? `No signed-in ${adapterId} workspace found — sign in to it, or pass --adapter ${adapterId} with --token/--cookie.`
+      : 'No signed-in workspace found — sign in, or pass --token/--cookie.',
+  );
 }
 
 /**
- * Filter sessions to one workspace by label substring or exact team id.
+ * Filter sessions to one workspace: an exact team id first, then an exact label
+ * (ignoring case), then a label substring. Exact matches win so `--workspace
+ * acme` cannot land on "Acme Staging" just because it was listed first.
  *
- * Extracted so `cmdSync` and `acquireSession` share one definition of a match:
- * a selector that resolved a channel under `sync` but not under `replay` would
- * be worse than having no selector at all.
+ * Shared by `cmdSync`, `acquireSession` and the drain so they share one
+ * definition of a match: a selector that resolved a channel under `sync` but not
+ * under `replay` would be worse than having no selector at all.
  */
 function selectWorkspace(sessions: Session[], workspace?: string): Session[] {
   if (!workspace) return sessions;
+  const byId = sessions.filter((s) => s.workspaceId === workspace);
+  if (byId.length > 0) return byId;
   const wanted = workspace.toLowerCase();
-  return sessions.filter((s) => s.label.toLowerCase().includes(wanted) || s.workspaceId === workspace);
+  const exact = sessions.filter((s) => s.label.toLowerCase() === wanted);
+  if (exact.length > 0) return exact;
+  return sessions.filter((s) => s.label.toLowerCase().includes(wanted));
 }
 
 /** Never throws: returns ALL workspace sessions (one per team), or [] with a warning. */
-async function bestEffortSessions(flags: CredFlags): Promise<Session[]> {
+async function bestEffortSessions(flags: CredFlags, adapterId?: string): Promise<Session[]> {
   let sessions: Session[] = [];
   try {
-    sessions = await extractAllSessions(flags);
+    sessions = await extractAllSessions(flags, adapterId);
   } catch (e) {
     console.error(`Warning: no session (${errMsg(e)}).`);
     return [];
@@ -330,46 +472,128 @@ async function bestEffortSessions(flags: CredFlags): Promise<Session[]> {
   return sessions;
 }
 
-function printServerBanner(server: StartServerResult, hasSession: boolean): void {
+/**
+ * Best-effort startup work run after bind, so a slow container/Keychain touch
+ * (first container touch can take ~20s cold) or the first full materialize
+ * never delays the banner. `sessions` is the array `getSessions` reads; it is
+ * empty at first, and the dashboard is sent each session as the scan finds it.
+ */
+async function warmStoreInBackground(opts: {
+  store: SqliteStore;
+  flags: CredFlags;
+  sessions: Session[];
+  server: StartServerResult;
+  /**
+   * Retention just deleted captures, so the derived tables need a drop + full
+   * rebuild (rebuildMaterialized) rather than an incremental pass, which would
+   * keep the deleted captures' rows — and their message text — forever.
+   */
+  rebuild?: boolean;
+}): Promise<void> {
+  const { store, flags, sessions, server } = opts;
+  // A killed earlier run can leave a plaintext copy of an app's credential
+  // store in $TMPDIR; remove it even if Slack is never read again. Never throws.
+  sweepStaleTempDirs();
+  try {
+    await seedWorkspaces(store, flags['app-support']);
+    const found = await bestEffortSessions(flags, flags.adapter);
+    sessions.push(...found);
+    for (const s of found) store.upsertSession(redactSession(s));
+    server.announceSessions(found);
+    if (opts.rebuild) {
+      try {
+        // The full registry, not just the enabled apps: a disabled app's
+        // derived rows for pruned captures must go too.
+        const t = rebuildMaterialized(store, apps.map((a) => a.id));
+        console.error(`Per-app DB rebuilt after retention: ${t.length} table(s).`);
+      } catch (e) {
+        console.error(`Warning: per-app DB rebuild failed — ${errMsg(e)}`);
+      }
+    } else {
+      materializeQuiet(store);
+    }
+  } catch (e) {
+    // Best-effort by definition: the dashboard, replay and capture all work
+    // without a local session. Never take the runner down for this.
+    console.error(`Warning: startup scan failed — ${errMsg(e)}`);
+  }
+}
+
+/** 'scanning': serve/start print before the session scan finishes; the scan reports its own result. */
+function printServerBanner(server: StartServerResult, sessionState: 'none' | 'scanning'): void {
   console.log('');
   console.log('sluice web UI listening on 127.0.0.1 (loopback only)');
-  // The token rides in the URL FRAGMENT, not the page. The served document no
-  // longer contains it (see server.ts injectConfig), so this tokenized URL — not
-  // the bare host — is the way in. The fragment is never sent to the server, so
-  // opening it discloses the token to nobody but this browser; a bare
-  // `curl 127.0.0.1:<port>/` now gets a tokenless page.
-  //
-  // When the terminal is on, the SEPARATE pty secret rides the same fragment as
-  // `&p=` — a second capability the read token cannot substitute for.
+  // The token rides the URL fragment, which is never sent to the server and never
+  // in the served page (server.ts injectConfig). With the terminal on, the separate
+  // pty secret rides as `&p=`, a capability the session token cannot substitute
+  // for. The session token is full dashboard control, so these lines are masked
+  // off-TTY (banner.ts).
   const frag = server.ptyToken ? `#k=${server.token}&p=${server.ptyToken}` : `#k=${server.token}`;
-  console.log(`  Open:   ${server.url}${frag}`);
-  console.log(`  Token:  ${server.token}  (shown here only — not embedded in any served page)`);
-  console.log(`  Dev UI: http://localhost:5273/${frag}  (with \`pnpm webapp:dev\`)`);
-  if (!hasSession) {
+  printSecretLines(
+    [
+      `  Open:   ${server.url}${frag}`,
+      `  Token:  ${server.token}  (shown here only — not embedded in any served page)`,
+      `  Dev UI: http://localhost:5273/${frag}  (with \`pnpm webapp:dev\`)`,
+    ],
+    [server.token, server.ptyToken],
+  );
+  if (sessionState === 'none') {
     console.log('  Note:   no session yet — run `sluice extract-token` or pass --token/--cookie.');
+  } else if (sessionState === 'scanning') {
+    console.log('  Note:   scanning for signed-in workspaces in the background…');
   }
   console.log('');
   console.log('Press Ctrl-C to stop.');
 }
 
-/** Resolves after SIGINT/SIGTERM has run `onStop`. Keeps the daemon alive. */
+/**
+ * Resolves after SIGINT/SIGTERM/SIGHUP has run `onStop`. Keeps the daemon alive.
+ *
+ * A crash runs `onStop` too, then exits non-zero. `onStop` is what restores the
+ * system proxy; a runner that died without it left all of the Mac's HTTPS
+ * pointed at a port nothing listens on — which any local process could then
+ * bind to receive it.
+ */
 function runUntilSignal(onStop: () => Promise<void>): Promise<void> {
   return new Promise((resolve) => {
-    let stopping = false;
-    const stop = async (): Promise<void> => {
-      if (stopping) return;
-      stopping = true;
-      console.error('\nShutting down…');
-      try {
-        await onStop();
-      } catch (e) {
-        console.error(errMsg(e));
-      }
-      resolve();
+    let stopping: Promise<void> | undefined;
+    const stop = (): Promise<void> => {
+      stopping ??= (async () => {
+        console.error('\nShutting down…');
+        try {
+          await onStop();
+        } catch (e) {
+          console.error(errMsg(e));
+        }
+        resolve();
+      })();
+      return stopping;
+    };
+    const crash = (e: unknown): void => {
+      console.error(`sluice: fatal — ${errMsg(e)}`);
+      void stop().finally(() => process.exit(1));
     };
     process.on('SIGINT', () => void stop());
     process.on('SIGTERM', () => void stop());
+    process.on('SIGHUP', () => void stop()); // the terminal that owned it closed
+    process.once('uncaughtException', crash);
+    process.once('unhandledRejection', crash);
   });
+}
+
+/**
+ * The installed apps `--adapter` scopes a command to: every one without the
+ * flag, else just that one. Undefined (having said why) when it names no
+ * installed app.
+ */
+function scopeApps(adapterId: string | undefined): typeof apps | undefined {
+  if (adapterId === undefined) return apps;
+  const scoped = apps.filter((a) => a.id === adapterId);
+  if (scoped.length === 0) {
+    console.error(`Unknown adapter "${adapterId}". Installed: ${apps.map((a) => a.id).join(', ')}`);
+    return undefined;
+  }
+  return scoped;
 }
 
 function parseParams(entries: string[] | undefined): Record<string, string> {
@@ -381,6 +605,31 @@ function parseParams(entries: string[] | undefined): Record<string, string> {
   }
   return out;
 }
+/** Non-internal IPv4 addresses — printed so a phone on this Wi-Fi can reach Engine A. */
+function lanIPv4s(): string[] {
+  return Object.values(networkInterfaces())
+    .flatMap((a) => a ?? [])
+    .filter((a) => a.family === 'IPv4' && !a.internal)
+    .map((a) => a.address);
+}
+
+const LAN_PROXY_NOTICE =
+  'LAN MITM is on: Engine A binds 0.0.0.0 with NO authentication; only this Mac and the --lan-allow address(es) are accepted, so an allowed device can send traffic out from your IP and write captures into your store (and one that trusts the Sluice CA has its TLS decrypted). An IP is not an identity — use it only on a network you trust, and stop capture as soon as the phone is done. Dashboard/WS stay 127.0.0.1. Do not run sluice proxy on. Install the CA from the printed /sluice-ca.mobileconfig URL, then uninstall it when done.';
+
+/** The `--lan-proxy` block of the serve/start banner: the warning, the allowlist, and where a phone points. */
+function printLanProxy(proxyPort: number, lanClients: readonly string[]): void {
+  console.log(`  ⚠ ${LAN_PROXY_NOTICE}`);
+  console.log(`  Proxy:   ${LAN_LISTEN_HOST}:${proxyPort}`);
+  console.log(`  Allowed: this Mac, ${lanClients.join(', ')}`);
+  const ips = lanIPv4s();
+  for (const ip of ips) {
+    console.log(`  Phone:   HTTP(S) proxy ${ip}:${proxyPort}`);
+    console.log(`  CA:      http://${ip}:${proxyPort}/sluice-ca.mobileconfig  (or /sluice-ca.cer)`);
+  }
+  if (ips.length === 0) {
+    console.log(`  CA:      http://127.0.0.1:${proxyPort}/sluice-ca.mobileconfig (no non-internal IPv4 found)`);
+  }
+}
 
 // ── commands ─────────────────────────────────────────────────────────────────
 
@@ -388,9 +637,8 @@ async function cmdDoctor(args: string[]): Promise<number> {
   const { values } = parseArgs({
     args,
     options: {
-      db: { type: 'string' },
+      ...STORE_OPTIONS,
       net: { type: 'boolean' },
-      help: { type: 'boolean', short: 'h' },
     },
   });
   if (values.help) {
@@ -408,12 +656,8 @@ async function cmdDoctor(args: string[]): Promise<number> {
   let warned = false;
   const line = (ok: boolean, label: string, detail = ''): void =>
     console.log(`${ok ? 'ok ' : 'XX '} ${label}${detail ? `  — ${detail}` : ''}`);
-  /**
-   * An advisory check. Previously these printed `XX` but were never folded into
-   * the summary, so the standard first run showed a red line above a green
-   * "doctor: OK" — which trains people to ignore the output. `!!` says "worth
-   * knowing, not fatal" and is reflected in the summary.
-   */
+  // An advisory check prints `!!` (worth knowing, not fatal) and is reflected in
+  // the summary, so a red line never sits above a plain "doctor: OK".
   const warn = (ok: boolean, label: string, detail = ''): void => {
     if (!ok) warned = true;
     console.log(`${ok ? 'ok ' : '!! '} ${label}${detail ? `  — ${detail}` : ''}`);
@@ -431,12 +675,9 @@ async function cmdDoctor(args: string[]): Promise<number> {
     darwin ? '' : 'token extraction is macOS-only; use --token/--cookie paste-in elsewhere',
   );
 
-  // Per-app sign-in probe — passive (reads local config only; no Keychain, no
-  // network) and non-fatal, driven entirely off each app's credential provider.
-  // Apps that ship a credential provider but no `listWorkspaces` are reported as
-  // unverifiable rather than skipped: silently omitting them meant a broken
-  // Trello cookie produced a clean "doctor: OK" and only surfaced when a tool
-  // failed much later.
+  // Per-app sign-in probe — passive (local config only; no Keychain, no network),
+  // non-fatal. Apps with a credential provider but no `listWorkspaces` are
+  // reported as unverifiable, not skipped.
   for (const app of apps) {
     if (!app.credentials) continue;
     const listWorkspaces = app.credentials.listWorkspaces;
@@ -457,10 +698,7 @@ async function cmdDoctor(args: string[]): Promise<number> {
     );
   }
 
-  // Probe the package that actually OWNS mockttp. Importing the bare specifier
-  // resolved from @sluice/runner, which does not declare it, so this always
-  // reported "not installed" — while cli.ts had already loaded mockttp into this
-  // very process via its static `@sluice/interceptor` import.
+  // Probe the package that owns mockttp (@sluice/interceptor), not a bare specifier @sluice/runner does not declare.
   let mockttpOk = false;
   let mockttpDetail = '';
   try {
@@ -468,7 +706,7 @@ async function cmdDoctor(args: string[]): Promise<number> {
     mockttpOk = typeof mod.MitmEngine === 'function';
     if (!mockttpOk) mockttpDetail = '@sluice/interceptor loaded but exposes no MitmEngine';
   } catch (e) {
-    mockttpDetail = `proxy engine unavailable: ${e instanceof Error ? e.message : String(e)}`;
+    mockttpDetail = `proxy engine unavailable: ${errMsg(e)}`;
   }
   warn(mockttpOk, 'MITM proxy engine available', mockttpDetail);
 
@@ -485,7 +723,7 @@ async function cmdDoctor(args: string[]): Promise<number> {
           'System proxy',
           live
             ? `enabled → ${st.host}:${st.port} (listening)`
-            : `enabled → ${st.host}:${st.port} but NOTHING is listening. Run \`sluice proxy off\` or start Sluice.`,
+            : `enabled → ${st.host}:${st.port} but NOTHING is listening. Run \`sluice proxy off --proxy-port ${st.port}\` or start Sluice.`,
         );
       }
     } catch {
@@ -501,28 +739,14 @@ async function cmdDoctor(args: string[]): Promise<number> {
   const caPath = sluiceCaCertPath();
 
   if (!existsSync(caPath)) {
-    // This used to offer `sluice start` as an equivalent second option. It is
-    // not one: start calls ensureSluiceCA(), which GENERATES the certificate and
-    // stops there — trusting it is `ca-install`'s job alone. Following the old
-    // advice left users with a CA on disk that no keychain trusts, which fails
-    // every HTTPS request through the proxy while doctor still summarised OK.
     warn(
       false,
       'Local CA',
       'not generated yet — run `sluice ca-install`. (`sluice start` creates the certificate but does NOT trust it, and an untrusted CA fails every HTTPS request through the proxy.)',
     );
   } else if (darwin) {
-    let trusted = false;
-    try {
-      // Exit 0 means the chain verifies for SSL, which is exactly the property
-      // the proxy needs and is not implied by the file existing.
-      execFileSync('/usr/bin/security', ['verify-cert', '-c', caPath, '-p', 'ssl'], {
-        stdio: 'ignore',
-      });
-      trusted = true;
-    } catch {
-      trusted = false;
-    }
+    // Exit 0 means the chain verifies for SSL — what the proxy needs, and not implied by the file existing.
+    const trusted = spawnSync('/usr/bin/security', ['verify-cert', '-c', caPath, '-p', 'ssl'], { stdio: 'ignore' }).status === 0;
     warn(
       trusted,
       'Local CA trusted',
@@ -547,13 +771,26 @@ async function cmdDoctor(args: string[]): Promise<number> {
       continue;
     }
     // Something is listening. If it is OUR runner, that is the healthy case.
-    const state = readRunState();
+    const state = liveRunState();
     const ours = state?.port === port || state?.proxyPort === port;
     warn(
       ours,
       `Port ${port} (${label})`,
       ours ? 'in use by a running Sluice' : 'in use by another process — pass --port / --proxy-port',
     );
+    if (label === 'MITM proxy') {
+      const lanIp = lanIPv4s()[0];
+      const onLan = lanIp ? await isPortListening(port, lanIp) : false;
+      if (onLan && !state?.lanProxy) {
+        warn(
+          false,
+          'MITM listen address',
+          `port ${port} answers on LAN ${lanIp} without --lan-proxy — accidental LAN MITM; bind Engine A on 127.0.0.1 unless you meant a phone proxy`,
+        );
+      } else if (state?.lanProxy) {
+        warn(true, 'MITM listen address', 'LAN bind (--lan-proxy); dashboard stays loopback');
+      }
+    }
   }
 
   // ── Network probes (opt-in) ─────────────────────────────────────────────────
@@ -564,6 +801,16 @@ async function cmdDoctor(args: string[]): Promise<number> {
     } else {
       const rt = await probeThroughProxy(proxyPort, 'https://example.com/');
       warn(rt.ok, 'Proxy round-trip', rt.ok ? `example.com → HTTP ${rt.status}` : rt.detail);
+      // The LAN-only CA route answers 200 (a passthrough loop would 500 here) —
+      // not whether the LAN can reach it.
+      if (liveRunState()?.lanProxy) {
+        try {
+          const ca = await fetch(`http://127.0.0.1:${proxyPort}/sluice-ca.pem`);
+          warn(ca.ok, 'LAN CA download', ca.ok ? 'GET /sluice-ca.pem from loopback succeeded' : `HTTP ${ca.status}`);
+        } catch (e) {
+          warn(false, 'LAN CA download', errMsg(e));
+        }
+      }
 
       // The TLS-pinning question the plan makes this the resolution mechanism
       // for: if Slack pinned its certificates, this call would fail through a
@@ -580,7 +827,7 @@ async function cmdDoctor(args: string[]): Promise<number> {
     }
   }
 
-  const dbPath = resolveDb(values.db, (values as { config?: string }).config);
+  const dbPath = resolveDb(values.db);
   let dbOk = true;
   try {
     config.ensureSluiceHome();
@@ -597,35 +844,27 @@ async function cmdDoctor(args: string[]): Promise<number> {
   return hardOk ? 0 : 1;
 }
 
-/**
- * Fetch a URL THROUGH a local proxy, reporting rather than throwing.
- *
- * Uses `fetch` with a dispatcher only when undici exposes one; otherwise it
- * falls back to a raw CONNECT, because the point of the probe is to work on the
- * Node the user actually has rather than to be elegant.
- */
+/** GET a URL through the local proxy via a raw CONNECT tunnel, reporting rather than throwing. */
 async function probeThroughProxy(
   proxyPort: number,
   url: string,
 ): Promise<{ ok: boolean; status?: number; detail: string }> {
   const { request } = await import('node:https');
-  const { connect } = await import('node:net');
   const target = new URL(url);
 
   return new Promise((resolve) => {
-    const done = (r: { ok: boolean; status?: number; detail: string }): void => resolve(r);
     const socket = connect({ port: proxyPort, host: config.LOOPBACK_HOST }, () => {
       socket.write(`CONNECT ${target.hostname}:443 HTTP/1.1\r\nHost: ${target.hostname}:443\r\n\r\n`);
     });
     socket.setTimeout(10_000, () => {
       socket.destroy();
-      done({ ok: false, detail: 'timed out' });
+      resolve({ ok: false, detail: 'timed out' });
     });
-    socket.once('error', (e) => done({ ok: false, detail: e.message }));
+    socket.once('error', (e) => resolve({ ok: false, detail: e.message }));
     socket.once('data', (chunk: Buffer) => {
       if (!/^HTTP\/1\.[01] 200/.test(chunk.toString('utf8'))) {
         socket.destroy();
-        done({ ok: false, detail: `proxy refused CONNECT: ${chunk.toString('utf8').split('\r\n')[0]}` });
+        resolve({ ok: false, detail: `proxy refused CONNECT: ${chunk.toString('utf8').split('\r\n')[0]}` });
         return;
       }
       const req = request(
@@ -647,13 +886,13 @@ async function probeThroughProxy(
           res.resume();
           res.once('end', () => {
             socket.destroy();
-            done({ ok: true, status: res.statusCode, detail: '' });
+            resolve({ ok: true, status: res.statusCode, detail: '' });
           });
         },
       );
       req.once('error', (e) => {
         socket.destroy();
-        done({ ok: false, detail: e.message });
+        resolve({ ok: false, detail: e.message });
       });
       req.end();
     });
@@ -665,36 +904,43 @@ async function cmdExtractToken(args: string[]): Promise<number> {
     args,
     options: {
       adapter: { type: 'string' },
-      token: { type: 'string' },
-      cookie: { type: 'string' },
-      'app-support': { type: 'string' },
-      db: { type: 'string' },
-      help: { type: 'boolean', short: 'h' },
+      ...CRED_OPTIONS,
+      ...STORE_OPTIONS,
     },
   });
   if (values.help) {
     console.log(
       'sluice extract-token [--adapter ID] [--token X --cookie Y] [--app-support DIR] [--db PATH]\n' +
-        '  Read your local session and print a REDACTED summary. The token/cookie are\n' +
-        '  never printed and never written to disk (only a RedactedSession is stored).\n' +
-        '  --adapter scopes extraction to one app, so only that app prompts the Keychain.',
+        '  Read your local sessions and print a REDACTED summary. The token/cookie are\n' +
+        '  never printed or stored (only a RedactedSession is). Reading them briefly\n' +
+        '  copies the app\'s store into a private 0700 dir under $TMPDIR, deleted after.\n' +
+        '  --adapter scopes extraction to one app, so only that app prompts the Keychain,\n' +
+        '  and names the app pasted credentials are for (default slack). Paste via\n' +
+        '  SLUICE_TOKEN / SLUICE_COOKIE or `--token -` (stdin) to keep them out of ps.',
     );
     return 0;
   }
 
-  if (values.adapter && !apps.some((a) => a.id === values.adapter)) {
-    console.error(`Unknown adapter "${values.adapter}". Installed: ${apps.map((a) => a.id).join(', ')}`);
-    return 1;
-  }
+  if (!scopeApps(values.adapter)) return 1;
 
-  let session: Session;
+  // Every session in scope, not one: this acts as nobody, it only reports, so
+  // several signed-in workspaces are an answer rather than an ambiguity.
+  let sessions: Session[];
   try {
-    session = await acquireSession(values, values.adapter);
+    sessions = await extractAllSessions(values, values.adapter);
+    if (sessions.length === 0) {
+      throw new Error(
+        values.adapter
+          ? `No signed-in ${values.adapter} workspace found — sign in to it, or pass --adapter ${values.adapter} with --token/--cookie.`
+          : 'No signed-in workspace found — sign in, or pass --token/--cookie.',
+      );
+    }
   } catch (e) {
     console.error(`extract-token failed: ${errMsg(e)}`);
     if (process.platform !== 'darwin') {
       console.error(
-        'Extraction reads the macOS Keychain + the app\'s local store and only works on macOS. Use --token/--cookie paste-in.',
+        'Extraction reads the macOS Keychain + the app\'s local store and only works on macOS. Use paste-in: ' +
+          'SLUICE_TOKEN / SLUICE_COOKIE (or --token - to read stdin) with --adapter ID.',
       );
     } else {
       console.error(
@@ -704,19 +950,23 @@ async function cmdExtractToken(args: string[]): Promise<number> {
     return 1;
   }
 
-  const store = openStore(resolveDb(values.db, (values as { config?: string }).config));
-  const redacted = redactSession(session);
-  store.upsertSession(redacted);
+  const store = openStoreFor(values);
+  const redacted = sessions.map((s) => redactSession(s));
+  for (const r of redacted) store.upsertSession(r);
   store.close();
 
-  console.log('Extracted a live session (held in memory only; NOT written to disk):');
-  console.log(`  id:              ${redacted.id}`);
-  console.log(`  adapter:         ${redacted.adapterId}`);
-  console.log(`  label:           ${redacted.label}`);
-  console.log(`  workspaceId:     ${redacted.workspaceId ?? '(unknown)'}`);
-  console.log(`  source:          ${redacted.source}`);
-  console.log(`  credentialKinds: ${redacted.credentialKinds.join(', ')}`);
-  console.log('');
+  console.log(
+    `Extracted ${redacted.length === 1 ? 'a live session' : `${redacted.length} live sessions`} (held in memory only; NOT written to disk):`,
+  );
+  for (const r of redacted) {
+    console.log(`  id:              ${r.id}`);
+    console.log(`  adapter:         ${r.adapterId}`);
+    console.log(`  label:           ${r.label}`);
+    console.log(`  workspaceId:     ${r.workspaceId ?? '(unknown)'}`);
+    console.log(`  source:          ${r.source}`);
+    console.log(`  credentialKinds: ${r.credentialKinds.join(', ')}`);
+    console.log('');
+  }
   console.log('The token and cookie were not printed and not persisted.');
   console.log('Run `sluice serve` or `sluice start` to reconstruct + browse this session.');
   return 0;
@@ -733,26 +983,22 @@ async function cmdExtractToken(args: string[]): Promise<number> {
 function makeProxyOps(ourPort: number): import('./engine-controller.js').SystemProxyOps {
   let service: string | undefined;
   const svc = async (): Promise<string> => (service ??= await detectNetworkService());
-  const isOurs = (st: { enabled: boolean; host?: string; port?: number }): boolean =>
-    Boolean(
-      st.enabled &&
-        (st.host === config.LOOPBACK_HOST || st.host === 'localhost') &&
-        st.port === ourPort,
-    );
   return {
     async on(port) {
-      await setProxy(await svc(), config.LOOPBACK_HOST, port);
+      const s = await svc();
+      assertNoForeignProxy(await getProxyState(s), port);
+      await setProxy(s, config.LOOPBACK_HOST, port);
     },
     async off() {
       // Only disable when the live proxy is ours. A bare clearProxy here would
       // clobber an unrelated corporate proxy if state().ours were wrong.
       const st = await getProxyState(await svc());
-      if (isOurs(st)) await clearProxy(await svc());
+      if (isOurProxy(st, ourPort)) await clearProxy(await svc());
     },
     async state() {
       try {
         const st = await getProxyState(await svc());
-        const ours = isOurs(st);
+        const ours = isOurProxy(st, ourPort);
         return { supported: true, enabled: st.enabled, host: st.host, port: st.port, ours };
       } catch (e) {
         return { supported: false, enabled: false, ours: false, detail: errMsg(e) };
@@ -761,15 +1007,6 @@ function makeProxyOps(ourPort: number): import('./engine-controller.js').SystemP
   };
 }
 
-/**
- * Build an EngineController wired to a (not-yet-created) server, plus the setters
- * that finish the wiring once the server exists.
- *
- * The forward-ref is unavoidable: the controller's engine needs the server's
- * `ingest`/`broadcastEngineStatus`, and the server needs the controller as its
- * `control` hooks. The mutable closures are assigned in one place immediately
- * after `startServer` returns.
- */
 /**
  * How to spawn the isolated capture engine (§S1). Under tsx (dev) the child is a
  * `.ts` run through the same loader; from a bundle it is the sibling
@@ -782,6 +1019,11 @@ function childEngineCommand(): { command: string; args: string[] } {
   return { command: process.execPath, args: dev ? ['--import', 'tsx', child] : [child] };
 }
 
+/**
+ * Build an EngineController plus `wire`, which finishes the wiring once the server
+ * exists. The forward-ref is unavoidable: the engine needs the server's
+ * `ingest`/`broadcastEngineStatus`, and the server needs the controller as `control`.
+ */
 function makeController(opts: {
   proxyPort: number;
   adapters: App[];
@@ -789,6 +1031,12 @@ function makeController(opts: {
   interceptAllHosts: boolean;
   /** Run the engine in an isolated child process (§S1). */
   isolated?: boolean;
+  /** Engine A listen address. Default loopback; `--lan-proxy` passes 0.0.0.0. */
+  listenHost?: string;
+  /** `--lan-proxy`: the controller then refuses to set the system proxy. */
+  lanProxy?: boolean;
+  /** `--lan-allow`: the only non-loopback clients the LAN proxy accepts. */
+  lanClients?: readonly string[];
 }): {
   controller: EngineController;
   wire: (server: StartServerResult) => void;
@@ -817,6 +1065,8 @@ function makeController(opts: {
         args,
         env: {
           SLUICE_CHILD_PORT: String(opts.proxyPort),
+          SLUICE_CHILD_LISTEN_HOST: opts.listenHost ?? '127.0.0.1',
+          SLUICE_CHILD_LAN_CLIENTS: (opts.lanClients ?? []).join(','),
           SLUICE_CHILD_HOSTS: hosts.join(','),
           SLUICE_CHILD_ALL_HOSTS: opts.interceptAllHosts ? '1' : '0',
         },
@@ -832,6 +1082,8 @@ function makeController(opts: {
       onError: (e) => console.error(`engine error: ${errMsg(e)}`),
       onStatus: (s) => publishStatus(s),
       interceptHosts: opts.interceptHosts,
+      listenHost: opts.listenHost,
+      lanClients: opts.lanClients,
       interceptAllHosts: opts.interceptAllHosts,
     });
   };
@@ -847,6 +1099,7 @@ function makeController(opts: {
       const path = sluiceCaCertPath();
       return { generated: existsSync(path), path: existsSync(path) ? path : undefined };
     },
+    lanProxy: opts.lanProxy,
   });
 
   const wire = (server: StartServerResult): void => {
@@ -857,19 +1110,92 @@ function makeController(opts: {
   return { controller, wire };
 }
 
+/** The flags `serve` and `start` share — what {@link prepareDaemon} reads. */
+interface DaemonFlags {
+  adapter?: string;
+  port?: string;
+  'proxy-port'?: string;
+  db?: string;
+  config?: string;
+  host?: string[];
+  'all-hosts'?: boolean;
+  'lan-proxy'?: boolean;
+  'lan-allow'?: string[];
+}
+
+/**
+ * `--lan-allow` values, validated: each must be an IP address, and they only
+ * mean something with `--lan-proxy` — which, without any, is refused: an
+ * unauthenticated proxy open to every device on the network is not a default.
+ * Returns the list, or an error message.
+ */
+function lanClientsFrom(values: Pick<DaemonFlags, 'lan-proxy' | 'lan-allow'>): string[] | string {
+  const allow = (values['lan-allow'] ?? []).map((a) => a.trim()).filter(Boolean);
+  const bad = allow.find((a) => isIP(a.replace(/^::ffff:/i, '')) === 0);
+  if (bad !== undefined) return `--lan-allow takes an IP address, not "${bad}".`;
+  if (!values['lan-proxy']) {
+    return allow.length > 0 ? '--lan-allow only applies with --lan-proxy.' : [];
+  }
+  if (allow.length === 0) {
+    return (
+      '--lan-proxy needs --lan-allow <phone IP> (repeatable): the proxy has no authentication, so ' +
+      'without a client allowlist any device on this network could relay traffic through this Mac.'
+    );
+  }
+  return allow;
+}
+
+/**
+ * The setup `serve` and `start` share: flag checks, config, ports, the store and
+ * its retention, external adapters, the TLS intercept scope, and the engine
+ * controller (not yet wired to a server). Undefined, having said why, on a bad
+ * flag — checked first, so a typo never opens or prunes the store.
+ */
+async function prepareDaemon(values: DaemonFlags, isolated: boolean) {
+  if (!scopeApps(values.adapter)) return undefined;
+  const lanClients = lanClientsFrom(values);
+  if (typeof lanClients === 'string') {
+    console.error(lanClients);
+    return undefined;
+  }
+  const cfg = fileConfig(values.config);
+  const port = parsePort(values.port, cfg.port ?? config.DEFAULT_HTTP_PORT);
+  const proxyPort = parsePort(values['proxy-port'], cfg.proxyPort ?? config.DEFAULT_PROXY_PORT);
+  const store = openStoreFor(values);
+  const pruned = applyRetention(store, values.config);
+  // External adapters can widen the scoped TLS list; print discovery either way.
+  // Before selectApps(), which picks from the registry they join.
+  for (const line of describeDiscovery(await installExternalAdapters())) console.error(line);
+  const adapters = selectApps();
+  const scope = config.resolveInterceptScope({
+    config: cfg,
+    cliHosts: values.host,
+    cliAllHosts: values['all-hosts'],
+  });
+  const lanProxy = Boolean(values['lan-proxy']);
+  const { controller, wire } = makeController({
+    proxyPort,
+    adapters,
+    interceptHosts: scope.interceptHosts,
+    interceptAllHosts: scope.interceptAllHosts,
+    isolated,
+    listenHost: lanProxy ? LAN_LISTEN_HOST : config.LOOPBACK_HOST,
+    lanProxy,
+    lanClients,
+  });
+  // Filled in after the socket is listening (and, for `start`, after the banner
+  // with the LAN CA URL has printed) — see warmStoreInBackground. The server
+  // reads this array lazily through `getSessions`, so a session found a few
+  // seconds from now is a session the dashboard sees.
+  const sessions: Session[] = [];
+  return { port, proxyPort, store, pruned, adapters, scope, lanProxy, lanClients, controller, wire, sessions };
+}
+
 async function cmdServe(args: string[]): Promise<number> {
   const { values } = parseArgs({
     args,
     options: {
-      port: { type: 'string' },
-      'proxy-port': { type: 'string' },
-      db: { type: 'string' },
-      token: { type: 'string' },
-      cookie: { type: 'string' },
-      host: { type: 'string', multiple: true },
-      'all-hosts': { type: 'boolean' },
-      'app-support': { type: 'string' },
-      config: { type: 'string' },
+      ...DAEMON_OPTIONS,
       isolated: { type: 'boolean' },
       ingest: { type: 'boolean' },
       terminal: { type: 'boolean' },
@@ -880,18 +1206,24 @@ async function cmdServe(args: string[]): Promise<number> {
       'terminal-no-mcp': { type: 'boolean' },
       'terminal-skip-permissions': { type: 'boolean' },
       'terminal-bin': { type: 'string' },
-      help: { type: 'boolean', short: 'h' },
     },
   });
   if (values.help) {
     console.log(
-      'sluice serve [--port N] [--proxy-port N] [--db PATH] [--host H]... [--all-hosts] [--isolated] [--token X --cookie Y]\n' +
+      'sluice serve [--port N] [--proxy-port N] [--db PATH] [--host H]... [--all-hosts] [--isolated] [--token X --cookie Y] [--adapter ID]\n' +
         '  Serves the dashboard. The engine starts IDLE — start/stop capture and the\n' +
         '  system proxy from the dashboard (or use `sluice start` to bring both up now).\n' +
         '\n' +
+        '  --token X --cookie Y     Paste-in credentials for ONE app (--adapter, default slack) instead\n' +
+        '                           of reading local sessions. `-` reads a value from stdin;\n' +
+        '                           SLUICE_TOKEN / SLUICE_COOKIE keep them out of ps and shell history.\n' +
+        '  --adapter ID             The app pasted credentials are for; also limits the session scan to it.\n' +
         '  --host H                 Limit TLS decrypt to adapter hosts plus H (repeatable).\n' +
         '                           Without any --host / interceptHosts, every host is decrypted.\n' +
         '  --all-hosts              Force decrypt everything (default when no hosts are set).\n' +
+        '  --lan-proxy              Bind Engine A on 0.0.0.0 so a phone on this Wi-Fi can use the proxy. Dashboard/WS stay 127.0.0.1. Do not combine with sluice proxy on.\n' +
+        '  --lan-allow IP           A client the LAN proxy accepts besides this Mac (repeatable; required\n' +
+        '                           with --lan-proxy). Every other device on the network is refused.\n' +
         '  --isolated               Run the capture engine in a separate process, so a\n' +
         '                           crash in the proxy cannot take the runner down; the\n' +
         '                           supervisor respawns it. Off by default (in-process).\n' +
@@ -909,37 +1241,18 @@ async function cmdServe(args: string[]): Promise<number> {
         '  --terminal-mcp FILE      Use this MCP config instead of the auto-wired Sluice one.\n' +
         '  --terminal-no-mcp        Do not wire any MCP server (context prompt still seeded).\n' +
         '  --terminal-skip-permissions  Launch with --dangerously-skip-permissions (NO prompts).\n' +
-        '                           Off by default; only for a dir/account you fully trust.\n' +
+        '                           Off by default. Captured content (emails, messages, any\n' +
+        '                           intercepted page) is written by OTHER people and the session\n' +
+        '                           reads it — with no prompts, text planted there can try to\n' +
+        '                           make it run commands. Trusting your own account is not enough.\n' +
         '  --terminal-bin PATH      Path to the claude binary (default: found on PATH).',
     );
     return 0;
   }
 
-  const cfg = fileConfig(values.config);
-  const port = parsePort(values.port, cfg.port ?? config.DEFAULT_HTTP_PORT);
-  const proxyPort = parsePort(values['proxy-port'], cfg.proxyPort ?? config.DEFAULT_PROXY_PORT);
-  const store = openStore(resolveDb(values.db, (values as { config?: string }).config));
-  applyRetention(store, values.config);
-  await seedWorkspaces(store, values['app-support']);
-  materializeQuiet(store);
-  // External adapters can widen the scoped TLS list; print discovery either way.
-  for (const line of describeDiscovery(await installExternalAdapters())) console.error(line);
-  const adapters = selectApps(values.config);
-  const sessions = await bestEffortSessions(values);
-  for (const s of sessions) store.upsertSession(redactSession(s));
-
-  const scope = config.resolveInterceptScope({
-    config: cfg,
-    cliHosts: values.host,
-    cliAllHosts: values['all-hosts'],
-  });
-  const { controller, wire } = makeController({
-    proxyPort,
-    adapters,
-    interceptHosts: scope.interceptHosts,
-    interceptAllHosts: scope.interceptAllHosts,
-    isolated: Boolean(values.isolated),
-  });
+  const d = await prepareDaemon(values, Boolean(values.isolated));
+  if (!d) return 1;
+  const { port, proxyPort, store, pruned, adapters, lanProxy, lanClients, controller, wire, sessions } = d;
 
   // The embedded terminal is strictly opt-in. Building the hooks here (not in
   // server.ts) is what keeps node-pty out of every mode that does not use it, and
@@ -978,11 +1291,19 @@ async function cmdServe(args: string[]): Promise<number> {
     ingest: Boolean(values.ingest),
   });
   wire(server);
-  printServerBanner(server, sessions.length > 0);
+  if (lanProxy) {
+    console.log('');
+    printLanProxy(proxyPort, lanClients);
+    // `serve` does not start Engine A, so nothing is listening on the proxy port
+    // yet and the URLs above answer nothing until capture starts. Saying so
+    // beats letting someone conclude the CA download is broken.
+    console.log('  ⓘ These come up when capture starts (dashboard → Control, or `sluice start --lan-proxy`).');
+  }
+  printServerBanner(server, 'scanning');
   if (server.ingestToken) {
     console.log('');
     console.log('  Extension ingest ENABLED — POST /api/ingest');
-    console.log(`    Ingest token: ${server.ingestToken}`);
+    printSecretLines([`    Ingest token: ${server.ingestToken}`], [server.ingestToken]);
     console.log('    Paste it (and this URL) into the Sluice browser extension\'s options.');
   }
   if (terminal) {
@@ -992,12 +1313,17 @@ async function cmdServe(args: string[]): Promise<number> {
     console.log('    It runs as you, and the session persists across reloads (re-attaches).');
     if (values['terminal-skip-permissions']) {
       console.log('  ⛔ SKIP-PERMISSIONS is ON — the session runs --dangerously-skip-permissions');
-      console.log('     and will NOT prompt before editing files or running commands. Only leave');
-      console.log('     this on for a directory and account you fully trust.');
+      console.log('     and will NOT prompt before editing files or running commands. It reads your');
+      console.log('     captures, which other people wrote (email senders, Slack users, any site you');
+      console.log('     intercepted): text planted there can try to make it run commands.');
     }
   }
   console.log('  Capture: idle — start it from the dashboard (Control), or run `sluice start`.');
-  writeRunState({ pid: process.pid, port, db: store.db.name, mode: 'serve', startedAt: Date.now(), proxyPort });
+  writeRunState({ pid: process.pid, port, db: store.db.name, mode: 'serve', startedAt: Date.now(), proxyPort, lanProxy });
+
+  // Deliberately not awaited: the socket is already listening and the banner is
+  // already printed, which is the whole point of running this here.
+  void warmStoreInBackground({ store, flags: values, sessions, server, rebuild: pruned > 0 });
 
   await runUntilSignal(async () => {
     clearRunState();
@@ -1013,51 +1339,22 @@ async function cmdServe(args: string[]): Promise<number> {
 async function cmdStart(args: string[]): Promise<number> {
   const { values } = parseArgs({
     args,
-    options: {
-      port: { type: 'string' },
-      'proxy-port': { type: 'string' },
-      db: { type: 'string' },
-      token: { type: 'string' },
-      cookie: { type: 'string' },
-      'app-support': { type: 'string' },
-      config: { type: 'string' },
-      host: { type: 'string', multiple: true },
-      'all-hosts': { type: 'boolean' },
-      help: { type: 'boolean', short: 'h' },
-    },
+    options: DAEMON_OPTIONS,
   });
   if (values.help) {
-    console.log('sluice start [--port N] [--proxy-port N] [--db PATH] [--token X --cookie Y]');
+    console.log('sluice start [--port N] [--proxy-port N] [--db PATH] [--token X --cookie Y] [--adapter ID]');
+    console.log('             [--token/--cookie]    paste-in for ONE app (--adapter, default slack); `-` = stdin,');
+    console.log('                                  or SLUICE_TOKEN / SLUICE_COOKIE to keep them out of ps');
     console.log('             [--host HOSTNAME]…   limit TLS decrypt to adapter hosts + these (repeatable)');
     console.log('             [--all-hosts]        decrypt everything (default when no --host is set)');
+    console.log('             [--lan-proxy]       bind the MITM proxy on 0.0.0.0 (phone on this LAN); dashboard stays loopback');
+    console.log('             [--lan-allow IP]…   the phone(s) the LAN proxy accepts (required with --lan-proxy; repeatable)');
     return 0;
   }
 
-  const cfg = fileConfig(values.config);
-  const port = parsePort(values.port, cfg.port ?? config.DEFAULT_HTTP_PORT);
-  const proxyPort = parsePort(values['proxy-port'], cfg.proxyPort ?? config.DEFAULT_PROXY_PORT);
-  const store = openStore(resolveDb(values.db, (values as { config?: string }).config));
-  applyRetention(store, values.config);
-  await seedWorkspaces(store, values['app-support']);
-  materializeQuiet(store);
-  // External adapters can widen the scoped TLS list; print discovery either way.
-  for (const line of describeDiscovery(await installExternalAdapters())) console.error(line);
-  const adapters = selectApps(values.config);
-  const sessions = await bestEffortSessions(values);
-  for (const s of sessions) store.upsertSession(redactSession(s));
-
-  const scope = config.resolveInterceptScope({
-    config: cfg,
-    cliHosts: values.host,
-    cliAllHosts: values['all-hosts'],
-  });
-  const { controller, wire } = makeController({
-    proxyPort,
-    adapters,
-    interceptHosts: scope.interceptHosts,
-    interceptAllHosts: scope.interceptAllHosts,
-    isolated: false,
-  });
+  const d = await prepareDaemon(values, false);
+  if (!d) return 1;
+  const { port, proxyPort, store, pruned, adapters, scope, lanProxy, lanClients, controller, wire, sessions } = d;
 
   const server = await startServer({
     store,
@@ -1074,18 +1371,27 @@ async function cmdStart(args: string[]): Promise<number> {
     await controller.startEngine();
     console.log('');
     console.log('MITM proxy engine started (Engine A).');
-    console.log(`  Proxy:   127.0.0.1:${proxyPort}`);
-    const appName = apps[0]?.displayName ?? 'the app';
-    console.log(`  Route the ${appName} desktop app through it (fully quit ${appName} first):`);
-    console.log(
-      `    open -a ${appName} --args --proxy-server=127.0.0.1:${proxyPort} --proxy-bypass-list="<-loopback>"`,
-    );
+    if (scope.interceptAllHosts) {
+      // All-hosts mode still tunnels these unread (AI assistant and agent
+      // tokens); only an explicit --host opts one of them into decryption.
+      console.log(`  Never decrypted: ${NEVER_DECRYPT_HOSTS.join(', ')} (and subdomains).`);
+    }
+    if (lanProxy) {
+      printLanProxy(proxyPort, lanClients);
+    } else {
+      console.log(`  Proxy:   127.0.0.1:${proxyPort}`);
+      const appName = apps[0]?.displayName ?? 'the app';
+      console.log(`  Route the ${appName} desktop app through it (fully quit ${appName} first):`);
+      console.log(
+        `    open -a ${appName} --args --proxy-server=127.0.0.1:${proxyPort} --proxy-bypass-list="<-loopback>"`,
+      );
+    }
   } catch (e) {
     console.error(`Failed to start the MITM engine: ${errMsg(e)}`);
     console.error('Run `sluice doctor` to check the environment. The web UI + replay still work without it.');
   }
 
-  printServerBanner(server, sessions.length > 0);
+  printServerBanner(server, 'scanning');
   writeRunState({
     pid: process.pid,
     port,
@@ -1093,7 +1399,12 @@ async function cmdStart(args: string[]): Promise<number> {
     mode: 'start (mitm)',
     startedAt: Date.now(),
     proxyPort,
+    lanProxy,
   });
+
+  // Not awaited: the proxy is listening and the CA URL is on screen. Reading
+  // Slack's container and the Keychain must not have gated either.
+  void warmStoreInBackground({ store, flags: values, sessions, server, rebuild: pruned > 0 });
 
   await runUntilSignal(async () => {
     clearRunState();
@@ -1115,9 +1426,7 @@ async function restoreSystemProxyIfOurs(proxyPort: number): Promise<void> {
   try {
     const service = await detectNetworkService();
     const st = await getProxyState(service);
-    if (!st.enabled) return;
-    const ours = st.port === proxyPort && (st.host === config.LOOPBACK_HOST || st.host === 'localhost');
-    if (!ours) return;
+    if (!isOurProxy(st, proxyPort)) return;
     await clearProxy(service);
     console.log(`Restored the system proxy (was pointing at ${st.host}:${st.port}).`);
   } catch (e) {
@@ -1134,11 +1443,10 @@ async function cmdCapture(args: string[]): Promise<number> {
       port: { type: 'string' },
       'cdp-port': { type: 'string' },
       url: { type: 'string' },
-      db: { type: 'string' },
+      ...STORE_OPTIONS,
       headless: { type: 'boolean' },
       'chrome-profile': { type: 'string' },
       'no-launch': { type: 'boolean' },
-      help: { type: 'boolean', short: 'h' },
     },
   });
   if (values.help) {
@@ -1150,17 +1458,15 @@ async function cmdCapture(args: string[]): Promise<number> {
     return 0;
   }
 
-  const cfg = fileConfig((values as { config?: string }).config);
+  const cfg = fileConfig();
   const port = parsePort(values.port, cfg.port ?? config.DEFAULT_HTTP_PORT);
   const cdpPort = parsePort(values['cdp-port'], cfg.cdpPort ?? config.DEFAULT_CDP_PORT);
   const startUrl = values.url ?? defaultCaptureUrl();
   const profileDir = values['chrome-profile'] ?? defaultChromeProfileDir();
-  const store = openStore(resolveDb(values.db, (values as { config?: string }).config));
-  await seedWorkspaces(store);
-  const adapters = apps;
+  const store = openStoreFor(values);
 
   // Passive capture needs NO credentials — nothing here touches the Keychain.
-  const server = await startServer({ store, adapters, port, getSessions: () => [] });
+  const server = await startServer({ store, adapters: apps, port, getSessions: () => [] });
 
   let chrome: LaunchedChrome | undefined;
   if (values['no-launch']) {
@@ -1184,7 +1490,7 @@ async function cmdCapture(args: string[]): Promise<number> {
 
   const engine = new CdpEngine({
     port: cdpPort,
-    adapters,
+    adapters: apps,
     onCapture: (c) => {
       try {
         server.ingest(c);
@@ -1211,16 +1517,12 @@ async function cmdCapture(args: string[]): Promise<number> {
     console.error('Chrome may still be starting, or was not launched with the debug port.');
   }
 
-  printServerBanner(server, false);
+  printServerBanner(server, 'none');
   writeRunState({ pid: process.pid, port, db: store.db.name, mode: 'capture (cdp)', startedAt: Date.now() });
   console.log('Log into the app in the launched Chrome window, then click around — captures stream live into the UI.');
 
   await runUntilSignal(async () => {
-    try {
-      await engine.stop();
-    } catch {
-      /* already stopped */
-    }
+    await engine.stop().catch(() => {}); // already stopped
     chrome?.close();
     await server.close();
     reconcileAll(store);
@@ -1234,18 +1536,22 @@ async function cmdCapture(args: string[]): Promise<number> {
 /** How many claims to take per round trip. Small enough that a Ctrl-C strands little. */
 const CLAIM_BATCH = 25;
 
+/**
+ * How long a claim may sit `running` before a new drainer treats it as stranded.
+ * Longer than one batch takes (25 claims × the 20 s replay timeout, plus
+ * pacing), so a drainer starting up never steals the live claims of another.
+ */
+const CLAIM_LEASE_MS = 15 * 60_000;
+
 interface DrainFlags extends CredFlags {
   db?: string;
-  adapter?: string;
   container?: string;
   'dry-run'?: boolean;
 }
 
 /**
- * Describe a claimed item. Deliberately says nothing about `reason` or `depth`,
- * even though `WorkItem` declares both: the `cursors` table has no column for
- * either, so every item read back from the store carries them as undefined.
- * Printing "depth 0" for a page five hops deep is worse than not printing it.
+ * Describe a claimed item. Omits `reason` and `depth`: the `cursors` table has
+ * no column for either, so they read back undefined.
  */
 function describeWorkItem(w: WorkItem): string {
   const bits = [w.adapterId, w.actionId];
@@ -1279,99 +1585,134 @@ function reportWorklist(store: SqliteStore): void {
 /**
  * Drain the `cursors` worklist: claim → replay → ingest → settle, until it is
  * empty or the replay rails refuse.
- *
- * The pieces existed and nothing joined them — §F1 built the table, §F2's
- * `nextCursors` fills it, and until now nothing took work off it, so a paginated
- * capture stopped at page one forever.
  */
 async function drainCursors(flags: DrainFlags, adapters: typeof apps): Promise<number> {
-  const store = openStore(flags.db);
+  // Resolved like every other command (`--db` → config `db` → default), so
+  // `--all` drains the same store `replay <action>` writes to.
+  const store = openStoreFor(flags);
   const wantContainer = flags.container;
+  // Filtered exactly as the real drain filters — by `--adapter` (which is what
+  // `claimCursors` takes) and by `--container`, and by nothing else. A dry run
+  // that quietly hid work the real run would attempt is worse than no dry run.
+  const inScope = (w: WorkItem): boolean =>
+    (!flags.adapter || w.adapterId === flags.adapter) && (!wantContainer || w.containerId === wantContainer);
 
   if (flags['dry-run']) {
     reportWorklist(store);
-    // Filtered exactly as the real drain filters — by `--adapter` (which is what
-    // `claimCursors` takes) and by `--container`, and by nothing else. A dry run
-    // that quietly hid work the real run would attempt is worse than no dry run.
-    const pending = store
-      .listCursors({ state: 'pending', limit: 10_000 })
-      .filter((w) => !flags.adapter || w.adapterId === flags.adapter)
-      .filter((w) => !wantContainer || w.containerId === wantContainer);
+    const pending = store.listCursors({ state: 'pending', limit: 10_000 }).filter(inScope);
+    // The real drain first returns claims past their lease to pending, then
+    // drains those too — so they are work this run would do, and the preview
+    // says so. A claim inside its lease belongs to a live drainer and is not.
+    const leaseCutoff = Date.now() - CLAIM_LEASE_MS;
+    const stranded = store
+      .listCursors({ state: 'running', limit: 10_000 })
+      .filter((w) => inScope(w) && w.updatedTs < leaseCutoff);
     store.close();
-    if (pending.length === 0) {
+    if (pending.length + stranded.length === 0) {
       if (wantContainer || flags.adapter) console.log('Nothing pending matches that filter.');
       return 0;
     }
-    console.log(`\nWould replay ${pending.length} item(s) — nothing was claimed:`);
+    console.log(`\nWould replay ${pending.length + stranded.length} item(s) — nothing was claimed:`);
     for (const w of pending) console.log(`  ${describeWorkItem(w)}`);
+    if (stranded.length > 0) {
+      console.log(`Including ${stranded.length} stranded claim(s) the run would release first:`);
+      for (const w of stranded) console.log(`  ${describeWorkItem(w)}`);
+    }
     return 0;
   }
 
   // A drainer killed mid-flight leaves its claims `running`, and nothing else
-  // ever returns them; without this the worklist looks permanently busy.
-  const released = store.releaseStaleCursors();
+  // ever returns them; without this the worklist looks permanently busy. Only
+  // claims past their lease: a younger one is a live drainer's.
+  const released = store.releaseStaleCursors(CLAIM_LEASE_MS);
   if (released > 0) console.error(`Released ${released} stranded claim(s) from an earlier run.`);
   reportWorklist(store);
 
-  // Sessions are cached per adapter — and so are FAILURES. Re-extracting per work
-  // item would raise one Keychain consent prompt per page.
-  const sessions = new Map<string, Session | undefined>();
-  const sessionFor = async (adapterId: string): Promise<Session | undefined> => {
-    if (sessions.has(adapterId)) return sessions.get(adapterId);
-    let session: Session | undefined;
+  // Sessions are extracted once per adapter — and so are FAILURES. Re-extracting
+  // per work item would raise one Keychain consent prompt per page. The whole
+  // list is kept, not its first entry: each item goes out as the session of the
+  // workspace it belongs to, never whichever the extractor listed first.
+  const pools = new Map<string, Session[]>();
+  const poolFor = async (app: App): Promise<Session[]> => {
+    const cached = pools.get(app.id);
+    if (cached) return cached;
+    let pool: Session[] = [];
     try {
-      session = await acquireSession(flags, adapterId);
+      pool = await extractAllSessions(flags, app.id);
+      if (pool.length === 0 && !app.credentials) pool = [anonymousSession(app.id)];
+      if (selectWorkspace(pool, flags.workspace).length === 0) {
+        console.error(
+          `No ${app.id} session${flags.workspace ? ` matching "${flags.workspace}"` : ''} — leaving its work queued.`,
+        );
+      }
     } catch (e) {
-      console.error(`No ${adapterId} session (${errMsg(e)}) — leaving its work queued.`);
+      console.error(`No ${app.id} session (${errMsg(e)}) — leaving its work queued.`);
     }
-    sessions.set(adapterId, session);
-    return session;
+    pools.set(app.id, pool);
+    return pool;
   };
+  let ambiguous = 0;
 
   let replayed = 0;
   let failed = 0;
   let skipped = 0;
   let queued = 0;
   let denied: ReplayDeniedError | undefined;
+  let rateLimited = false;
 
-  drain: while (true) {
-    const batch = store.claimCursors(CLAIM_BATCH, flags.adapter);
-    if (batch.length === 0) break;
+  // This run's unsettled claims. Only these are returned to the worklist at the
+  // end — a global release would hand a concurrent drainer's live claims to the
+  // next claimer and replay those pages twice.
+  const held = new Set<string>();
+  const settle = (id: string, error?: string): void => {
+    store.completeCursor(id, error);
+    held.delete(id);
+  };
 
-    for (const item of batch) {
-      // Skipped items stay `running` and are returned to the worklist below —
-      // the store has no per-item release, and marking work "done" that was never
-      // attempted would lose the page.
-      if (wantContainer && item.containerId !== wantContainer) {
-        skipped += 1;
-        continue;
-      }
-      const adapter = adapters.find((a) => a.id === item.adapterId);
-      if (!adapter) {
-        store.completeCursor(item.id, `no installed adapter "${item.adapterId}"`);
-        failed += 1;
-        console.error(`  skip: ${describeWorkItem(item)} — no such adapter`);
-        continue;
-      }
-      const action = adapter.listReplayActions().find((a) => a.id === item.actionId);
-      if (!action) {
-        store.completeCursor(item.id, `unknown action "${item.actionId}"`);
-        failed += 1;
-        console.error(`  skip: ${describeWorkItem(item)} — no such replay action`);
-        continue;
-      }
-      // Deliberately after both lookups: a seed nothing can resolve is settled
-      // without ever asking the OS for a credential.
-      const session = await sessionFor(adapter.id);
-      if (!session) {
-        skipped += 1;
-        continue;
-      }
+  // Ctrl-C is how a drain is stopped: return this run's claims at once, so the
+  // lease only ever strands them after a hard kill.
+  const SIGNALS = ['SIGINT', 'SIGTERM', 'SIGHUP'] as const;
+  const onSignal = (sig: NodeJS.Signals): void => {
+    try {
+      const n = store.releaseCursors([...held]);
+      store.close();
+      if (n > 0) console.error(`\nInterrupted — returned ${n} claim(s) to the worklist.`);
+    } finally {
+      process.exit(sig === 'SIGTERM' ? 143 : sig === 'SIGHUP' ? 129 : 130);
+    }
+  };
+  for (const s of SIGNALS) process.once(s, onSignal);
 
-      try {
-        const params: Record<string, string> = {};
-        for (const p of action.params) if (p.default != null) params[p.name] = p.default;
-        Object.assign(params, item.params ?? {});
+  let stranded = 0;
+  try {
+    drain: while (true) {
+      const batch = store.claimCursors(CLAIM_BATCH, flags.adapter);
+      if (batch.length === 0) break;
+      for (const item of batch) held.add(item.id);
+
+      for (const item of batch) {
+        // Skipped items stay `running` (held) and are returned to the worklist
+        // below — marking work "done" that was never attempted would lose the page.
+        if (wantContainer && item.containerId !== wantContainer) {
+          skipped += 1;
+          continue;
+        }
+        const adapter = adapters.find((a) => a.id === item.adapterId);
+        if (!adapter) {
+          settle(item.id, `no installed adapter "${item.adapterId}"`);
+          failed += 1;
+          console.error(`  skip: ${describeWorkItem(item)} — no such adapter`);
+          continue;
+        }
+        const action = adapter.listReplayActions().find((a) => a.id === item.actionId);
+        if (!action) {
+          settle(item.id, `unknown action "${item.actionId}"`);
+          failed += 1;
+          console.error(`  skip: ${describeWorkItem(item)} — no such replay action`);
+          continue;
+        }
+
+        const params = { ...defaultParams(action), ...item.params };
         // The cursor and the container live on the WorkItem, not in `params`;
         // find where THIS action wants them rather than assuming the names.
         const cursorParam = action.params.find((p) => p.kind === 'cursor');
@@ -1381,65 +1722,108 @@ async function drainCursors(flags: DrainFlags, adapters: typeof apps): Promise<n
           params[containerParam.name] = item.containerId;
         }
 
-        const req = faithfulReplayRequest(store, adapter.buildReplayRequest(action, params, session));
-        const capture = await runReplay(req); // secret-redacted Capture
-        capture.adapterId = adapter.id; // attribute so the Cartographer + stats include it
-        store.insertCapture(capture);
-        const counts = store.applyParseResult(adapter.parse(capture), capture.ts || Date.now());
-
-        // The follow-on pages. Without this the drain replays one page and stops:
-        // nothing else in the CLI feeds the worklist.
-        //
-        // No depth bound here, and that is not an oversight. `CursorSeed.depth`
-        // has no column in the `cursors` table, so it does not survive a claim —
-        // any hop counter written here would read back as undefined and bound
-        // nothing while looking like it did. What actually bounds the drain is
-        // real: `enqueueCursors` dedupes on (adapter, action, container, cursor)
-        // across every state, so a page is enqueued at most once ever, and
-        // `replayBudget` refuses long before a runaway fan-out could matter.
-        const added = store.enqueueCursors(adapter.nextCursors?.(capture) ?? []);
-        queued += added;
-
-        const apiErr = apiErrorText(capture);
-        store.completeCursor(item.id, apiErr ?? undefined);
-        if (apiErr) failed += 1;
-        else replayed += 1;
-        console.error(
-          `  ${item.actionId}${item.containerId ? ` ${item.containerId}` : ''}` +
-            `  HTTP ${capture.status ?? '?'}${apiErr ? ` (${apiErr})` : ''}` +
-            `  +${counts.items} item(s), +${added} queued`,
-        );
-      } catch (e) {
-        if (e instanceof ReplayDeniedError) {
-          denied = e;
-          // The budget refills; a rails denial never does. So a spent budget
-          // leaves the item claimed (released just below, back to pending) while
-          // a refused request is settled — re-queuing it would loop forever
-          // against a check that will always say no.
-          if (e.code !== 'rate_budget_exhausted') {
-            store.completeCursor(item.id, `[${e.code}] ${errMsg(e)}`);
-            failed += 1;
-          }
-          break drain;
+        // Deliberately after both lookups: a seed nothing can resolve is settled
+        // without ever asking the OS for a credential.
+        const pool = await poolFor(adapter);
+        const scoped = selectWorkspace(pool, flags.workspace);
+        if (scoped.length === 0) {
+          skipped += 1;
+          continue;
         }
-        store.completeCursor(item.id, errMsg(e));
-        failed += 1;
-        console.error(`  ${item.actionId}: ${errMsg(e)}`);
+        // Whose page is this? Its container's workspace, or the one its params
+        // name — and it goes out as that workspace or not at all (sessionForItem).
+        const workspaceId =
+          workspaceOfParams(store, action, params) ??
+          (item.containerId ? containerWorkspace(store, item.containerId) : undefined);
+        const choice = sessionForItem(pool, scoped, workspaceId, adapter.displayName);
+        if (!choice.ok) {
+          ambiguous += 1;
+          skipped += 1;
+          continue;
+        }
+        const session = choice.session;
+
+        try {
+          // Through the shared funnel: redacted, attributed, classified, parsed.
+          // The follow-on pages are seeded there too — without them the drain
+          // replays one page and stops.
+          //
+          // No depth bound: `CursorSeed.depth` has no column, so a hop counter would
+          // read back undefined. `enqueueCursors` dedupe (a page is enqueued at most
+          // once ever) and `replayBudget` are what bound the drain.
+          const { capture, counts, seeded, parseError } = persistCapture(
+            store,
+            await runReplayAction(store, adapter, action, params, session),
+            adapter,
+          );
+          queued += seeded;
+
+          const outcome = drainOutcome(capture);
+          if (outcome.kind === 'retry-later') {
+            // Left claimed: released back to pending just below, for the next run.
+            rateLimited = true;
+            console.error(`  ${item.actionId}${item.containerId ? ` ${item.containerId}` : ''}  HTTP 429 — left queued for the next run`);
+            break drain;
+          }
+          const apiErr =
+            (outcome.kind === 'failed' ? outcome.error : null) ??
+            (parseError !== undefined ? `parse failed: ${errMsg(parseError)}` : null);
+          settle(item.id, apiErr ?? undefined);
+          if (apiErr) failed += 1;
+          else replayed += 1;
+          console.error(
+            `  ${item.actionId}${item.containerId ? ` ${item.containerId}` : ''}` +
+              `  HTTP ${capture.status ?? '?'}${apiErr ? ` (${apiErr})` : ''}` +
+              `  +${counts.items} item(s), +${seeded} queued`,
+          );
+        } catch (e) {
+          if (e instanceof ReplayDeniedError) {
+            denied = e;
+            // The budget refills; a rails denial never does. So a spent budget
+            // leaves the item claimed (released just below, back to pending) while
+            // a refused request is settled — re-queuing it would loop forever
+            // against a check that will always say no.
+            if (e.code !== 'rate_budget_exhausted') {
+              settle(item.id, `[${e.code}] ${errMsg(e)}`);
+              failed += 1;
+            }
+            break drain;
+          }
+          settle(item.id, errMsg(e));
+          failed += 1;
+          console.error(`  ${item.actionId}: ${errMsg(e)}`);
+        }
       }
     }
+  } finally {
+    // Removed before the store closes, and run on a throw too: a claim this run
+    // took must not wait out the lease because an adapter hook threw.
+    for (const s of SIGNALS) process.off(s, onSignal);
+    stranded = store.releaseCursors([...held]);
+    store.close();
   }
-
-  const stranded = store.releaseStaleCursors();
-  store.close();
 
   console.log(
     `Drained: ${replayed} replayed, ${failed} failed, ${skipped} skipped; ${queued} new page(s) queued.`,
   );
   if (stranded > 0) console.log(`Returned ${stranded} unfinished item(s) to the worklist.`);
+  if (ambiguous > 0) {
+    console.error(
+      `${ambiguous} item(s) left queued: they belong to another workspace than --workspace, or several ` +
+        'workspaces are signed in and nothing says which — pass --workspace <name|team-id>.',
+    );
+  }
+  if (rateLimited) {
+    console.error('Stopped: the service rate-limited this drain (HTTP 429); re-run `sluice replay --all` to continue.');
+    return 0;
+  }
   if (denied) {
     console.error(`Stopped: [${denied.code}] ${errMsg(denied)}`);
     if (denied.code === 'rate_budget_exhausted') {
-      console.error('The replay budget refills — re-run `sluice replay --all` to continue.');
+      console.error(
+        "This process's replay budget is spent (it is per process, not per account) — " +
+          're-run `sluice replay --all` to continue.',
+      );
       return 0;
     }
     console.error('That seed asks for something the replay rails refuse; it is marked failed.');
@@ -1460,13 +1844,10 @@ async function cmdReplay(args: string[]): Promise<number> {
       container: { type: 'string' },
       all: { type: 'boolean' },
       'dry-run': { type: 'boolean' },
-      db: { type: 'string' },
+      ...STORE_OPTIONS,
       workspace: { type: 'string' },
-      token: { type: 'string' },
-      cookie: { type: 'string' },
-      'app-support': { type: 'string' },
+      ...CRED_OPTIONS,
       list: { type: 'boolean' },
-      help: { type: 'boolean', short: 'h' },
     },
   });
   if (values.help) {
@@ -1475,21 +1856,25 @@ async function cmdReplay(args: string[]): Promise<number> {
         'sluice replay --flow <templateId|primaryKey> [--param k=v ...] [--adapter ID] [--db PATH]\n' +
         'sluice replay --list [--adapter ID]   list available replay actions\n' +
         'sluice replay --all [--container ID] [--adapter ID] [--workspace NAME] [--dry-run]\n' +
-        '  --workspace <name|team-id> picks which signed-in workspace to act as.\n' +
-        '  Without it the first extracted session wins, which on a machine signed\n' +
-        '  in to several workspaces returns HTTP 200 + channel_not_found from the\n' +
-        '  wrong one. Same selector as `sluice sync --workspace`.\n' +
+        '  --workspace <name|team-id> picks which signed-in workspace to act as;\n' +
+        '  without it, the workspace the params name, else the only one signed in.\n' +
+        '  Same selector as `sluice sync --workspace`.\n' +
+        '  --token/--cookie are for --adapter (default slack), also with --flow and --all.\n' +
         '  Drain the cursor worklist: replay every queued page, ingest it, and queue\n' +
         '  whatever it names next. --dry-run prints what it would replay and claims\n' +
-        '  nothing. Stops cleanly when the replay budget is spent.\n' +
+        '  nothing (only with --all: a single or --flow replay has no preview). Stops\n' +
+        '  cleanly when the replay budget is spent or the service rate-limits.\n' +
         '  --flow runs a learned multi-step template (see `sluice learn-flows`).',
     );
     return 0;
   }
 
-  const adapters = values.adapter ? apps.filter((a) => a.id === values.adapter) : apps;
-  if (values.adapter && adapters.length === 0) {
-    console.error(`Unknown adapter "${values.adapter}". Installed: ${apps.map((a) => a.id).join(', ')}`);
+  const adapters = scopeApps(values.adapter);
+  if (!adapters) return 1;
+  // Refused, not ignored: a single or --flow replay has no preview, so accepting
+  // the flag would send a real request. Checked before any session.
+  if (values['dry-run'] && !values.all) {
+    console.error('--dry-run applies only to --all; single and --flow replays have no preview.');
     return 1;
   }
 
@@ -1513,19 +1898,21 @@ async function cmdReplay(args: string[]): Promise<number> {
     return 0;
   }
 
+  // Before any session: a malformed --param fails without a Keychain prompt.
+  let params: Record<string, string>;
+  try {
+    params = parseParams(values.param);
+  } catch (e) {
+    console.error(errMsg(e));
+    return 1;
+  }
+
   if (values.flow) {
-    if (values.all || values.list || values.action || positionals[0]) {
+    if (values.action || positionals[0]) {
       console.error('Pass --flow alone (with --param / --adapter / --db), not with an action id or --all.');
       return 1;
     }
-    let params: Record<string, string>;
-    try {
-      params = parseParams(values.param);
-    } catch (e) {
-      console.error(errMsg(e));
-      return 1;
-    }
-    const store = openStore(resolveDb(values.db, (values as { config?: string }).config));
+    const store = openStoreFor(values);
     try {
       let tmpl = store.getFlowTemplate(values.flow);
       if (!tmpl && values.adapter) {
@@ -1548,37 +1935,26 @@ async function cmdReplay(args: string[]): Promise<number> {
         console.error(`Unknown flow template "${values.flow}". Run \`sluice learn-flows\` or \`sluice flows list\`.`);
         return 1;
       }
-      const app = apps.find((a) => a.id === tmpl!.adapterId);
+      const template = tmpl;
+      const app = apps.find((a) => a.id === template.adapterId);
       if (!app) {
-        console.error(`No installed app for adapter "${tmpl.adapterId}".`);
+        console.error(`No installed app for adapter "${template.adapterId}".`);
         return 1;
       }
       let session: Session;
       try {
-        session = await acquireSession(values, app.id);
+        session = await acquireSession(values, app.id, () => workspaceOfValues(store, Object.values(params)));
       } catch (e) {
         console.error(`No session: ${errMsg(e)}`);
         return 1;
       }
       const result = await runFlowReplay({
-        template: tmpl,
+        template,
         params,
         session,
-        io: {
-          build: (step, s, ctx) =>
-            buildFlowStepRequest(tmpl!, step, s, {
-              params: ctx.params,
-              priorResponses: ctx.priorResponses,
-              resolvePath: resolveJsonPath,
-              allowedHosts: app.hosts,
-            }),
-          run: (req) => runReplay(req),
-          record: (c) => {
-            c.adapterId = app.id;
-            store.insertCapture(c);
-            store.applyParseResult(app.parse(c), c.ts || Date.now());
-          },
-        },
+        io: flowReplayIo(template, app, (c) => {
+          persistCapture(store, c, app);
+        }),
       });
       if (result.flow) {
         try {
@@ -1587,9 +1963,8 @@ async function cmdReplay(args: string[]): Promise<number> {
           /* best-effort */
         }
       }
-      console.log(
-        `flow ${tmpl.primaryKey}: ${result.ok ? 'ok' : 'FAILED'}${result.error ? ` — ${result.error}` : ''}`,
-      );
+      // Error and step detail text arrive redacted (runFlowReplay's stepFailed).
+      console.log(`flow ${template.primaryKey}: ${result.ok ? 'ok' : 'FAILED'}${result.error ? ` — ${result.error}` : ''}`);
       if (result.flow?.id) console.log(`parent flow id: ${result.flow.id}`);
       for (const s of result.steps) {
         console.log(
@@ -1609,55 +1984,54 @@ async function cmdReplay(args: string[]): Promise<number> {
     return 1;
   }
 
-  let found: { adapter: (typeof adapters)[number]; action: ReturnType<(typeof adapters)[number]['listReplayActions']>[number] } | undefined;
-  for (const a of adapters) {
-    const act = a.listReplayActions().find((x) => x.id === actionId);
-    if (act) {
-      found = { adapter: a, action: act };
-      break;
-    }
-  }
+  const found = findReplayAction(adapters, actionId);
   if (!found) {
     console.error(`Unknown action "${actionId}". Use \`--list\`.`);
     return 1;
   }
 
-  let session: Session;
+  const { adapter, action } = found;
+
+  // Opened only once it is needed — to tell workspaces apart, or to store the
+  // result — so a command that fails at the session never touches the store.
+  let store: SqliteStore | undefined;
+  const db = (): SqliteStore => {
+    store ??= openStoreFor(values);
+    return store;
+  };
   try {
-    // The action's OWN adapter, not whichever app happens to be first.
-    session = await acquireSession(values, found.adapter.id);
-  } catch (e) {
-    console.error(`No session: ${errMsg(e)}`);
-    return 1;
+    let session: Session;
+    try {
+      // The action's OWN adapter, not whichever app happens to be first; and
+      // with several workspaces, the one the params name (a channel's team).
+      session = await acquireSession(values, adapter.id, () => workspaceOfParams(db(), action, params));
+    } catch (e) {
+      console.error(`No session: ${errMsg(e)}`);
+      return 1;
+    }
+
+    const { capture, counts, parseError } = persistCapture(
+      db(),
+      await runReplayAction(db(), adapter, action, params, session), // secret-redacted Capture
+      adapter,
+    );
+    const apiErr = apiErrorText(capture);
+    if (apiErr) console.error(`replay ${actionId}: ${adapter.displayName} said "${apiErr}"`);
+
+    console.log(
+      `replay ${actionId}: HTTP ${capture.status ?? '?'} ${capture.method} ${capture.host}${capture.path}`,
+    );
+    console.log(
+      `entities: workspaces=${counts.workspaces} actors=${counts.actors} containers=${counts.containers} items=${counts.items}`,
+    );
+    if (parseError !== undefined) {
+      console.error(`replay ${actionId}: parse failed — ${errMsg(parseError)} (the capture is stored, unparsed)`);
+      return 1;
+    }
+    return 0;
+  } finally {
+    store?.close();
   }
-
-  let params: Record<string, string>;
-  try {
-    params = parseParams(values.param);
-  } catch (e) {
-    console.error(errMsg(e));
-    return 1;
-  }
-
-  const store = openStore(resolveDb(values.db, (values as { config?: string }).config));
-  const req = faithfulReplayRequest(store, found.adapter.buildReplayRequest(found.action, params, session));
-  const capture = await runReplay(req); // secret-redacted Capture
-  capture.adapterId = found.adapter.id; // attribute so the Cartographer + stats include it
-  const parsed = found.adapter.parse(capture);
-  const apiErr = apiErrorText(capture);
-  if (apiErr) console.error(`replay ${actionId}: ${found.adapter.displayName} said "${apiErr}"`);
-
-  store.insertCapture(capture);
-  const counts = store.applyParseResult(parsed, capture.ts || Date.now());
-  store.close();
-
-  console.log(
-    `replay ${actionId}: HTTP ${capture.status ?? '?'} ${capture.method} ${capture.host}${capture.path}`,
-  );
-  console.log(
-    `entities: workspaces=${counts.workspaces} actors=${counts.actors} containers=${counts.containers} items=${counts.items}`,
-  );
-  return 0;
 }
 
 // ── export ───────────────────────────────────────────────────────────────────
@@ -1692,16 +2066,6 @@ function readBundle(store: SqliteStore, containerId: string, container?: Contain
     actors: container ? store.listActors(container.workspaceId) : [],
     items: store.listItems(containerId, { limit: 1_000_000 }),
   };
-}
-
-/**
- * An ISO timestamp that cannot throw. `new Date(x).toISOString()` raises a
- * RangeError on a NaN or out-of-range `ts`, and an item with a garbage timestamp
- * is a parser bug that must not also make the export unreadable.
- */
-function isoTs(ms: number): string {
-  const d = new Date(ms);
-  return Number.isNaN(d.getTime()) ? '(unknown time)' : d.toISOString();
 }
 
 /**
@@ -1747,7 +2111,8 @@ function renderTranscript(b: ExportBundle): string {
   // and reversing it here keeps every other format on the store's order.
   for (const item of [...b.items].reverse()) {
     const who = (item.authorId ? named.get(item.authorId) : undefined) ?? item.authorId ?? 'unknown';
-    out.push(`### ${isoTs(item.ts)} — ${who}`, '', item.text.trim() || '*(no text)*', '');
+    // isoTime cannot throw: a garbage `ts` must not make the export unreadable.
+    out.push(`### ${isoTime(item.ts) ?? '(unknown time)'} — ${who}`, '', item.text.trim() || '*(no text)*', '');
   }
   if (b.items.length === 0) out.push('*(no items captured for this container yet)*', '');
   return out.join('\n');
@@ -1802,7 +2167,7 @@ function renderExport(format: Exclude<ExportFormat, 'sqlite'>, b: ExportBundle):
 /** Write one container in `format`. */
 function writeExport(path: string, format: ExportFormat, bundle: ExportBundle): void {
   if (format === 'sqlite') writeSqliteExport(path, bundle);
-  else writeFileSync(path, renderExport(format, bundle));
+  else writePrivateFile(path, renderExport(format, bundle)); // item bodies: owner-only, like the store
 }
 
 async function cmdExport(args: string[]): Promise<number> {
@@ -1814,9 +2179,8 @@ async function cmdExport(args: string[]): Promise<number> {
       out: { type: 'string' },
       format: { type: 'string' },
       all: { type: 'boolean' },
-      db: { type: 'string' },
+      ...STORE_OPTIONS,
       list: { type: 'boolean' },
-      help: { type: 'boolean', short: 'h' },
     },
   });
   if (values.help) {
@@ -1843,7 +2207,7 @@ async function cmdExport(args: string[]): Promise<number> {
   }
   const format: ExportFormat = requested;
 
-  const store = openStore(resolveDb(values.db, (values as { config?: string }).config));
+  const store = openStoreFor(values);
 
   if (values.list) {
     for (const c of store.listContainers()) {
@@ -1868,22 +2232,25 @@ async function cmdExport(args: string[]): Promise<number> {
       store.close();
       return 1;
     }
-    mkdirSync(values.out, { recursive: true });
+    mkdirSync(values.out, { recursive: true, mode: 0o700 });
     if (containers.length === 0) {
       console.error('No containers to export — capture or sync some structure first.');
       store.close();
       return 0;
     }
     let items = 0;
+    let first: string | undefined;
     for (const c of containers) {
       const bundle = readBundle(store, c.id, c);
       const path = join(values.out, exportFileName(c.id, format, c));
       writeExport(path, format, bundle);
+      first ??= path;
       items += bundle.items.length;
       console.error(`  ${path}  (${bundle.items.length} item(s))`);
     }
     store.close();
     console.error(`Wrote ${containers.length} container(s), ${items} item(s) to ${values.out}`);
+    if (first) warnIfTrackedByGit(first);
     return 0;
   }
 
@@ -1896,8 +2263,7 @@ async function cmdExport(args: string[]): Promise<number> {
 
   const bundle = readBundle(store, containerId, containers.find((c) => c.id === containerId));
   store.close();
-  // A typo'd id produced a valid, empty export and exited 0 — silently. Said on
-  // stderr so stdout and the exit code stay exactly what a script expects.
+  // On stderr, so stdout and the exit code stay what a script expects.
   if (!bundle.container) {
     console.error(
       `No container "${containerId}" in this store (see \`--list\`) — exporting ${bundle.items.length} matching item(s).`,
@@ -1924,29 +2290,44 @@ async function cmdExport(args: string[]): Promise<number> {
       : values.out;
   writeExport(path, format, bundle);
   console.error(`Wrote ${bundle.items.length} items to ${path}`);
+  warnIfTrackedByGit(path);
   return 0;
 }
 
 /**
- * Write captured traffic out as an NDJSON fixture the mock runner can replay.
- *
- * This is what makes the codebase workable without credentials. Everything that
- * exercises a parser today needs a live, signed-in account for the service in
- * question, so anyone without one cannot test the store, the WS protocol or the
- * dashboard at all. A fixture recorded once unblocks all of it.
- *
- * Two decisions worth stating, because both are easy to get backwards:
+ * Warn when captured data was just written inside a Git worktree at a path Git
+ * does not ignore: from there it can be committed, and the project graph
+ * indexes it. Says nothing outside a repository, for an ignored path, or when
+ * Git cannot tell. Never blocks the write and never prints the file.
+ */
+function warnIfTrackedByGit(out: string): void {
+  const abs = resolve(out);
+  let toplevel: string;
+  try {
+    toplevel = execFileSync('git', ['-C', dirname(abs), 'rev-parse', '--show-toplevel'], {
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+    }).trim();
+  } catch {
+    return; // not a repository, or no git
+  }
+  if (!toplevel) return;
+  const r = spawnSync('git', ['-C', toplevel, 'check-ignore', '-q', '--', abs], { stdio: 'ignore' });
+  if (r.status === 1) {
+    console.error(
+      `warning: ${out} is inside the Git worktree ${toplevel} and is not ignored; captured data there can be ` +
+        'committed or indexed. Write it outside the repository or add it to .gitignore.',
+    );
+  }
+}
+
+/**
+ * Write captured traffic out as an NDJSON fixture the mock runner can replay, so
+ * the store, WS protocol and dashboard can be exercised without credentials.
  *
  * Redaction runs AGAIN here even though captures are redacted on the way into
- * the store. A fixture is the one artifact that leaves the machine — it gets
- * committed, attached to an issue, sent to a maintainer — so it is worth paying
- * for a second pass rather than trusting that every engine got it right.
- *
- * Assets and binaries are skipped by default. fast.com's speed-test payloads are
- * ~25 MiB EACH; a recorder that takes everything an adapter claims produces a
- * multi-hundred-megabyte file, and Trello's host-only match means its entire JS
- * bundle is attributed to the adapter. `classify()` is what makes that skip
- * mechanical rather than a rule someone has to remember.
+ * the store: a fixture is the one artifact that leaves the machine. Assets and
+ * binaries are skipped by default, mechanically via `classify()`.
  */
 async function cmdRecord(args: string[]): Promise<number> {
   const { values } = parseArgs({
@@ -1957,8 +2338,7 @@ async function cmdRecord(args: string[]): Promise<number> {
       limit: { type: 'string' },
       since: { type: 'string' },
       'include-assets': { type: 'boolean' },
-      db: { type: 'string' },
-      help: { type: 'boolean', short: 'h' },
+      ...STORE_OPTIONS,
     },
   });
   if (values.help) {
@@ -1973,7 +2353,7 @@ async function cmdRecord(args: string[]): Promise<number> {
     return 0;
   }
 
-  const store = openStore(resolveDb(values.db, (values as { config?: string }).config));
+  const store = openStoreFor(values);
   const limit = values.limit ? Number(values.limit) : 10_000;
   if (!Number.isFinite(limit) || limit <= 0) {
     console.error('--limit must be a positive number.');
@@ -1995,12 +2375,12 @@ async function cmdRecord(args: string[]): Promise<number> {
   store.close();
 
   const skipped = { asset: 0, binary: 0 };
-  // Written a line at a time rather than joined and written once. Joining is how
-  // this used to work and it has a hard ceiling: V8 caps a single string at
-  // ~512 MB, so `sluice record` over a real capture set — 12k Notion page chunks,
-  // ~1.5 GB of response bodies — died with "Invalid string length" before it
-  // wrote a byte, on exactly the volume the command exists to handle.
-  const fd = values.out ? openSync(values.out, 'w') : undefined;
+  // Written a line at a time: V8 caps a single string at ~512 MB.
+  //
+  // Owner-only, like the store it came from: the open's mode applies only on
+  // create, so an existing file is tightened before the first body lands in it.
+  const fd = values.out ? openSync(values.out, 'w', 0o600) : undefined;
+  if (values.out) restrictToOwner(values.out);
   const emit = (line: string): void => {
     if (fd === undefined) process.stdout.write(`${line}\n`);
     else writeSync(fd, `${line}\n`);
@@ -2017,22 +2397,19 @@ async function cmdRecord(args: string[]): Promise<number> {
         skipped[kind] += 1;
         continue;
       }
-      emit(
-        JSON.stringify({
-          ...capture,
-          url: redactUrl(capture.url),
-          reqHeaders: redactHeaders(capture.reqHeaders ?? {}),
-          resHeaders: redactHeaders(capture.resHeaders ?? {}),
-          reqBody: capture.reqBody === null ? null : redactText(capture.reqBody),
-          resBody: capture.resBody === null ? null : redactText(capture.resBody),
-        }),
-      );
+      // Re-redacted on the way out — every field, the URL-like ones included:
+      // rows stored before the ingest funnel redacted them still hold raw
+      // query strings, and a fixture is the artifact that leaves the machine.
+      emit(JSON.stringify(redactCapture(capture)));
       written += 1;
     }
   } finally {
     if (fd !== undefined) closeSync(fd);
   }
-  if (values.out) console.error(`Wrote ${written} captures to ${values.out}`);
+  if (values.out) {
+    console.error(`Wrote ${written} captures to ${values.out}`);
+    warnIfTrackedByGit(values.out);
+  }
   const dropped = skipped.asset + skipped.binary;
   if (dropped > 0) {
     console.error(
@@ -2060,11 +2437,10 @@ async function cmdMock(args: string[]): Promise<number> {
     options: {
       speed: { type: 'string' },
       port: { type: 'string' },
-      db: { type: 'string' },
+      ...STORE_OPTIONS,
       loop: { type: 'boolean' },
       serve: { type: 'boolean' },
       config: { type: 'string' },
-      help: { type: 'boolean', short: 'h' },
     },
   });
   const file = positionals[0];
@@ -2102,13 +2478,13 @@ async function cmdMock(args: string[]): Promise<number> {
     return 1;
   }
 
-  const store = openStore(resolveDb(values.db, (values as { config?: string }).config));
-  const adapters = selectApps(values.config);
+  const store = openStoreFor(values);
+  const adapters = selectApps();
   const port = parsePort(values.port, fileConfig(values.config).port ?? config.DEFAULT_HTTP_PORT);
   const server = await startServer({ store, adapters, port, getSessions: () => [] });
 
   console.error(`Replaying ${captures.length} capture(s) at ${speed}x from ${file}`);
-  if (values.serve) printServerBanner(server, false);
+  if (values.serve) printServerBanner(server, 'none');
 
   const controller = new AbortController();
   const stopping = runUntilSignal(async () => {
@@ -2144,15 +2520,18 @@ async function cmdProxy(args: string[]): Promise<number> {
     options: {
       service: { type: 'string' },
       'proxy-port': { type: 'string' },
+      force: { type: 'boolean' },
       help: { type: 'boolean', short: 'h' },
     },
   });
   const sub = positionals[0];
   if (values.help || !sub) {
     console.log(
-      'sluice proxy <on|off|status> [--service NAME] [--proxy-port N]\n' +
+      'sluice proxy <on|off|status> [--service NAME] [--proxy-port N] [--force]\n' +
         '  Toggle the macOS system web proxy so the desktop app routes through Sluice.\n' +
-        '  `on`/`off` may need admin — if so, the exact `sudo networksetup …` command is printed.',
+        '  `on`/`off` may need admin — if so, the exact `sudo networksetup …` command is printed.\n' +
+        '  `on` refuses to replace a proxy someone else set; `off` only clears Sluice\'s own\n' +
+        '  (loopback, --proxy-port) unless --force.',
     );
     return values.help ? 0 : 1;
   }
@@ -2172,12 +2551,31 @@ async function cmdProxy(args: string[]): Promise<number> {
       return 0;
     }
     if (sub === 'on') {
+      if (liveRunState()?.lanProxy) {
+        console.error(LAN_PROXY_REFUSAL);
+        return 1;
+      }
+      assertNoForeignProxy(await getProxyState(service), proxyPort);
       await setProxy(service, config.LOOPBACK_HOST, proxyPort);
       console.log(`System proxy ON → ${config.LOOPBACK_HOST}:${proxyPort} (service: ${service}).`);
       console.log('Now run `sluice start` to capture. Run `sluice proxy off` when you are done.');
       return 0;
     }
     if (sub === 'off') {
+      // Only Sluice's own proxy, unless told otherwise: a bare clear would
+      // disable a corporate proxy the user never asked Sluice to touch.
+      const st = await getProxyState(service);
+      if (!st.enabled) {
+        console.log(`System proxy is already OFF (service: ${service}).`);
+        return 0;
+      }
+      if (!isOurProxy(st, proxyPort) && !values.force) {
+        console.error(
+          `The system proxy points at ${st.host ?? '?'}:${st.port ?? '?'}, not Sluice's ${config.LOOPBACK_HOST}:${proxyPort}. ` +
+            'Pass --proxy-port N if Sluice used another port, or --force to turn it off anyway.',
+        );
+        return 1;
+      }
       await clearProxy(service);
       console.log(`System proxy OFF (service: ${service}).`);
       return 0;
@@ -2190,10 +2588,6 @@ async function cmdProxy(args: string[]): Promise<number> {
   }
 }
 
-function loginKeychain(): string {
-  return join(homedir(), 'Library', 'Keychains', 'login.keychain-db');
-}
-
 async function cmdCaInstall(args: string[]): Promise<number> {
   const { values } = parseArgs({ args, options: { help: { type: 'boolean', short: 'h' } } });
   if (values.help) {
@@ -2201,7 +2595,7 @@ async function cmdCaInstall(args: string[]): Promise<number> {
     return 0;
   }
   const { caPath } = await ensureSluiceCA();
-  const keychain = loginKeychain();
+  const keychain = join(homedir(), 'Library', 'Keychains', 'login.keychain-db');
   console.log(`Sluice CA: ${caPath}`);
   console.log('Trusting it in your login keychain (you may be prompted for your password)…');
   try {
@@ -2248,25 +2642,27 @@ async function cmdSync(args: string[]): Promise<number> {
     args,
     options: {
       workspace: { type: 'string' },
-      db: { type: 'string' },
-      'app-support': { type: 'string' },
-      token: { type: 'string' },
-      cookie: { type: 'string' },
-      help: { type: 'boolean', short: 'h' },
+      ...STORE_OPTIONS,
+      ...CRED_OPTIONS,
+      adapter: { type: 'string' },
     },
   });
   if (values.help) {
     console.log(
-      'sluice sync [--workspace NAME] [--db PATH]\n' +
+      'sluice sync [--workspace NAME] [--adapter ID] [--token X --cookie Y] [--db PATH]\n' +
         '  Reconstruct structure (conversations.list + users.list) for EVERY signed-in\n' +
-        '  workspace, or just one via --workspace <name|team-id>.',
+        '  workspace, or just one via --workspace <name|team-id>.\n' +
+        '  --adapter limits it to one app, and names the app pasted --token/--cookie are\n' +
+        '  for (default slack). `-` reads a value from stdin; SLUICE_TOKEN / SLUICE_COOKIE\n' +
+        '  keep them out of ps and shell history.',
     );
     return 0;
   }
+  if (!scopeApps(values.adapter)) return 1;
 
   let sessions: Session[];
   try {
-    sessions = await extractAllSessions(values);
+    sessions = await extractAllSessions(values, values.adapter);
   } catch (e) {
     console.error(`No sessions: ${errMsg(e)}`);
     return 1;
@@ -2282,7 +2678,7 @@ async function cmdSync(args: string[]): Promise<number> {
     return 1;
   }
 
-  const store = openStore(resolveDb(values.db, (values as { config?: string }).config));
+  const store = openStoreFor(values);
   for (const s of picked) {
     store.upsertSession(redactSession(s));
     const app = apps.find((a) => a.id === s.adapterId);
@@ -2292,29 +2688,20 @@ async function cmdSync(args: string[]): Promise<number> {
     let items = 0;
     // Replay each app's no-argument "structure" actions (conversations.list,
     // users.list, …) — the ones with no required params.
-    for (const action of app.listReplayActions()) {
-      if (action.params.some((p) => p.required)) continue;
-      const params: Record<string, string> = {};
-      for (const p of action.params) if (p.default != null) params[p.name] = p.default;
+    for (const action of structureActions(app)) {
       try {
-        const req = faithfulReplayRequest(store, app.buildReplayRequest(action, params, s));
-        const capture = await runReplay(req);
-        capture.adapterId = app.id; // attribute so the Cartographer + stats include it
-        store.insertCapture(capture);
-        const apiErr = apiErrorText(capture);
+        const r = persistCapture(store, await runReplayAction(store, app, action, defaultParams(action), s), app);
+        const apiErr = apiErrorText(r.capture);
         if (apiErr) console.error(`  ${s.label} ${action.id}: ${apiErr}`);
-        const counts = store.applyParseResult(app.parse(capture), capture.ts || Date.now());
-        containers += counts.containers;
-        actors += counts.actors;
-        items += counts.items;
+        if (r.parseError !== undefined) console.error(`  ${s.label} ${action.id}: parse failed — ${errMsg(r.parseError)}`);
+        containers += r.counts.containers;
+        actors += r.counts.actors;
+        items += r.counts.items;
       } catch (e) {
         console.error(`  ${s.label} ${action.id}: ${errMsg(e)}`);
       }
     }
-    // Neutral nouns, and `items` included. The old line said "+N channels, +N
-    // users" — Slack's vocabulary — and counted only containers+actors, so a
-    // Trello sync that fetched 198 cards (items) reported "+0 channels, +0 users"
-    // and looked like a failure. Report what was actually reconstructed.
+    // Neutral nouns, items included.
     console.log(
       `${s.label}: +${containers} containers, +${actors} actors, +${items} items`,
     );
@@ -2331,43 +2718,24 @@ const REPARSE_PAGE = 500;
 /**
  * Attribute and parse captures that landed before their app was installed.
  *
- * Attribution happens once, at capture time, from whatever adapters the
- * capturing process held — so traffic recorded before an app existed is stored
- * with `adapter_id NULL`, and `ingestCapture` stamps `parsed_at` on it anyway
- * (it parses `adapter ? adapter.parse(c) : {}`). Nothing revisited those rows:
- * 19,405 Notion captures sat fully parsed-and-empty while the parser, run over
- * them offline, produced 8,279 pages. Installing an app was retroactively
- * useless. This command is the missing revisit.
+ * Attribution happens once, at capture time, so traffic recorded before an app
+ * existed is stored with `adapter_id NULL` yet `parsed_at` set. Hence this is
+ * keyed on `adapter_id IS NULL`, NOT on `parsed_at`.
  *
- * Keyed on `adapter_id IS NULL`, NOT on `parsed_at` — the stamp is already set on
- * exactly the rows that need this.
- *
- * Walks OLDEST-FIRST, and that is load-bearing rather than a detail. Entity
- * upserts are last-writer-wins on text, so applying captures newest-first left
- * the EARLIEST observation of every row in the store — the opposite of live
- * ingest, where captures arrive in time order and a later observation
- * supersedes an earlier one. On this machine it silently downgraded 9 Notion
- * rows to their pre-rename titles, which would have made a downstream
- * derivation keyed on those titles produce nothing and look like missing data
- * rather than stale data.
- *
- * Paged on a `(ts, id)` keyset: oldest-first with ties broken by id, and each
- * page starting strictly after the last row of the one before. A `ts` bound
- * alone cannot do this. Rows share a millisecond, and rows this walk does not
- * claim (--dry-run, --reapply, or traffic no selected app matches) stay in the
- * result set, so a tick holding more than one page of them came back as the
- * same page every time and the walk stopped there, exiting 0.
+ * Walks OLDEST-FIRST because entity upserts are last-writer-wins, matching live
+ * ingest order. Paged on a `(ts, id)` keyset: rows share a millisecond, and rows
+ * this walk does not claim (--dry-run, --reapply, or traffic no selected app
+ * matches) stay in the result set, so a `ts` bound alone repeats the same page.
  */
 async function cmdReparse(args: string[]): Promise<number> {
   const { values } = parseArgs({
     args,
     options: {
       adapter: { type: 'string' },
-      db: { type: 'string' },
+      ...STORE_OPTIONS,
       'dry-run': { type: 'boolean' },
       reapply: { type: 'boolean' },
       limit: { type: 'string' },
-      help: { type: 'boolean', short: 'h' },
     },
   });
   if (values.help) {
@@ -2385,11 +2753,8 @@ async function cmdReparse(args: string[]): Promise<number> {
     );
     return 0;
   }
-  const adapters = values.adapter ? apps.filter((a) => a.id === values.adapter) : apps;
-  if (values.adapter && adapters.length === 0) {
-    console.error(`Unknown adapter "${values.adapter}". Installed: ${apps.map((a) => a.id).join(', ')}`);
-    return 1;
-  }
+  const adapters = scopeApps(values.adapter);
+  if (!adapters) return 1;
   const dry = Boolean(values['dry-run']);
   const reapply = Boolean(values.reapply);
   if (reapply && !values.adapter) {
@@ -2404,7 +2769,7 @@ async function cmdReparse(args: string[]): Promise<number> {
     return 1;
   }
 
-  const store = openStore(resolveDb(values.db, (values as { config?: string }).config));
+  const store = openStoreFor(values);
   const claimed = new Map<string, number>();
   const totals = { workspaces: 0, actors: 0, containers: 0, items: 0 };
   let scanned = 0;
@@ -2426,13 +2791,7 @@ async function cmdReparse(args: string[]): Promise<number> {
     for (const c of page) {
       if (scanned >= max) break;
       scanned += 1;
-      const adapter = adapters.find((a) => {
-        try {
-          return a.matchRequest({ host: c.host, path: c.path, method: c.method, url: c.url });
-        } catch {
-          return false; // matchRequest is contractually non-throwing; a capture is not lost to one that does
-        }
-      });
+      const adapter = matchAdapter(adapters, c);
       if (!adapter) {
         unmatched += 1;
         continue;
@@ -2440,37 +2799,20 @@ async function cmdReparse(args: string[]): Promise<number> {
       claimed.set(adapter.id, (claimed.get(adapter.id) ?? 0) + 1);
       if (dry) continue;
 
-      c.adapterId = adapter.id;
-      if (adapter.classify) {
-        try {
-          const named = adapter.classify(c);
-          if (named.operation) c.classification = named.operation;
-        } catch {
-          /* classify is non-throwing by contract */
-        }
-      }
+      // The same funnel as live ingest, re-classifying and re-stamping: the
+      // upsert rewrites adapter_id, classification and parsed_at in place (and
+      // re-redacts the row), and parsed_at is set only if this parse succeeds.
       c.parsedAt = Date.now();
-      store.insertCapture(c); // upsert: rewrites adapter_id, classification, parsed_at in place
-      let parsed: ParseResult = {};
-      try {
-        parsed = adapter.parse(c);
-      } catch (e) {
+      const r = persistCapture(store, c, adapter, { reclassify: true });
+      if (r.parseError !== undefined) {
         parseErrors += 1;
-        console.error(`  ${adapter.id} parse failed on ${c.id}: ${errMsg(e)}`);
+        console.error(`  ${adapter.id} parse failed on ${c.id}: ${errMsg(r.parseError)}`);
       }
-      const counts = store.applyParseResult(parsed, c.ts || Date.now());
-      totals.workspaces += counts.workspaces;
-      totals.actors += counts.actors;
-      totals.containers += counts.containers;
-      totals.items += counts.items;
-      if (adapter.nextCursors !== undefined) {
-        try {
-          const next = adapter.nextCursors(c);
-          if (next.length > 0) seeds += store.enqueueCursors(next);
-        } catch {
-          /* nextCursors is non-throwing by contract */
-        }
-      }
+      totals.workspaces += r.counts.workspaces;
+      totals.actors += r.counts.actors;
+      totals.containers += r.counts.containers;
+      totals.items += r.counts.items;
+      seeds += r.seeded;
     }
 
     after = { ts: last.ts, id: last.id };
@@ -2507,8 +2849,12 @@ async function cmdBuildDb(args: string[]): Promise<number> {
     );
     return 0;
   }
-  const store = openStore(resolveDb(values.db, (values as { config?: string }).config));
-  const { tables } = materialize(store);
+  const store = openStoreFor(values);
+  // Reconcile before deriving tables (idempotent, offline).
+  reconcileAll(store);
+  // The explicit full rebuild: drop first, so rows from captures since pruned do
+  // not survive (materialize only upserts); it owns the watermark.
+  const tables = rebuildMaterialized(store, apps.map((a) => a.id));
   store.close();
   if (tables.length === 0) {
     console.log('No per-app tables derived yet — capture some traffic first.');
@@ -2523,11 +2869,10 @@ async function cmdApiDoc(args: string[]): Promise<number> {
   const { values } = parseArgs({
     args,
     options: {
-      db: { type: 'string' },
+      ...STORE_OPTIONS,
       out: { type: 'string' },
       host: { type: 'string' },
       app: { type: 'string' },
-      help: { type: 'boolean', short: 'h' },
     },
   });
   if (values.help) {
@@ -2539,7 +2884,7 @@ async function cmdApiDoc(args: string[]): Promise<number> {
     );
     return 0;
   }
-  const store = openStore(resolveDb(values.db, (values as { config?: string }).config));
+  const store = openStoreFor(values);
   const hostContains = values.host
     ? values.host.split(',').map((s) => s.trim()).filter(Boolean)
     : undefined;
@@ -2554,21 +2899,18 @@ async function cmdApiDoc(args: string[]): Promise<number> {
   return 0;
 }
 
-// ── dispatch ─────────────────────────────────────────────────────────────────
-
 /**
  * `sluice prune` — bound the capture store. Sluice captures ALL traffic with
- * bodies up to 5 MB and previously had no expiry, so the DB grew forever.
+ * bodies up to 5 MB, so the DB otherwise grows without bound.
  */
 async function cmdPrune(args: string[]): Promise<number> {
   const { values } = parseArgs({
     args,
     options: {
-      db: { type: 'string' },
+      ...STORE_OPTIONS,
       days: { type: 'string' },
       'max-rows': { type: 'string' },
       vacuum: { type: 'boolean' },
-      help: { type: 'boolean', short: 'h' },
     },
   });
   if (values.help) {
@@ -2595,31 +2937,35 @@ async function cmdPrune(args: string[]): Promise<number> {
     return 1;
   }
 
-  const store = openStore(resolveDb(values.db, (values as { config?: string }).config));
+  const store = openStoreFor(values);
   const before = store.countCaptures();
   const removed = store.pruneCaptures({
     maxAgeMs: days === undefined ? undefined : days * 24 * 60 * 60 * 1000,
     maxRows,
-    vacuum: Boolean(values.vacuum),
   });
+  if (removed > 0) {
+    // The derived tables still hold rows (message text included) for what was
+    // just deleted — materialize never deletes — so drop and rebuild them. The
+    // full registry, so a disabled app's derived rows go too.
+    const t = rebuildMaterialized(store, apps.map((a) => a.id));
+    console.log(`Rebuilt ${t.length} derived table(s).`);
+  }
+  // After the rebuild, so VACUUM also reclaims the dropped tables' pages.
+  if (values.vacuum && removed > 0) store.vacuum();
   const after = store.countCaptures();
   store.close();
   console.log(`Pruned ${removed} capture(s): ${before} → ${after}.`);
   return 0;
 }
 
-/**
- * `sluice wipe` — the panic button. Documented in the plan and in SECURITY.md as
- * the mechanism behind "reversible trust", but never actually implemented.
- */
+/** `sluice wipe` — the panic button, the mechanism behind "reversible trust" (SECURITY.md). */
 async function cmdWipe(args: string[]): Promise<number> {
   const { values } = parseArgs({
     args,
     options: {
-      db: { type: 'string' },
+      ...STORE_OPTIONS,
       all: { type: 'boolean' },
       yes: { type: 'boolean', short: 'y' },
-      help: { type: 'boolean', short: 'h' },
     },
   });
   if (values.help) {
@@ -2632,13 +2978,12 @@ async function cmdWipe(args: string[]): Promise<number> {
     return 0;
   }
 
-  const dbPath = resolveDb(values.db, (values as { config?: string }).config);
+  const dbPath = resolveDb(values.db);
   const targets: string[] = [dbPath, `${dbPath}-wal`, `${dbPath}-shm`];
-  // dirname(sluiceCaCertPath()) rather than sluiceHome()/ca: on macOS the CA
-  // lives under ~/Library/Application Support/Sluice, not ~/.sluice, so the old
-  // path pointed at a directory that never exists and `wipe --all` silently
-  // left the certificate behind.
-  const caDir = dirname(sluiceCaCertPath());
+  // The CA lives beside sluiceCaCertPath() (on macOS under
+  // ~/Library/Application Support/Sluice, not ~/.sluice).
+  const caPath = sluiceCaCertPath();
+  const caDir = dirname(caPath);
   const profileDir = defaultChromeProfileDir();
   if (values.all) targets.push(caDir, profileDir);
 
@@ -2654,9 +2999,8 @@ async function cmdWipe(args: string[]): Promise<number> {
     // Untrust before deleting: removing the file alone leaves a trusted cert in
     // the keychain with no corresponding key, which is worse than either state.
     try {
-      const certPath = join(caDir, 'sluice-ca.cert');
-      if (existsSync(certPath)) {
-        execFileSync('/usr/bin/security', ['remove-trusted-cert', '-d', certPath], { stdio: 'ignore' });
+      if (existsSync(caPath)) {
+        execFileSync('/usr/bin/security', ['remove-trusted-cert', '-d', caPath], { stdio: 'ignore' });
         console.log('Removed CA trust.');
       }
     } catch {
@@ -2678,20 +3022,11 @@ async function cmdWipe(args: string[]): Promise<number> {
   return 0;
 }
 
-
-/** `sluice adapters` — what this build can capture, and how each authenticates. */
 /**
- * Turn an installed app on or off, by editing the home config.
- *
- * Exists because the allow-list was a config key you had to know about and
- * hand-edit, and the thing it controls is not a preference — it is **which
- * hosts the proxy decrypts**. A setting with that consequence should be one
- * command and should print what it changed.
- *
- * Writes `~/.sluice/config.json` specifically, not whatever config `loadConfig`
- * finds by walking up from the working directory. Enabling an app from inside a
- * repo, into that repo's config, would silently do nothing the next time you ran
- * Sluice from anywhere else.
+ * Turn an installed app on or off by editing `~/.sluice/config.json`. The
+ * allow-list decides **which hosts the proxy decrypts**, so it is one command
+ * that prints what changed. It writes the home config, not the nearest repo
+ * config, so the change applies everywhere.
  */
 async function cmdApp(args: string[]): Promise<number> {
   const [action, id] = args;
@@ -2760,8 +3095,8 @@ async function cmdApp(args: string[]): Promise<number> {
     }
   }
   config.adapters = next;
-  mkdirSync(dirname(configPath), { recursive: true });
-  writeFileSync(configPath, `${JSON.stringify(config, null, 2)}\n`);
+  mkdirSync(dirname(configPath), { recursive: true, mode: 0o700 });
+  writePrivateFile(configPath, `${JSON.stringify(config, null, 2)}\n`);
 
   const enabled = apps.filter((a) => next.includes(a.id));
   console.log(`${action === 'enable' ? 'Enabled' : 'Disabled'} ${id}. Now active: ${next.join(', ')}`);
@@ -2770,6 +3105,7 @@ async function cmdApp(args: string[]): Promise<number> {
   return 0;
 }
 
+/** `sluice adapters` — what this build can capture, and how each authenticates. */
 async function cmdAdapters(args: string[]): Promise<number> {
   const { values } = parseArgs({
     args,
@@ -2788,7 +3124,7 @@ async function cmdAdapters(args: string[]): Promise<number> {
   // working?" is a question you ask before capturing anything, and an answer
   // that requires starting a proxy to see is not an answer.
   const discovery = await installExternalAdapters();
-  const selected = selectApps(values.config);
+  const selected = selectApps();
   const rows = selected.map((a) => ({
     id: a.id,
     displayName: a.displayName,
@@ -2827,6 +3163,8 @@ interface RunState {
   db: string;
   mode: string;
   startedAt: number;
+  /** True when Engine A was started with `--lan-proxy` (0.0.0.0). */
+  lanProxy?: boolean;
   /**
    * The MITM proxy port, when this runner has one. Recorded so `doctor` can tell
    * "our own proxy is listening" from "something else has the port" — without it
@@ -2842,7 +3180,7 @@ function statePath(): string {
 function writeRunState(st: RunState): void {
   try {
     config.ensureSluiceHome();
-    writeFileSync(statePath(), JSON.stringify(st, null, 2));
+    writePrivateFile(statePath(), JSON.stringify(st, null, 2));
   } catch {
     /* status/stop are conveniences — never fail a capture over them */
   }
@@ -2858,7 +3196,6 @@ function clearRunState(): void {
 
 function readRunState(): RunState | undefined {
   try {
-    if (!existsSync(statePath())) return undefined;
     return JSON.parse(readFileSync(statePath(), 'utf8')) as RunState;
   } catch {
     return undefined;
@@ -2875,6 +3212,12 @@ function pidAlive(pid: number): boolean {
   }
 }
 
+/** The run state of a runner that is still alive — never a file a SIGKILL or power loss left behind. */
+function liveRunState(): RunState | undefined {
+  const st = readRunState();
+  return st && pidAlive(st.pid) ? st : undefined;
+}
+
 async function cmdStatus(args: string[]): Promise<number> {
   const { values } = parseArgs({
     args,
@@ -2887,7 +3230,7 @@ async function cmdStatus(args: string[]): Promise<number> {
 
   const st = readRunState();
   const running = st !== undefined && pidAlive(st.pid);
-  const dbPath = resolveDb(values.db, (values as { config?: string }).config);
+  const dbPath = resolveDb(values.db, values.config);
   let captures = 0;
   try {
     const store = openStore(dbPath);
@@ -2950,18 +3293,11 @@ async function cmdStop(args: string[]): Promise<number> {
   // A clean shutdown clears its own state and restores the system proxy;
   // --force cannot, so do both here when we know the proxy port.
   if (values.force) {
-    if (typeof st.proxyPort === 'number' && st.proxyPort > 0) {
-      try {
-        await restoreSystemProxyIfOurs(st.proxyPort);
-      } catch (e) {
-        console.error(`Warning: could not restore system proxy: ${errMsg(e)}`);
-      }
-    }
+    if (typeof st.proxyPort === 'number' && st.proxyPort > 0) await restoreSystemProxyIfOurs(st.proxyPort);
     clearRunState();
   }
   return 0;
 }
-
 
 /**
  * `sluice auth` — how this service authenticates you, derived from what you
@@ -2972,12 +3308,11 @@ async function cmdAuth(args: string[]): Promise<number> {
   const { values } = parseArgs({
     args,
     options: {
-      db: { type: 'string' },
+      ...STORE_OPTIONS,
       app: { type: 'string' },
       json: { type: 'boolean' },
       hints: { type: 'boolean' },
       config: { type: 'string' },
-      help: { type: 'boolean', short: 'h' },
     },
   });
   if (values.help) {
@@ -2991,16 +3326,20 @@ async function cmdAuth(args: string[]): Promise<number> {
     return 0;
   }
 
-  const store = openStore(resolveDb(values.db, (values as { config?: string }).config));
+  const store = openStoreFor(values);
   const captures = store.listCaptures({ limit: 1_000_000, adapterId: values.app });
   const flow = mapAuthFlow(captures, values.app ?? null);
 
-  const hints = values.hints
-    ? captures
-        .flatMap((c) => reconstructCredentials(c, selectApps(values.config)))
-        .filter((h, i, all) => all.findIndex((o) => o.name === h.name && o.location === h.location) === i)
-        .sort((a, b) => b.confidence - a.confidence)
-    : [];
+  let hints: CredentialHint[] = [];
+  if (values.hints) {
+    const adapters = selectApps(); // once, not per capture: it re-reads ~/.sluice/config.json
+    const seen = new Map<string, CredentialHint>();
+    for (const h of captures.flatMap((c) => reconstructCredentials(c, adapters))) {
+      const key = `${h.location}\u0000${h.name}`;
+      if (!seen.has(key)) seen.set(key, h); // the first occurrence wins
+    }
+    hints = [...seen.values()].sort((a, b) => b.confidence - a.confidence);
+  }
   store.close();
 
   if (values.json) {
@@ -3044,7 +3383,6 @@ async function cmdAuth(args: string[]): Promise<number> {
   return 0;
 }
 
-
 // ── flows / learn-flows ──────────────────────────────────────────────────────
 
 async function cmdFlows(args: string[]): Promise<number> {
@@ -3069,12 +3407,11 @@ async function cmdFlows(args: string[]): Promise<number> {
         adapter: { type: 'string' },
         source: { type: 'string' },
         q: { type: 'string' },
-        db: { type: 'string' },
-        help: { type: 'boolean', short: 'h' },
+        ...STORE_OPTIONS,
       },
     });
     if (values.help) return cmdFlows(['help']);
-    const store = openStore(resolveDb(values.db, (values as { config?: string }).config));
+    const store = openStoreFor(values);
     try {
       const flows = store.listFlows({
         adapterId: values.adapter,
@@ -3087,10 +3424,7 @@ async function cmdFlows(args: string[]): Promise<number> {
         return 0;
       }
       for (const f of flows) {
-        const primaryOp =
-          f.steps.find((s) => s.captureId === f.primaryCaptureId)?.operation ??
-          f.steps.find((s) => s.role === 'primary')?.operation ??
-          '?';
+        const primaryOp = primaryOperation(f) ?? '?';
         console.log(
           `${f.id}  [${f.source}] ${f.adapterId}  ${primaryOp}  steps=${f.steps.length}` +
             (f.label ? `  ${f.label}` : ''),
@@ -3108,7 +3442,7 @@ async function cmdFlows(args: string[]): Promise<number> {
       options: { adapter: { type: 'string' }, db: { type: 'string' }, help: { type: 'boolean', short: 'h' } },
     });
     if (values.help) return cmdFlows(['help']);
-    const store = openStore(resolveDb(values.db, (values as { config?: string }).config));
+    const store = openStoreFor(values);
     try {
       const tmpls = store.listFlowTemplates({ adapterId: values.adapter, limit: 200 });
       if (tmpls.length === 0) {
@@ -3139,7 +3473,7 @@ async function cmdFlows(args: string[]): Promise<number> {
       console.error('Provide a flow or template id.');
       return 1;
     }
-    const store = openStore(resolveDb(values.db, (values as { config?: string }).config));
+    const store = openStoreFor(values);
     try {
       const flow = store.getFlow(id);
       if (flow) {
@@ -3152,19 +3486,8 @@ async function cmdFlows(args: string[]): Promise<number> {
         const safe = {
           ...tmpl,
           steps: tmpl.steps.map((s) => ({
-            seq: s.seq,
-            role: s.role,
-            method: s.method,
-            path: s.path,
-            operation: s.operation,
-            required: s.required,
-            support: s.support,
-            delayMsP50: s.delayMsP50,
-            unreproducible: s.unreproducible,
-            unreproducibleReason: s.unreproducibleReason,
-            params: s.params
-              ? Object.fromEntries(Object.entries(s.params).map(([k, v]) => [k, { kind: v.kind, name: 'name' in v ? v.name : undefined, fromStep: 'fromStep' in v ? v.fromStep : undefined, jsonPath: 'jsonPath' in v ? v.jsonPath : undefined }]))
-              : undefined,
+            ...templateStepSummary(s),
+            params: paramSourcesSummary(s.params),
             hasRequestTemplate: Boolean(s.request),
           })),
         };
@@ -3190,7 +3513,7 @@ async function cmdFlows(args: string[]): Promise<number> {
       console.error(`Provide a flow id to ${sub}.`);
       return 1;
     }
-    const store = openStore(resolveDb(values.db, (values as { config?: string }).config));
+    const store = openStoreFor(values);
     try {
       const got = sub === 'pin' ? store.pinFlow(id) : store.unpinFlow(id);
       if (!got) {
@@ -3212,8 +3535,7 @@ async function cmdFlows(args: string[]): Promise<number> {
         capture: { type: 'string', multiple: true },
         label: { type: 'string' },
         adapter: { type: 'string' },
-        db: { type: 'string' },
-        help: { type: 'boolean', short: 'h' },
+        ...STORE_OPTIONS,
       },
     });
     if (values.help) return cmdFlows(['help']);
@@ -3226,7 +3548,7 @@ async function cmdFlows(args: string[]): Promise<number> {
       console.error('Pass at least one --capture <id>.');
       return 1;
     }
-    const store = openStore(resolveDb(values.db, (values as { config?: string }).config));
+    const store = openStoreFor(values);
     try {
       const flow = store.createPinnedFlow({
         primaryCaptureId: values.primary,
@@ -3258,8 +3580,7 @@ async function cmdLearnFlows(args: string[]): Promise<number> {
       'min-steps': { type: 'string' },
       'min-samples': { type: 'string' },
       'no-cluster': { type: 'boolean' },
-      db: { type: 'string' },
-      help: { type: 'boolean', short: 'h' },
+      ...STORE_OPTIONS,
     },
   });
   if (values.help) {
@@ -3271,7 +3592,7 @@ async function cmdLearnFlows(args: string[]): Promise<number> {
     return 0;
   }
 
-  const store = openStore(resolveDb(values.db, (values as { config?: string }).config));
+  const store = openStoreFor(values);
   try {
     let clustered = 0;
     if (!values['no-cluster']) {
@@ -3294,6 +3615,9 @@ async function cmdLearnFlows(args: string[]): Promise<number> {
       adapterId: values.adapter,
       minSamples: Number.isFinite(minSamples) ? minSamples : undefined,
       persist: true,
+      // So a template never carries a non-GET step its app does not declare as a
+      // read — the build rail would refuse it at replay anyway.
+      adapters: apps,
     });
     console.log(`learned ${templates.length} template(s)`);
     for (const t of templates) {
@@ -3306,7 +3630,6 @@ async function cmdLearnFlows(args: string[]): Promise<number> {
     store.close();
   }
 }
-
 
 const USAGE = `sluice — local-only capture + explorer for your own SaaS API traffic
 
@@ -3332,7 +3655,7 @@ Commands:
   record          Dump captures as NDJSON for the mock runner (credential-free replay).
   mock            Replay a recorded NDJSON fixture through the real ingest path.
   auth            Map how a service authenticates you, from captured traffic. No secrets.
-  app             App-specific helpers (subcommands per installed adapter).
+  app             List, enable or disable installed apps (which hosts the proxy decrypts).
   adapters        List installed apps: hosts, credential source, replay actions, MCP tools.
   status          Is a runner serving? Report pid/port/uptime and store size.
   stop            Ask a running runner to shut down (--force to SIGKILL).
@@ -3342,12 +3665,40 @@ Commands:
 Common options:
   -h, --help      Show help (also works per-command)
   --db PATH       SQLite path (default ~/.sluice/sluice.db)
-  --port N        HTTP+WS port (default 7788)
-  --config PATH   Config file (default: nearest sluice.config.json, then ~/.sluice/config.json)
+  --port N        HTTP+WS port (default 7788; serve, start, capture, mock)
+  --config PATH   Config file (serve, start, mock, status, auth, adapters; default: nearest sluice.config.json, then ~/.sluice/config.json)
 
 macOS is the primary target; token extraction is macOS-only (use --token/--cookie elsewhere).
 
 Sluice is unfunded: https://github.com/sponsors/YasserShkeir`;
+
+const COMMANDS = new Map<string, (args: string[]) => Promise<number>>([
+  ['doctor', cmdDoctor],
+  ['extract-token', cmdExtractToken],
+  ['serve', cmdServe],
+  ['start', cmdStart],
+  ['capture', cmdCapture],
+  ['proxy', cmdProxy],
+  ['ca-install', cmdCaInstall],
+  ['ca-uninstall', cmdCaUninstall],
+  ['sync', cmdSync],
+  ['build-db', cmdBuildDb],
+  ['reparse', cmdReparse],
+  ['apidoc', cmdApiDoc],
+  ['replay', cmdReplay],
+  ['flows', cmdFlows],
+  ['learn-flows', cmdLearnFlows],
+  ['record', cmdRecord],
+  ['mock', cmdMock],
+  ['export', cmdExport],
+  ['prune', cmdPrune],
+  ['wipe', cmdWipe],
+  ['adapters', cmdAdapters],
+  ['app', cmdApp],
+  ['auth', cmdAuth],
+  ['status', cmdStatus],
+  ['stop', cmdStop],
+]);
 
 async function main(): Promise<number> {
   const cmd = process.argv[2];
@@ -3356,62 +3707,11 @@ async function main(): Promise<number> {
     console.log(USAGE);
     return cmd ? 0 : 1;
   }
-  switch (cmd) {
-    case 'doctor':
-      return cmdDoctor(rest);
-    case 'extract-token':
-      return cmdExtractToken(rest);
-    case 'serve':
-      return cmdServe(rest);
-    case 'start':
-      return cmdStart(rest);
-    case 'capture':
-      return cmdCapture(rest);
-    case 'proxy':
-      return cmdProxy(rest);
-    case 'ca-install':
-      return cmdCaInstall(rest);
-    case 'ca-uninstall':
-      return cmdCaUninstall(rest);
-    case 'sync':
-      return cmdSync(rest);
-    case 'build-db':
-      return cmdBuildDb(rest);
-    case 'reparse':
-      return cmdReparse(rest);
-    case 'apidoc':
-      return cmdApiDoc(rest);
-    case 'replay':
-      return cmdReplay(rest);
-    case 'flows':
-      return cmdFlows(rest);
-    case 'learn-flows':
-      return cmdLearnFlows(rest);
-    case 'record':
-      return cmdRecord(rest);
-    case 'mock':
-      return cmdMock(rest);
-    case 'export':
-      return cmdExport(rest);
-    case 'prune':
-      return cmdPrune(rest);
-    case 'wipe':
-      return cmdWipe(rest);
-    case 'adapters':
-      return cmdAdapters(rest);
-    case 'app':
-      return cmdApp(rest);
-    case 'auth':
-      return cmdAuth(rest);
-    case 'status':
-      return cmdStatus(rest);
-    case 'stop':
-      return cmdStop(rest);
-    default:
-      console.error(`Unknown command "${cmd}".\n`);
-      console.log(USAGE);
-      return 1;
-  }
+  const run = COMMANDS.get(cmd);
+  if (run) return run(rest);
+  console.error(`Unknown command "${cmd}".\n`);
+  console.log(USAGE);
+  return 1;
 }
 
 main()

@@ -21,18 +21,9 @@ export const WS_PROTOCOL_VERSION = 1;
 // ── Server → client ──────────────────────────────────────────────────────────
 
 /**
- * What every server frame carries beyond its own payload.
- *
- * `seq` is stamped on BROADCAST frames only — the ones the server holds in a
- * ring so a reconnecting client can resume. Frames addressed to one connection
- * (the hello, the subscribe-time priming, a replay result) answer something that
- * connection asked for and mean nothing to replay, so they carry none.
- *
- * The counter is per-RUNNER, not per-connection. A subscriber with a filter
- * therefore sees gaps — 5, 7, 8, 12 — and that is deliberate: renumbering per
- * connection would mean re-serializing every frame for every subscriber, and one
- * `JSON.stringify` per broadcast is worth more than contiguous numbering. A
- * resume replays the ring through the same filter, so the gaps come out the same.
+ * `seq` is stamped on BROADCAST frames only — the ones held in the resume ring —
+ * never on frames answering one connection. It is per-runner, so a filtered
+ * subscriber sees gaps (renumbering would mean re-serializing per subscriber).
  */
 export interface ServerFrame {
   seq?: number;
@@ -43,33 +34,19 @@ export interface HelloMsg extends ServerFrame {
   protocolVersion: number;
   appVersion: string;
   adapters: { id: string; displayName: string }[];
-  /**
-   * Whether this runner was started with `--terminal`. A static server
-   * capability, not runtime state — the embedded Claude Code terminal is off
-   * unless the operator opted in at launch, so the dashboard only shows the
-   * terminal affordance when this is true. It lives on `hello` (always sent,
-   * once) rather than in the environment frame because it never changes for the
-   * life of the process.
-   */
+  /** The runner was started with `--terminal` (off unless opted in); fixed for the process's life. */
   terminalEnabled?: boolean;
 }
 
 /**
- * The `/pty` socket's wire protocol — deliberately NOT part of the zod-validated
- * {@link ClientMsg}/{@link ServerMsg} unions.
- *
- * `/pty` is a second, separately-gated WebSocket (its own capability secret) that
- * carries a raw terminal byte stream to and from an embedded Claude Code session.
- * It has nothing to do with capture traffic, so it stays off the main channel:
- * folding a high-frequency keystroke/redraw stream into the broadcast ring — which
- * pins bodies for resume — would be actively wrong. These frames are small and
- * hand-validated at the boundary in server.ts.
+ * The `/pty` socket's wire protocol: a separately-gated WebSocket carrying a raw
+ * terminal stream, deliberately outside {@link ClientMsg}/{@link ServerMsg} so
+ * keystrokes never enter the broadcast ring. Hand-validated in server.ts.
  */
 export type PtyClientFrame =
   | { t: 'stdin'; d: string }
   | { t: 'resize'; cols: number; rows: number }
-  /** Explicitly end the session (kill the child). A reload/close does NOT — the
-   *  session persists so it can be re-attached; only this tears it down. */
+  /** Kill the session; a reload/close keeps it for re-attach. */
   | { t: 'end' };
 
 export type PtyServerFrame =
@@ -148,14 +125,7 @@ export interface SessionDiscoveredMsg extends ServerFrame {
   session: RedactedSession;
 }
 
-/**
- * The replay rate budget as a value, so the UI can SHOW it.
- *
- * The bucket used to be write-only: the one signal it produced was a refusal, at
- * the moment it was already exhausted. That is the worst time to learn about a
- * rate limit — someone watching a meter drain slows down, someone who gets a
- * refusal has already spent the budget on the request that was refused.
- */
+/** The replay rate budget, so the UI can show it draining before a refusal. */
 export interface ReplayBudgetState {
   /** Replays available right now. */
   tokens: number;
@@ -164,12 +134,8 @@ export interface ReplayBudgetState {
   /** How long the window is, in ms. */
   refillMs: number;
   /**
-   * How long until at least one token exists, in ms; 0 when one already does.
-   *
-   * Named for the HTTP header it plays the part of, and sent as a DURATION
-   * rather than a deadline: the page's clock is not the runner's, and a wall
-   * time computed on one and counted down on the other is wrong by the skew
-   * between them.
+   * Ms until at least one token exists (0 when one does). A duration, not a
+   * deadline: the page's clock is not the runner's.
    */
   retryAfterMs: number;
 }
@@ -177,11 +143,7 @@ export interface ReplayBudgetState {
 export interface StatusMsg extends ServerFrame {
   type: 'status';
   engines: EngineStatus[];
-  /**
-   * Optional because the field is newer than the frame and an older runner
-   * simply will not send it — the UI hides the meter rather than rendering a
-   * budget of zero, which would read as "exhausted" instead of "not reported".
-   */
+  /** Absent from older runners; the UI then hides the meter rather than showing zero. */
   replayBudget?: ReplayBudgetState;
 }
 
@@ -208,10 +170,7 @@ export interface AppBuildStatus {
 export interface AppCatalogMcpTool {
   name: string;
   description: string;
-  /**
-   * Parameter names, in declaration order. Names only: the tool's schema is a
-   * zod raw shape, and zod objects do not survive JSON.
-   */
+  /** Parameter names in declaration order (a zod shape does not survive JSON). */
   params: string[];
 }
 
@@ -220,16 +179,7 @@ export interface AppCatalogReplayAction {
   id: string;
   label: string;
   method: string;
-  /**
-   * `kind` is the ReplayParam kind as a plain string rather than the enum, so
-   * adding a param kind to the adapter contract is not also a protocol change.
-   *
-   * `label` and `default` used to be dropped here, which was fine while the
-   * catalog only had to render chips and became wrong the moment a form was
-   * generated from it: a field labelled `types` instead of "Channel types", and
-   * an adapter's own `limit=200` default silently not applied, are both the
-   * adapter's stated intent being thrown away in transit.
-   */
+  /** `kind` is a plain string, so a new ReplayParam kind is not a protocol change. */
   params: { name: string; kind: string; required?: boolean; label?: string; default?: string }[];
 }
 
@@ -239,20 +189,9 @@ export interface AppCatalogEntry {
   /** an engine is actively capturing this app right now */
   capturing: boolean;
   build: AppBuildStatus;
-  /**
-   * The hostnames the adapter claims — and therefore exactly what the proxy
-   * decrypts for this app. The one field on this entry that is about privacy
-   * rather than progress, which is why it is worth showing.
-   */
+  /** Hostnames the adapter claims — exactly what the proxy decrypts for this app. */
   hosts: string[];
-  /**
-   * The app's full capabilities, not just whether it has any.
-   *
-   * `build.mcp` is a boolean and stays one: it drives a checklist tick. It
-   * cannot answer "what did Sluice collect for this app, and what can I do with
-   * it?", which is the whole of the per-app page — so the inventory travels with
-   * the catalog instead of forcing a second round trip per app.
-   */
+  /** The app's full inventory, so the per-app page needs no second round trip. */
   mcpTools: AppCatalogMcpTool[];
   replayActions: AppCatalogReplayAction[];
   stats: {
@@ -271,44 +210,25 @@ export interface AppsMsg extends ServerFrame {
   apps: AppCatalogEntry[];
 }
 
-/**
- * A chunk of recent captures sent when a client subscribes, oldest-first.
- * Priming used to send one `capture.new` frame per capture — 2000 separate
- * JSON.stringify calls and socket writes, each carrying a body up to 5 MB, on
- * every page reload. Batching keeps a refresh cheap.
- */
+/** A chunk of recent captures sent when a client subscribes, oldest-first. */
 export interface CaptureBackfillMsg extends ServerFrame {
   type: 'capture.backfill';
   captures: Capture[];
   /** True on the final chunk, so a client can show "primed" exactly once. */
   done: boolean;
   /**
-   * How this client was primed: `full` is everything recent from the store,
-   * `resume` is only what it missed while disconnected.
-   *
-   * Stated rather than inferred. A client that asked to resume and was given a
-   * full backfill instead cannot tell from the frames — they are the same shape
-   * — so it would fold 2000 rows into a buffer it should have replaced, and end
-   * up with a view stitched together from two eras. A silent partial resume is
-   * the same bug with quieter symptoms.
+   * `full`: everything recent from the store; `resume`: only what this client
+   * missed. Stated because the frames look alike and a client must know whether
+   * to replace its buffer or fold into it.
    */
   mode?: 'full' | 'resume';
 }
 
 /**
- * The lifecycle of ONE named, possibly-long-running operation the dashboard
- * triggered — a sync, a prune, a vacuum, a rematerialize, an engine start.
- *
- * Exists because the `notice` model cannot carry this. There is one notice slot
- * and a 4.5s toast, so `onSync` firing a notice per failed action clobbers
- * itself — you see the last of five and nothing that finished. An operation is
- * keyed by its `requestId`, so successive frames for the same op UPDATE one row
- * rather than replacing an unrelated message; the client keeps a small map and
- * renders running/done/error distinctly, and an error persists until dismissed
- * instead of vanishing in 4.5s.
- *
- * Broadcast, not answered: two dashboards watching one runner should both see a
- * vacuum in progress, the same reason `capture.state` is broadcast.
+ * The lifecycle of ONE named, possibly long-running dashboard operation (sync,
+ * prune, vacuum, rematerialize, engine start). Frames sharing a `requestId`
+ * update one row instead of clobbering the single `notice` toast; broadcast, so
+ * every dashboard on the runner sees it.
  */
 export interface OpProgress {
   /** Correlates the frames of one operation. Minted by whoever starts it. */
@@ -328,13 +248,9 @@ export interface OpProgressMsg extends ServerFrame {
 }
 
 /**
- * The runner's environment: the system-proxy state, and whether the CA exists.
- *
- * Broadcast on change (engine started/stopped, proxy toggled) and at subscribe,
- * so the control page renders the real OS state rather than a guess. Kept
- * separate from `status` (which is the engine's own state) because these are
- * facts about the MACHINE — a proxy someone else set, a CA that exists but is not
- * trusted — that the engine does not know about.
+ * The machine's system-proxy state, broadcast on change and at subscribe. Kept
+ * apart from `status` because these are facts about the OS (a proxy someone else
+ * set, a CA not yet trusted), not the engine.
  */
 export interface SystemProxyReport {
   supported: boolean;
@@ -372,13 +288,7 @@ export type ServerMsg =
   | EnvironmentMsg
   | CaptureStateMsg;
 
-/**
- * Whether the server is currently writing captures, broadcast to EVERY client.
- *
- * Broadcast rather than answered, because pause is server state: two dashboards
- * open on the same runner must not disagree about whether traffic is being
- * recorded. The client renders this rather than its own optimistic guess.
- */
+/** Whether the server is writing captures. Broadcast: pause is server state every dashboard must agree on. */
 export interface CaptureStateMsg extends ServerFrame {
   type: 'capture.state';
   paused: boolean;
@@ -386,15 +296,7 @@ export interface CaptureStateMsg extends ServerFrame {
 
 // ── Client → server ──────────────────────────────────────────────────────────
 
-/**
- * The client's half of the version handshake, sent on receiving `hello`.
- *
- * `WS_PROTOCOL_VERSION` used to travel one way and be compared by neither end,
- * which made a half-finished upgrade — a rebuilt runner against a cached page,
- * or a `dist/` webapp from another checkout — present as mysterious breakage: a
- * panel that stays empty because the field feeding it is not in the frame. The
- * server answers a mismatch with a `notice`, so the failure names itself.
- */
+/** The client's half of the version handshake; the server answers a mismatch with a `notice`. */
 export interface HelloOkMsg {
   type: 'hello.ok';
   protocolVersion: number;
@@ -409,18 +311,11 @@ export interface SubscribeFilter {
 export interface SubscribeMsg {
   type: 'subscribe';
   /**
-   * The highest `seq` this client already holds. The server resumes from there
-   * if the frame is still in its ring, and otherwise re-primes from the store
-   * and says which it did (see {@link CaptureBackfillMsg.mode}). Omit it on a
-   * first connection — there is nothing to resume.
+   * Highest `seq` held (omit on a first connection). The server resumes from its
+   * ring, or re-primes and says so (see {@link CaptureBackfillMsg.mode}).
    */
   sinceSeq?: number;
-  /**
-   * Applied per connection, so a client watching one app is not shipped every
-   * capture on the machine. Scopes captures only: engine status, notices, the
-   * pause state and the catalog are about the runner, and a client that muted
-   * them by scoping itself to one app would just render stale.
-   */
+  /** Scopes captures only; runner-wide frames (status, notices, pause, catalog) always arrive. */
   filter?: SubscribeFilter;
 }
 
@@ -429,11 +324,17 @@ export interface ReplayRunMsg {
   requestId: string;
   actionId: string;
   params: Record<string, string>;
+  /**
+   * Which signed-in session to replay as (a `RedactedSession.id`). An unknown id
+   * is refused, never replaced by another account's session. Omitted, the
+   * runner uses the app's only session, or the one whose workspace the params
+   * name; with several and no way to tell, the run is refused.
+   */
   sessionId?: string;
 }
 
 /**
- * Run a learned multi-step flow template from the dashboard (F7.3).
+ * Run a learned multi-step flow template from the dashboard.
  *
  * Same rails as CLI `sluice replay --flow` and MCP `sluice_replay_flow`: each
  * step pays method/operation/budget independently. Params are the template's
@@ -445,15 +346,11 @@ export interface FlowRunMsg {
   /** Flow template id from `listFlowTemplates` / Learn-flows. */
   templateId: string;
   params: Record<string, string>;
+  /** As {@link ReplayRunMsg.sessionId}. */
   sessionId?: string;
 }
 
-/**
- * Ask the server to (re)emit a container's entities so the client can serialize
- * them. Deliberately has no `format`: the WS path only re-emits entities, and the
- * on-disk formats live in `sluice export`. A declared-but-ignored field reads as
- * a capability the server does not have.
- */
+/** Re-emit a container's entities. No `format`: on-disk formats live in `sluice export`. */
 export interface ExportMsg {
   type: 'export';
   containerId?: string;
@@ -465,19 +362,10 @@ export interface SyncMsg {
 }
 
 /**
- * Stop or resume WRITING captures. Not a display filter — the engines keep
- * running and the proxy keeps proxying, but nothing reaches SQLite or the wire.
- *
- * Pause used to be client-side only, which meant the UI said "paused" while the
- * engine went on writing every request to disk. That is the opposite of what
- * someone pressing pause is asking for, and on a capture tool the gap is a
- * privacy problem rather than a cosmetic one: you pause precisely when you are
- * about to do something you do not want recorded.
- *
- * There is deliberately no `clear` action. Clearing the client's view is the
- * client's business, and a socket message that deletes captures from the store
- * would be a destructive action behind a toolbar button — `sluice wipe` and
- * `sluice prune` are the deliberate, out-of-band ways to remove data.
+ * Stop or resume WRITING captures (a privacy control): engines keep running, but
+ * nothing reaches SQLite or the wire. Deliberately no `clear` — deleting captures
+ * from a toolbar socket message would be a destructive action; `sluice wipe`/
+ * `prune` are the deliberate ways.
  */
 export interface CaptureControlMsg {
   type: 'capture.control';
@@ -485,12 +373,8 @@ export interface CaptureControlMsg {
 }
 
 /**
- * Start or stop the capture engine at RUNTIME, from the dashboard.
- *
- * Distinct from `capture.control`: pause/resume gates whether captures are
- * WRITTEN while the engine keeps running; this starts and stops the engine (and
- * therefore the proxy) itself. It is a privileged control — it decrypts traffic
- * — so the server applies a stricter gate to it than to the read stream.
+ * Start or stop the capture engine (and proxy) itself, unlike `capture.control`.
+ * Privileged — it decrypts traffic — so the server gates it more strictly.
  */
 export interface EngineControlMsg {
   type: 'engine.control';

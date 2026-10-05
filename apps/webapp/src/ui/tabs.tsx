@@ -6,7 +6,7 @@
  * selectors. A full Tabs primitive with context is overkill when every caller
  * already owns its selected id in local state; this is just the chrome.
  */
-import type { ComponentProps, ReactNode } from 'react';
+import type { ComponentProps } from 'react';
 import { cn } from './cn.js';
 
 export function TabList({ className, ...props }: ComponentProps<'div'>) {
@@ -20,7 +20,7 @@ export function TabList({ className, ...props }: ComponentProps<'div'>) {
 }
 
 export function Tab({
-  selected,
+  selected = false,
   className,
   ...props
 }: ComponentProps<'button'> & { selected?: boolean }) {
@@ -28,7 +28,7 @@ export function Tab({
     <button
       type="button"
       role="tab"
-      aria-selected={selected ? true : false}
+      aria-selected={selected}
       className={cn(
         'rounded-t px-2.5 py-1 text-[12px] transition-colors',
         'focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-accent',
@@ -37,17 +37,5 @@ export function Tab({
       )}
       {...props}
     />
-  );
-}
-
-export function TabPanel({
-  className,
-  children,
-  ...props
-}: ComponentProps<'div'> & { children?: ReactNode }) {
-  return (
-    <div role="tabpanel" className={cn('flex min-h-0 flex-1 flex-col', className)} {...props}>
-      {children}
-    </div>
   );
 }

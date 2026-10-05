@@ -38,8 +38,8 @@
       <div class="panel grow">
         <header><h2>Capability secrets<small>three doors, three keys</small></h2></header>
         <div class="stack even">
-          <div class="card amber"><h3>read token</h3><p>Gates <span class="mono">/ws</span> and every <span class="mono">GET /api/*</span>. Travels in the URL fragment, never in the served page.</p></div>
-          <div class="card amber"><h3>pty token</h3><p>Only with <span class="mono">--terminal</span>. Gates <span class="mono">/pty</span> alone — the read token cannot open a terminal.</p></div>
+          <div class="card amber"><h3>session token</h3><p>Full dashboard control. Gates <span class="mono">/ws</span> and every <span class="mono">GET /api/*</span>. Travels in the URL fragment, never in the served page.</p></div>
+          <div class="card amber"><h3>pty token</h3><p>Only with <span class="mono">--terminal</span>. Gates <span class="mono">/pty</span> alone — the session token cannot open a terminal.</p></div>
           <div class="card amber"><h3>ingest token</h3><p>Only with <span class="mono">--ingest</span>. Gates the single <span class="mono">POST /api/ingest</span> the extension uses.</p></div>
         </div>
       </div>
@@ -58,10 +58,10 @@
 
     <div class="col">
       <div class="panel grow">
-        <header><h2>MCP surface<small>29 tools over stdio</small></h2></header>
+        <header><h2>MCP surface<small>up to 37 tools over stdio</small></h2></header>
         <div class="stack even">
           <div class="card purple"><h3>11 core</h3><p>Nine read straight from the store; only <span class="mono">replay</span> and <span class="mono">sluice_replay_flow</span> touch the network.</p></div>
-          <div class="card purple"><h3>18 app-contributed</h3><p>gmail 5 · linkedin 7 · loom 4 · trello 1 · fast 1 · slack 0, each prefixed with its app id.</p></div>
+          <div class="card purple"><h3>26 app-contributed</h3><p>linkedin 7 · gmail 5 · loom 4 · olx 3 · toters 3 · notion 2 · trello 1 · fast 1 · slack 0.</p></div>
           <div class="card red"><h3>Narrowed store</h3><p>App tools get a nine-method read-only projection — no writers, no raw handle, no capture bodies.</p></div>
         </div>
       </div>

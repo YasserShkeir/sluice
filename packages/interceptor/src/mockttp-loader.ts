@@ -3,25 +3,15 @@
  * The single place mockttp is loaded. Every other module goes through
  * `loadMockttp()` — never `import('mockttp')` directly.
  *
- * Why it is dynamic. mockttp is a ~12 MB tree that only `sluice start` needs, so
- * a static import would make every other command — `doctor`, `serve`, `export`,
- * the whole MCP server — pay for it at startup. `scripts/build.mjs` relies on
- * this being the ONLY dynamic import of mockttp: esbuild's code splitting turns
- * it into a separate chunk that no other command ever loads.
+ * Dynamic because mockttp is a ~12 MB tree that only `sluice start` needs.
+ * `scripts/build.mjs` relies on this being the ONLY dynamic import of mockttp,
+ * so esbuild's code splitting turns it into a separate chunk.
  *
- * Why it needs an interop shim. mockttp ships a CommonJS build. When esbuild
- * inlines it, `await import('mockttp')` resolves to a namespace whose real
- * exports sit on `.default`, because a CJS module's export names cannot be known
- * statically. Run the same source under tsx or plain Node and the named exports
- * are on the namespace itself. Reading `getLocal` off the wrong one yields
- * `getLocal is not a function` — at proxy-start time, from inside a catch that
- * degrades to "the web UI still works", so the capture engine silently never
- * starts. Normalising here means neither caller has to know which shape it got.
- *
- * (mockttp's own CJS build `require()`s get-port@7, which is ESM-only, so on Node
- * older than 20.19 / 22.12 an unbundled `import('mockttp')` throws ERR_REQUIRE_ESM.
- * Bundling resolves that at build time. mockttp 4.6.0 is the latest release —
- * there is no version bump that avoids it.)
+ * Interop shim: when esbuild inlines mockttp's CJS build, the exports sit on
+ * `.default`; under tsx or plain Node they are on the namespace. Reading the
+ * wrong one fails silently at proxy start (`getLocal is not a function` inside
+ * a catch that degrades to web-UI-only). Bundling also sidesteps mockttp's
+ * `require()` of ESM-only get-port@7 on Node < 20.19 / 22.12.
  */
 
 type Mockttp = typeof import('mockttp');

@@ -172,6 +172,22 @@ importers:
         specifier: ^20.10.0
         version: 20.19.43
 
+  packages/app-olx:
+    dependencies:
+      '@sluice/adapter-sdk':
+        specifier: workspace:*
+        version: link:../adapter-sdk
+      '@sluice/core':
+        specifier: workspace:*
+        version: link:../core
+      zod:
+        specifier: ^3.23.8
+        version: 3.25.76
+    devDependencies:
+      '@types/node':
+        specifier: ^20.10.0
+        version: 20.19.43
+
   packages/app-slack:
     dependencies:
       '@sluice/adapter-sdk':
@@ -183,6 +199,22 @@ importers:
       classic-level:
         specifier: ^1.4.0
         version: 1.4.1
+    devDependencies:
+      '@types/node':
+        specifier: ^20.10.0
+        version: 20.19.43
+
+  packages/app-toters:
+    dependencies:
+      '@sluice/adapter-sdk':
+        specifier: workspace:*
+        version: link:../adapter-sdk
+      '@sluice/core':
+        specifier: workspace:*
+        version: link:../core
+      zod:
+        specifier: ^3.23.8
+        version: 3.25.76
     devDependencies:
       '@types/node':
         specifier: ^20.10.0
@@ -221,9 +253,15 @@ importers:
       '@sluice/app-notion':
         specifier: workspace:*
         version: link:../app-notion
+      '@sluice/app-olx':
+        specifier: workspace:*
+        version: link:../app-olx
       '@sluice/app-slack':
         specifier: workspace:*
         version: link:../app-slack
+      '@sluice/app-toters':
+        specifier: workspace:*
+        version: link:../app-toters
       '@sluice/app-trello':
         specifier: workspace:*
         version: link:../app-trello
@@ -293,15 +331,6 @@ importers:
       '@modelcontextprotocol/sdk':
         specifier: ^1.0.0
         version: 1.30.0(zod@3.25.76)
-      '@sluice/cartographer':
-        specifier: workspace:*
-        version: link:../cartographer
-      '@sluice/core':
-        specifier: workspace:*
-        version: link:../core
-      '@sluice/interceptor':
-        specifier: workspace:*
-        version: link:../interceptor
       better-sqlite3:
         specifier: ^11.7.0
         version: 11.10.0
@@ -318,6 +347,18 @@ importers:
       '@sluice/apps':
         specifier: workspace:*
         version: link:../apps
+      '@sluice/cartographer':
+        specifier: workspace:*
+        version: link:../cartographer
+      '@sluice/core':
+        specifier: workspace:*
+        version: link:../core
+      '@sluice/interceptor':
+        specifier: workspace:*
+        version: link:../interceptor
+      '@sluice/protocol':
+        specifier: workspace:*
+        version: link:../protocol
       '@types/node':
         specifier: ^20.10.0
         version: 20.19.43
@@ -3707,7 +3748,7 @@ snapshots:
 
   '@types/better-sqlite3@7.6.13':
     dependencies:
-      '@types/node': 20.19.43
+      '@types/node': 22.20.1
 
   '@types/chrome-remote-interface@0.34.0':
     dependencies:

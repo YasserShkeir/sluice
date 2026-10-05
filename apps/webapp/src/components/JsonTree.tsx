@@ -15,6 +15,7 @@
  */
 import { useMemo, useRef, useState } from 'react';
 import { useVirtualizer } from '@tanstack/react-virtual';
+import { toggled } from '../collections.js';
 
 type Json = unknown;
 
@@ -41,11 +42,17 @@ function kindOf(v: Json): 'object' | 'array' | 'primitive' {
   return 'primitive';
 }
 
-/** A one-line preview of a collapsed container, e.g. `{3 keys}` / `[128]`. */
-function summary(v: Json): string {
-  if (Array.isArray(v)) return `[${v.length}]`;
-  const n = Object.keys(v as object).length;
+/** A one-line preview of a collapsed container of `n` children, e.g. `{3 keys}` / `[128]`. */
+function summary(v: Json, n: number): string {
+  if (Array.isArray(v)) return `[${n}]`;
   return `{${n === 1 ? '1 key' : `${n} keys`}}`;
+}
+
+/** A container's children as [label, value] pairs — array indices or object keys. Not for primitives. */
+function childEntries(v: Json, limit = Number.POSITIVE_INFINITY): Array<[string, Json]> {
+  return Array.isArray(v)
+    ? v.slice(0, limit).map((c, i): [string, Json] => [String(i), c])
+    : Object.entries(v as Record<string, Json>).slice(0, limit);
 }
 
 /** How a primitive is drawn, with a class for colouring. */
@@ -73,22 +80,10 @@ function flatten(root: Json, expanded: Set<string>): Row[] {
     const size = expandable ? (Array.isArray(value) ? value.length : Object.keys(value as object).length) : 0;
     rows.push({ id: path, depth, label, value, expandable, expanded: isOpen, size });
     if (!isOpen) return;
-    if (Array.isArray(value)) {
-      const shown = Math.min(value.length, MAX_CHILDREN);
-      for (let i = 0; i < shown; i++) walk(value[i], String(i), depth + 1, `${path}/${i}`);
-      if (value.length > shown) {
-        rows.push({ id: `${path}/…`, depth: depth + 1, label: `… ${value.length - shown} more`, value: undefined, expandable: false, expanded: false, size: 0 });
-      }
-    } else {
-      const entries = Object.entries(value as Record<string, Json>);
-      const shown = Math.min(entries.length, MAX_CHILDREN);
-      for (let i = 0; i < shown; i++) {
-        const [k, v] = entries[i] as [string, Json];
-        walk(v, k, depth + 1, `${path}/${k}`);
-      }
-      if (entries.length > shown) {
-        rows.push({ id: `${path}/…`, depth: depth + 1, label: `… ${entries.length - shown} more`, value: undefined, expandable: false, expanded: false, size: 0 });
-      }
+    const kids = childEntries(value, MAX_CHILDREN);
+    for (const [k, v] of kids) walk(v, k, depth + 1, `${path}/${k}`);
+    if (size > kids.length) {
+      rows.push({ id: `${path}/…`, depth: depth + 1, label: `… ${size - kids.length} more`, value: undefined, expandable: false, expanded: false, size: 0 });
     }
   };
   walk(root, null, 0, '$');
@@ -101,13 +96,7 @@ function allPaths(root: Json): Set<string> {
   const walk = (value: Json, path: string): void => {
     if (kindOf(value) === 'primitive') return;
     out.add(path);
-    if (Array.isArray(value)) {
-      value.forEach((v, i) => {
-        walk(v, `${path}/${i}`);
-      });
-    } else {
-      for (const [k, v] of Object.entries(value as object)) walk(v, `${path}/${k}`);
-    }
+    for (const [k, v] of childEntries(value)) walk(v, `${path}/${k}`);
   };
   walk(root, '$');
   return out;
@@ -133,12 +122,7 @@ export function JsonTree({ value }: { value: Json }) {
   });
 
   const toggle = (path: string): void => {
-    setExpanded((prev) => {
-      const next = new Set(prev);
-      if (next.has(path)) next.delete(path);
-      else next.add(path);
-      return next;
-    });
+    setExpanded((prev) => toggled(prev, path));
   };
 
   return (
@@ -178,12 +162,10 @@ export function JsonTree({ value }: { value: Json }) {
                 {row.label !== null ? <span className="text-fg-dim">{row.label}</span> : null}
                 {row.label !== null && row.value !== undefined ? <span className="text-fg-mute">: </span> : null}
                 {row.expandable ? (
-                  <span className="text-fg-mute">{row.expanded ? (Array.isArray(row.value) ? '[' : '{') : summary(row.value)}</span>
+                  <span className="text-fg-mute">{row.expanded ? (Array.isArray(row.value) ? '[' : '{') : summary(row.value, row.size)}</span>
                 ) : prim ? (
                   <span className={prim.cls}>{prim.text}</span>
-                ) : (
-                  <span className="text-fg-mute italic">{row.label === null ? '' : ''}</span>
-                )}
+                ) : null}
               </div>
             );
           })}

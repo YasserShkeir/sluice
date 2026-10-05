@@ -11,12 +11,9 @@ import { spawn, type ChildProcess } from 'node:child_process';
 import { existsSync, mkdirSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
+import { setTimeout as sleep } from 'node:timers/promises';
 
 const MAC_CHROME = '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
-
-export function defaultChromePath(): string {
-  return MAC_CHROME;
-}
 
 export function defaultChromeProfileDir(): string {
   return join(homedir(), '.sluice', 'chrome');
@@ -36,25 +33,38 @@ export interface LaunchedChrome {
   close: () => void;
 }
 
-export async function launchDebugChrome(opts: LaunchChromeOptions): Promise<LaunchedChrome> {
-  const chromePath = opts.chromePath ?? defaultChromePath();
-  if (!existsSync(chromePath)) {
-    throw new Error(`Chrome not found at ${chromePath} — pass chromePath or install Google Chrome.`);
-  }
-  const userDataDir = opts.userDataDir ?? defaultChromeProfileDir();
-  mkdirSync(userDataDir, { recursive: true });
-
-  const args = [
+/**
+ * The Chrome argv for a debug instance.
+ *
+ * No `--remote-allow-origins`: chrome-remote-interface connects with Node's `ws`
+ * and sends no Origin header, which Chrome accepts. The flag's only effect would
+ * be to let web pages open DevTools sockets to a browser holding every session
+ * signed into for capture — Chrome 111's guard exists for exactly that.
+ */
+export function debugChromeArgs(
+  opts: Pick<LaunchChromeOptions, 'port' | 'startUrl' | 'headless'>,
+  userDataDir: string,
+): string[] {
+  return [
     `--remote-debugging-port=${opts.port}`,
     `--user-data-dir=${userDataDir}`,
     '--no-first-run',
     '--no-default-browser-check',
-    '--remote-allow-origins=*', // allow the local CDP client to attach (Chrome 111+)
     ...(opts.headless ? ['--headless=new'] : []),
     opts.startUrl ?? 'about:blank',
   ];
+}
 
-  const child = spawn(chromePath, args, { stdio: 'ignore', detached: false });
+export async function launchDebugChrome(opts: LaunchChromeOptions): Promise<LaunchedChrome> {
+  const chromePath = opts.chromePath ?? MAC_CHROME;
+  if (!existsSync(chromePath)) {
+    throw new Error(`Chrome not found at ${chromePath} — pass chromePath or install Google Chrome.`);
+  }
+  const userDataDir = opts.userDataDir ?? defaultChromeProfileDir();
+  // Owner-only: the profile holds the session cookies of every signed-in app.
+  mkdirSync(userDataDir, { recursive: true, mode: 0o700 });
+
+  const child = spawn(chromePath, debugChromeArgs(opts, userDataDir), { stdio: 'ignore', detached: false });
   child.on('error', () => {
     /* surfaced via the readiness poll below */
   });
@@ -84,12 +94,8 @@ async function waitForDebugPort(port: number, timeoutMs: number): Promise<void> 
     } catch (e) {
       lastErr = e;
     }
-    await delay(200);
+    await sleep(200);
   }
   const detail = lastErr instanceof Error ? `: ${lastErr.message}` : '';
   throw new Error(`Chrome debug port ${port} did not become ready within ${timeoutMs}ms${detail}`);
-}
-
-function delay(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
 }

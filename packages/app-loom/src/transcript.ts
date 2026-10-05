@@ -27,11 +27,7 @@ function cueTimeToSeconds(raw: string): number {
   const m = /^(?:(\d+):)?(\d{1,2}):(\d{2})(?:[.,](\d{1,3}))?$/.exec(raw.trim());
   if (!m) return NaN;
   const [, hh, mm, ss, ms] = m;
-  const h = hh ? Number(hh) : 0;
-  const min = Number(mm);
-  const sec = Number(ss);
-  const millis = ms ? Number(ms.padEnd(3, '0')) : 0;
-  return h * 3600 + min * 60 + sec + millis / 1000;
+  return Number(hh ?? 0) * 3600 + Number(mm) * 60 + Number(ss) + Number((ms ?? '').padEnd(3, '0')) / 1000;
 }
 
 /** Strip WebVTT inline markup: `<c>`, `</c>`, `<v Name>`, `<00:00:01.000>`. */

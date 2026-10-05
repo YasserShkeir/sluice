@@ -6,67 +6,44 @@
  * that re-enters the identical ingest funnel as live captures.
  *
  * A network-level failure throws (redacted); any HTTP response — including 4xx/5xx
- * — comes back as a Capture so the caller can inspect the error body.
+ * and a 3xx, which is never followed — comes back as a Capture so the caller can
+ * inspect it.
  */
-import { newId, redactHeaders, redactText, redactUrl, splitUrl } from '@sluice/core';
+import { redactedErrorMessage, splitUrl } from '@sluice/core';
 import type { Capture, ReplayRequest } from '@sluice/core';
+import { capBody, redactedCapture } from './capture-build.js';
 import { assertReplayAllowed, replayBudget, withReplaySlot } from './replay-policy.js';
 
-const MAX_BODY = 5_000_000;
 const DEFAULT_TIMEOUT_MS = 20_000;
 
 /**
  * Drop header values undici would reject, at the ONE boundary every replay
- * crosses.
- *
- * undici throws `Cannot convert argument to a ByteString` — out of the whole
- * fetch — on any header value with a code unit > 255. `makeFaithful` already
- * guards the values it learns from captures, but a value the ADAPTER put on the
- * base request (or any other caller's) reaches here unguarded, so one odd header
- * failed the entire replay rather than just being omitted. Guarding here covers
- * every path into the network, faithful or raw, which is the same reason the
- * safety rails live at this layer. A dropped header degrades fidelity; a thrown
- * replay returns nothing.
- *
- * HTTP/2 pseudo-headers (`:method`, `:authority`, `:scheme`, `:path`) also
- * cannot be set on `fetch`. Faithful templates learned from MITM captures often
- * include them; leaving them in produced a opaque `fetch failed` on every
- * `sluice replay` that went through `faithfulReplayRequest`.
+ * crosses. undici throws `Cannot convert argument to a ByteString` out of the
+ * whole fetch on any header value with a code unit > 255; guarding here covers
+ * every path into the network (faithful or raw), so a dropped header degrades
+ * fidelity instead of failing the replay. HTTP/2 pseudo-headers (`:method`,
+ * `:authority`, `:scheme`, `:path`) cannot be set on `fetch` either.
  */
 export function sendableHeaders(headers: Record<string, string>): Record<string, string> {
-  const out: Record<string, string> = {};
-  for (const [k, v] of Object.entries(headers)) {
-    if (k.startsWith(':')) continue;
-    let ok = true;
-    for (let i = 0; i < v.length; i++) {
-      if (v.charCodeAt(i) > 255) {
-        ok = false;
-        break;
-      }
-    }
-    if (ok) out[k] = v;
-  }
-  return out;
+  return Object.fromEntries(Object.entries(headers).filter(([k, v]) => !k.startsWith(':') && !/[\u0100-\uffff]/.test(v)));
 }
 
 /**
  * Issue a replay, subject to the safety rails in `replay-policy.ts`. The checks
  * are here rather than in each caller so that the CLI, the WS server and the MCP
  * tools all inherit them — there is no path to the network that skips this.
+ * `allowedHosts` (the owning app's hosts) is required, so the host rail is too.
  */
 export async function runReplay(
   req: ReplayRequest,
-  opts: { timeoutMs?: number } = {},
+  opts: { timeoutMs?: number; allowedHosts: readonly string[] },
 ): Promise<Capture> {
-  assertReplayAllowed(req);
+  assertReplayAllowed(req, { allowedHosts: opts.allowedHosts });
   replayBudget.take();
   return withReplaySlot(() => issue(req, opts));
 }
 
-async function issue(
-  req: ReplayRequest,
-  opts: { timeoutMs?: number } = {},
-): Promise<Capture> {
+async function issue(req: ReplayRequest, opts: { timeoutMs?: number }): Promise<Capture> {
   const { host, path } = splitUrl(req.url);
   const startedAt = Date.now();
   const timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
@@ -82,54 +59,39 @@ async function issue(
       method: req.method,
       headers: sendableHeaders(req.headers),
       body: req.body,
+      // Never follow a redirect. The rails above checked THIS url only; a 3xx
+      // to a write endpoint (or another origin) would re-send the method, the
+      // body and custom credential headers past them, and the capture would
+      // record the read. undici's 'manual' returns the real 3xx (status and
+      // Location readable), which becomes the recorded capture.
+      redirect: 'manual',
       signal: ctrl.signal,
     });
-    // Timeout must cover the body too — a stalled res.text() used to hold the
-    // single-flight slot forever after headers arrived.
-    try {
-      resBodyRaw = await res.text();
-    } catch {
-      resBodyRaw = null;
-    }
+    // The timeout covers the body too: a stalled res.text() would hold the single-flight slot.
+    resBodyRaw = await res.text().catch(() => null);
   } catch (err) {
-    const msg = ctrl.signal.aborted
-      ? `timed out after ${timeoutMs}ms`
-      : err instanceof Error
-        ? err.message
-        : String(err);
-    throw new Error(`replay request failed: ${redactText(msg)}`);
+    const msg = ctrl.signal.aborted ? `timed out after ${timeoutMs}ms` : redactedErrorMessage(err);
+    throw new Error(`replay request failed: ${msg}`);
   } finally {
     clearTimeout(timer);
   }
   const durationMs = Date.now() - startedAt;
 
-  const resHeaders: Record<string, string> = {};
-  res.headers.forEach((value, key) => {
-    resHeaders[key] = value;
-  });
+  const resHeaders: Record<string, string> = Object.fromEntries(res.headers);
 
-  return {
-    id: newId('cap'),
+  return redactedCapture({
     ts: startedAt,
     source: 'replay',
     adapterId: null,
     method: req.method,
-    url: redactUrl(req.url),
+    url: req.url,
     host,
     path,
     status: res.status,
     durationMs,
-    reqHeaders: redactHeaders(req.headers),
-    reqBody: req.body == null ? null : redactText(req.body),
-    resHeaders: redactHeaders(resHeaders),
-    resBody: resBodyRaw == null ? null : redactText(cap(resBodyRaw)),
-    pid: null,
-    processName: null,
-  };
-}
-
-function cap(s: string): string {
-  return s.length > MAX_BODY
-    ? `${s.slice(0, MAX_BODY)}…[truncated ${s.length - MAX_BODY} chars]`
-    : s;
+    reqHeaders: req.headers,
+    reqBody: req.body ?? null,
+    resHeaders,
+    resBody: resBodyRaw == null ? null : capBody(resBodyRaw),
+  });
 }

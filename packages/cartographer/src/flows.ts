@@ -49,10 +49,7 @@ const ASSET_HINT =
 /** True when a capture is static/bundle noise and must not seed a primary. */
 export function isAssetCapture(c: Capture): boolean {
   const op = (c.classification ?? '').trim().toLowerCase();
-  if (op === 'asset' || op.startsWith('assets/')) return true;
-  if (ASSET_HINT.test(c.path)) return true;
-  if (/^\/assets\//i.test(c.path)) return true;
-  return false;
+  return op === 'asset' || op.startsWith('assets/') || ASSET_HINT.test(c.path) || /^\/assets\//i.test(c.path);
 }
 
 export interface ClusterFlowsOptions {
@@ -116,9 +113,7 @@ export function clusterCaptureList(
     group.sort((a, b) => a.ts - b.ts || a.id.localeCompare(b.id));
     for (const burst of splitBursts(group, windowMs)) {
       const flow = burstToFlow(burst);
-      if (!flow) continue;
-      if (flow.steps.length < minSteps) continue;
-      out.push(flow);
+      if (flow && flow.steps.length >= minSteps) out.push(flow);
     }
   }
 
@@ -150,10 +145,7 @@ export function clusterCapturesIntoFlows(
 // ── internals ────────────────────────────────────────────────────────────────
 
 function hostFamily(host: string): string {
-  // strip leading www. so www.slack.com and slack.com share a bucket when
-  // tabId is missing. Keep the rest intact — api.slack.com stays distinct from
-  // app.slack.com only if we ever need that; for v1 same registrable-ish host
-  // family is enough, and most adapters already pin one API host.
+  // Strip www. so www.slack.com and slack.com share a bucket when tabId is missing.
   return host.replace(/^www\./i, '').toLowerCase();
 }
 
@@ -194,8 +186,7 @@ function burstToFlow(burst: Capture[]): FlowInput | undefined {
     };
   });
 
-  // Ensure the primary is first in seq only if it already was; we keep time
-  // order so later binding (F2) can walk response→request chronologically.
+  // Steps stay in time order so binding can walk response→request chronologically.
   return {
     adapterId,
     label: labelFor(primary),
@@ -225,8 +216,7 @@ function pickPrimary(burst: Capture[]): Capture | undefined {
 }
 
 function primaryScore(c: Capture): number {
-  if (isAssetCapture(c)) return 0;
-  if (isAuthShaped(c)) return 0;
+  if (isAssetCapture(c) || isAuthShaped(c)) return 0;
   let score = 1;
   const op = operationOf(c);
   if (op) score += 5;
@@ -258,12 +248,9 @@ function isAuthShaped(c: Capture): boolean {
 function operationOf(c: Capture): string | undefined {
   // `classification` holds the semantic op name when set at ingest
   // (conversations.history, boards/:id/cards, …). See Capture.classification.
-  const op = c.classification?.trim();
-  return op && op.length > 0 ? op : undefined;
+  return c.classification?.trim() || undefined;
 }
 
 function labelFor(primary: Capture): string {
-  const op = operationOf(primary);
-  if (op) return op;
-  return `${primary.method} ${primary.path}`;
+  return operationOf(primary) ?? `${primary.method} ${primary.path}`;
 }

@@ -15,13 +15,15 @@ import { trelloApp } from '@sluice/app-trello';
 import { gmailApp } from '@sluice/app-gmail';
 import { loomApp } from '@sluice/app-loom';
 import { linkedinApp } from '@sluice/app-linkedin';
+import { olxApp } from '@sluice/app-olx';
 import { notionApp } from '@sluice/app-notion';
+import { totersApp } from '@sluice/app-toters';
 import { checkConformance } from '@sluice/adapter-sdk';
 import { discoverAdapters, readEnabledAdapterIds } from './discover.js';
 import type { DiscoverOptions, DiscoveryResult } from './discover.js';
 
 /** Every installed app, in registration order. `apps[0]` is the default. */
-export const apps: App[] = [slackApp, fastApp, trelloApp, gmailApp, loomApp, linkedinApp, notionApp];
+export const apps: App[] = [slackApp, fastApp, trelloApp, gmailApp, loomApp, linkedinApp, olxApp, notionApp, totersApp];
 
 /**
  * Load every installed app's redaction contributions into the global policy, at
@@ -91,10 +93,4 @@ export function enabledApps(allow = readEnabledAdapterIds()): App[] {
   return apps.filter((a) => allow.includes(a.id));
 }
 
-/** Look up an installed app by its adapter id. */
-export function getApp(id: string): App | undefined {
-  return apps.find((a) => a.id === id);
-}
-
 export { discoverAdapters, describeDiscovery, externalConfigPath, readEnabledAdapterIds } from './discover.js';
-export type { DiscoveredAdapter, DiscoveryResult, RejectedAdapter } from './discover.js';

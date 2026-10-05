@@ -3,6 +3,7 @@ import { useEffect, useMemo, useState, type ReactNode } from 'react';
 import type { Capture } from '@sluice/core';
 import { formatBytes, formatClock, formatDuration } from '../format.js';
 import { Badge, statusTone } from '../ui/badge.js';
+import { Kpi } from '../ui/kpi.js';
 import {
   computeKpis,
   recentErrors,
@@ -23,6 +24,10 @@ interface Props {
 const fmtInt = (n: number): string => n.toLocaleString();
 const truncate = (s: string, n: number): string => (s.length <= n ? s : `${s.slice(0, n - 1)}…`);
 const hms = (ms: number): string => formatClock(ms).slice(0, 8);
+
+/** A clickable row in the smart cards' lists. */
+const LIST_ROW =
+  'flex w-full items-center gap-2 border-b border-bg-2 px-1 py-0.5 font-mono text-[11.5px] last:border-b-0 hover:bg-bg-2 focus-visible:outline focus-visible:outline-1 focus-visible:outline-offset-[-1px] focus-visible:outline-accent';
 
 function formatPct(x: number): string {
   const p = x * 100;
@@ -51,11 +56,7 @@ export function Overview({ captures, onSelect }: Props) {
   const errs = useMemo(() => recentErrors(captures, 6), [captures]);
   const slow = useMemo(() => slowestEndpoints(captures, 6), [captures]);
 
-  const byId = useMemo(() => {
-    const m = new Map<string, Capture>();
-    for (const c of captures) m.set(c.id, c);
-    return m;
-  }, [captures]);
+  const byId = useMemo(() => new Map(captures.map((c) => [c.id, c])), [captures]);
   const pick = (id: string): void => {
     const c = byId.get(id);
     if (c) onSelect(c);
@@ -79,26 +80,26 @@ export function Overview({ captures, onSelect }: Props) {
         <Kpi value={fmtInt(kpis.distinctEndpoints)} label="Endpoints" hint="method+host+path" />
         <Kpi value={fmtInt(kpis.distinctApps)} label="Apps" hint="adapters" />
         <Kpi value={formatPct(kpis.errorRate)} label="Error rate" hint="≥ 400" sev={errSev} />
-        <Kpi value={kpis.p95Ms === null ? '—' : formatDuration(kpis.p95Ms)} label="p95 latency" />
+        <Kpi value={formatDuration(kpis.p95Ms)} label="p95 latency" />
         <Kpi value={formatBytes(kpis.bytes)} label="Data" hint="response bodies" />
       </div>
 
       {/* ── Charts ────────────────────────────────────────────────────────── */}
       <div className="grid grid-cols-[1.5fr_1.3fr_1.5fr] gap-2 max-[1000px]:grid-cols-[repeat(auto-fit,minmax(250px,1fr))]">
-        <ChartCard title="Requests over time">
+        <Card title="Requests over time">
           <RequestsChart series={series} />
-        </ChartCard>
-        <ChartCard title="Status distribution">
+        </Card>
+        <Card title="Status distribution">
           <StatusDonut dist={dist} />
-        </ChartCard>
-        <ChartCard title="Top endpoints">
+        </Card>
+        <Card title="Top endpoints">
           <EndpointBars tops={tops} />
-        </ChartCard>
+        </Card>
       </div>
 
       {/* ── Smart cards ───────────────────────────────────────────────────── */}
       <div className="grid grid-cols-[repeat(auto-fit,minmax(280px,1fr))] gap-2">
-        <SmartCard title="Recent errors" hint="status ≥ 400 or ok:false">
+        <Card title="Recent errors" hint="status ≥ 400 or ok:false">
           {errs.length === 0 ? (
             <div className="px-0.5 py-2.5 text-[11px] text-fg-mute">No errors in view.</div>
           ) : (
@@ -108,7 +109,7 @@ export function Overview({ captures, onSelect }: Props) {
                   <button
                     type="button"
                     onClick={() => pick(e.id)}
-                    className="flex w-full items-center gap-2 border-b border-bg-2 px-1 py-0.5 font-mono text-[11.5px] last:border-b-0 hover:bg-bg-2 focus-visible:outline focus-visible:outline-1 focus-visible:outline-offset-[-1px] focus-visible:outline-accent"
+                    className={LIST_ROW}
                   >
                     <Badge tone={statusTone(e.status)}>{e.status ?? 'ERR'}</Badge>
                     <span className="min-w-0 flex-1 truncate text-fg" title={`${e.host}${e.path}`}>
@@ -123,9 +124,9 @@ export function Overview({ captures, onSelect }: Props) {
               ))}
             </ul>
           )}
-        </SmartCard>
+        </Card>
 
-        <SmartCard title="Slowest endpoints" hint="by max duration">
+        <Card title="Slowest endpoints" hint="by max duration">
           {slow.length === 0 ? (
             <div className="px-0.5 py-2.5 text-[11px] text-fg-mute">No timings yet.</div>
           ) : (
@@ -135,7 +136,7 @@ export function Overview({ captures, onSelect }: Props) {
                   <button
                     type="button"
                     onClick={() => pick(s.id)}
-                    className="flex w-full items-center gap-2 border-b border-bg-2 px-1 py-0.5 font-mono text-[11.5px] last:border-b-0 hover:bg-bg-2 focus-visible:outline focus-visible:outline-1 focus-visible:outline-offset-[-1px] focus-visible:outline-accent"
+                    className={LIST_ROW}
                   >
                     <span className="w-10 shrink-0 text-fg-dim">{s.method}</span>
                     <span className="min-w-0 flex-1 truncate text-fg" title={s.hostPath}>
@@ -150,58 +151,26 @@ export function Overview({ captures, onSelect }: Props) {
               ))}
             </ul>
           )}
-        </SmartCard>
+        </Card>
       </div>
     </section>
   );
 }
 
-// ── KPI tile ───────────────────────────────────────────────────────────────
+// ── Cards ───────────────────────────────────────────────────────────────────
 
-interface KpiProps {
-  value: string;
-  label: string;
-  hint?: string;
-  sev?: 'ok' | 'warn' | 'err';
-}
-function Kpi({ value, label, hint, sev }: KpiProps) {
-  const sevCls =
-    sev === 'ok' ? 'text-ok' : sev === 'warn' ? 'text-warn' : sev === 'err' ? 'text-err' : 'text-fg';
-  return (
-    <div className="min-w-0 rounded-md border border-border bg-bg-1 px-2.5 py-2">
-      <div className={`truncate text-[20px] font-semibold leading-tight tabular-nums ${sevCls}`}>{value}</div>
-      <div className="mt-0.5 truncate text-[10.5px] uppercase tracking-wide text-fg-dim">
-        {label}
-        {hint ? <span className="normal-case tracking-normal text-fg-mute"> · {hint}</span> : null}
-      </div>
-    </div>
-  );
-}
-
-function ChartCard({ title, children }: { title: string; children: ReactNode }) {
+/** A titled card; a `hint` is set on the title row's right-hand side. */
+function Card({ title, hint, children }: { title: string; hint?: string; children: ReactNode }) {
   return (
     <div className="flex min-w-0 flex-col rounded-md border border-border bg-bg-1 px-2.5 py-2">
-      <div className="mb-1.5 text-[10.5px] uppercase tracking-wider text-fg-dim">{title}</div>
-      {children}
-    </div>
-  );
-}
-
-function SmartCard({
-  title,
-  hint,
-  children,
-}: {
-  title: string;
-  hint: string;
-  children: ReactNode;
-}) {
-  return (
-    <div className="flex min-w-0 flex-col rounded-md border border-border bg-bg-1 px-2.5 py-2">
-      <div className="mb-1 flex items-baseline justify-between gap-2 text-[10.5px] uppercase tracking-wider text-fg-dim">
-        <span>{title}</span>
-        <span className="normal-case tracking-normal text-fg-mute">{hint}</span>
-      </div>
+      {hint === undefined ? (
+        <div className="mb-1.5 text-[10.5px] uppercase tracking-wider text-fg-dim">{title}</div>
+      ) : (
+        <div className="mb-1 flex items-baseline justify-between gap-2 text-[10.5px] uppercase tracking-wider text-fg-dim">
+          <span>{title}</span>
+          <span className="normal-case tracking-normal text-fg-mute">{hint}</span>
+        </div>
+      )}
       {children}
     </div>
   );

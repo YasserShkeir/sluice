@@ -2,12 +2,6 @@
 /**
  * Replay recorded captures as if they were arriving live.
  *
- * Every path that exercises a parser today goes through a real network call
- * against a real signed-in account, which means the store, the WS protocol and
- * the dashboard can only be tested by someone holding credentials for the
- * service in question. That is the single biggest tax on working on this
- * codebase, and it is why the plan called this a week-one dependency.
- *
  * The mock runner reads an NDJSON fixture and feeds each line to the SAME sink
  * the live engines use. That is the whole design: it is not a second ingest
  * path, so anything it exercises is exercised exactly as production does it —

@@ -2,11 +2,6 @@
 /**
  * The traffic table and the inspector, side by side and resizable.
  *
- * The inspector used to be a drawer floating over the table's right edge, which
- * covered Status, Size and Duration — the three columns you are comparing
- * against when you open a row in the first place. As a panel it takes space from
- * the table instead of hiding it, and the split is yours to set.
- *
  * The inspector panel is conditional; the table panel never is. Keeping the
  * table as the group's first child in both cases is what stops React remounting
  * it on every selection — a remount would empty its ingest buffer, its marks and

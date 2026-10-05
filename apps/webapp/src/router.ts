@@ -97,14 +97,13 @@ function emit(): void {
   for (const l of listeners) l();
 }
 
-export function navigate(route: Route, opts: { replace?: boolean } = {}): void {
+export function navigate(route: Route): void {
   const path = href(route);
   if (path === pathname()) return;
   // Preserve the hash. The token lives there on first load and ws.ts strips it
   // itself; throwing it away here would log the dev UI out on the first click.
   const url = `${path}${location.search}${location.hash}`;
-  if (opts.replace) history.replaceState(null, '', url);
-  else history.pushState(null, '', url);
+  history.pushState(null, '', url);
   current = parse(path);
   emit();
 }
@@ -134,19 +133,14 @@ export function useRoute(): Route {
  * cmd-click and "copy link address" all behave — the things people do without
  * thinking, and the things a click handler silently breaks.
  */
-export function useLink(): (route: Route) => {
-  href: string;
-  onClick: (e: React.MouseEvent) => void;
-} {
-  return useCallback((route: Route) => {
-    return {
-      href: href(route),
-      onClick: (e: React.MouseEvent) => {
-        // Let the browser handle anything that means "open elsewhere".
-        if (e.defaultPrevented || e.button !== 0 || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return;
-        e.preventDefault();
-        navigate(route);
-      },
-    };
-  }, []);
+export function useLink() {
+  return useCallback((route: Route) => ({
+    href: href(route),
+    onClick: (e: React.MouseEvent) => {
+      // Let the browser handle anything that means "open elsewhere".
+      if (e.defaultPrevented || e.button !== 0 || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return;
+      e.preventDefault();
+      navigate(route);
+    },
+  }), []);
 }

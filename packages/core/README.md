@@ -92,7 +92,10 @@ rels: `member-of`, `authored`, `mentions`, `replies-to`, `in-label`.
 against a unique dedupe index on adapter + action + container + cursor, carrying
 `reason` and `depth`), `claimCursors` (claim-and-flip inside an *immediate*
 transaction so two drainers cannot claim the same page), `completeCursor`,
-`releaseStaleCursors` (startup recovery of `running` rows), `countCursors`.
+`releaseStaleCursors(olderThanMs)` (startup recovery of `running` rows — a
+lease: only claims untouched that long, so a live drainer keeps its own),
+`releaseCursors(ids)` (return a drainer's own unsettled claims — it resets any
+`running` id it is given), `countCursors`.
 
 **Flows.** `upsertFlow` (rejects an empty step list, sorts by `seq`, guarantees
 the primary capture appears as role `primary` with `required=true`),
@@ -125,14 +128,49 @@ hands this projection to app-contributed tools.
 
 `redactHeaders` always masks `authorization`, `cookie`, `set-cookie` and
 `proxy-authorization`, plus any header name matching the credential-shaped
-regex. `redactText` applies the generic value patterns first, then every
-app-registered pattern in registration order, then the field rule that replaces
-the value after `access_token` / `refresh_token` / `client_secret` / `api_key` /
-`token` / `password` / `passwd` / `secret`. The mask is the literal `«redacted»`
-(exported as `MASK`).
+regex (also concatenated names such as `X-CSRFToken` or `x-authtoken`).
+`redactText` applies, in order, rules that each stay linear on hostile input:
+
+1. the generic value patterns, which mask a secret by its SHAPE under any field
+   name: `Bearer …` (also URL/form-encoded), PEM private-key blocks (raw,
+   escaped at any JSON depth, URL/form-encoded or truncated), JWTs, Anthropic /
+   OpenAI / Stripe keys, Google OAuth access and refresh tokens and API keys,
+   AWS access key ids, GitHub tokens and Slack `xox?-` / `xapp-` tokens;
+2. every app-registered pattern, in registration order;
+3. the echoed-header rule — the WHOLE value after an `Authorization`,
+   `Proxy-Authorization`, `Cookie` or `Set-Cookie` name echoed into a body, log
+   line or error (`"cookie":"a=1; SID=…"`, `Authorization: Basic …`);
+4. the multipart rule — the value line of a `form-data` part whose name is
+   credential-shaped;
+5. the field rule, which masks the value after any name ENDING in a credential
+   word (`token`, `secret`, `password`, `passwd`, `passphrase`, `api_key`,
+   `private_key`, `secret_access_key`, `client_assertion`, `session_id`,
+   `oauth_verifier`, `code_verifier`, `SAMLResponse`, `csrf`, `xsrf`, `jwt`) —
+   so `id_token`, `authToken` and `x-csrf-token` are covered — in `k=v`,
+   `"k":"v"`, escaped-JSON and percent-encoded forms. A quoted value is masked
+   up to its closing quote (spaces and commas included) and a bare JSON
+   `true`/`false`/`null` is left alone, so the JSON stays parseable. Pagination
+   cursors (`nextPageToken`, `page_token`, `nextToken`, `syncToken`, …) are
+   deliberately left alone;
+6. the query-param rule — `code`, `sig`, `signature`, `session`,
+   `X-Amz-Signature`/`-Credential`, … are too generic as field names, so they are
+   masked only as query-shaped params (after `?`, `&`, `#` or `;`) with a value of
+   8+ characters, so `?code=US` survives. It is the last step of `redactText`, so
+   it applies wherever `redactText` does: URLs, header values such as
+   `Location`/`Referer`/`Link`, bodies, classifications and error messages.
+
+`redactUrl` is `redactText` over a URL, keeping the query before the fragment,
+except that params an app declared public survive on its hosts.
+`redactCaptureUrls(c)` applies it to a capture's `url`, `path` and `tabUrl`
+(plus `redactText` on `classification`);
+`redactedErrorMessage(e)` is `redactText(errorMessage(e))`; `previewSecret`
+shows the first 6 characters of a long secret and only `«present»` for one of
+12 characters or fewer. The mask is the literal `«redacted»` (exported as
+`MASK`).
 
 `AppRedaction` has three optional fields: `headers` (extra always-masked names),
-`patterns` (extra global value patterns), and `publicParams` (query params that
+`patterns` (extra value patterns — the `g` flag is forced on and `y` removed at
+registration, so every occurrence is masked), and `publicParams` (query params that
 are *public* on the listed hosts and must survive redaction — this is what stops
 the generic `token=` rule from destroying fast.com's speedtest token and making
 the capture unreplayable). `registerAppRedaction(sources)` folds them into
@@ -147,15 +185,53 @@ the adapters allow-list.
 ## Also exported
 
 - **`replay-deny.ts`** — `REPLAY_DENIED_OPERATION_PATTERNS` and
-  `looksLikeDeniedOperation(...haystacks)`, the write/admin denylist shared by
-  the runtime replay rails, flow learning and flow building. Matched against
-  path, query, body and operation names — never against the HTTP method.
+  `looksLikeDeniedWrite(method, ...haystacks)`: the name patterns whatever the
+  method, plus unsafe methods on order/checkout/cart/payment/subscription/
+  refund/tip paths and bare Trello collections (flow-learn calls it).
+  `looksLikeDeniedReplay(req, ...extra)` is the whole-request check the
+  interceptor replay-policy and cartographer flow-build call: it also matches the percent-decoded path/body and refuses
+  method-override headers and `_method` fields. `isReplayMethodAllowed(method)`
+  (GET/HEAD/POST) and `replayRequestProbe(url)` are the single source for the
+  method allowlist and the `pathname?query` haystack, and `replayHostAllowed(host,
+  allowed)` is the one host-rail matcher (exact host or a subdomain, `*.`
+  stripped, empty list allows nothing). These are heuristics, not a proof that
+  an allowed request does not mutate.
+- **`persist.ts`** — `persistCapture(store, raw, adapter)`, the one persistence
+  funnel the runner and the MCP server share: redact (`redactCapture`: headers,
+  bodies and every URL-like field) → attribute → classify → store → parse
+  (contained: a throwing parser leaves the capture stored with `parsedAt` null)
+  → seed cursors. `matchAdapter(adapters, input, onError?)` is the guarded
+  "which app is this?" check the engines use too.
+- **`workspace-of.ts`** — `workspaceOfParams`, `workspaceOfValues` and
+  `containerWorkspace`: the workspace a replay's own arguments name, so it goes
+  out as that workspace's session.
+- **`flow-summary.ts`** — secret-free flow and template projections
+  (`flowSummary`, `templateSummary`, `paramSourcesSummary`, …) for MCP, the HTTP
+  API and the CLI.
+- **`oscrypt.ts`** — `decryptOscryptV10`, `keychainPassphrase` (retries without
+  the account only on "item not found", 120 s timeout), `withCopiedSqliteDb`,
+  and `KEYCHAIN_ALLOW_ADVICE`, the "Allow, not Always Allow" line to print
+  before a Keychain read.
+- **`chrome-cookies.ts`** — `locateChromeProfile(domain, { requireCookie })`
+  (passive, bound SQL), `readChromeCookies`, `buildChromeCookieHeader`,
+  `readChromeCookieHeader`, `NoChromeSessionError` and `isNoSessionError`
+  ("signed out" vs "could not read it").
+- **`safe-copy.ts`** — `copyFileSafe`, `copyDirSafe`: EINTR-tolerant JS copies
+  that skip symlinks; `sweepStaleTempDirs`, which removes the private temp copies
+  (`sluice-ldb-*`, `sluice-cookies-*`) a killed read left behind.
 - **`auth-failure.ts`** — `isAuthFailure(capture)`: HTTP 401 always, 403 never,
   plus a 2xx whose JSON body is `{ ok: false, error: <code> }` for ten known
-  codes (Slack signals failure as HTTP 200).
-- **`util.ts`** — `newId(prefix)` (nanoid, `prefix_<16 chars>`), `splitUrl`, and
+  codes (Slack signals failure as HTTP 200); `serviceError(body)` parses that
+  `{ ok:false, error?, needed?, provided? }` shape.
+- **`util.ts`** — `newId(prefix)` (nanoid, `prefix_<16 chars>`), `splitUrl`,
   `operationName(path)`, the generic fallback classification that strips
-  `api`/`vN`/digit prefixes and replaces id-looking segments with `:id`.
+  `api`/`vN`/digit prefixes and replaces id-looking segments with `:id`, and the
+  shared helpers `errorMessage`, `headerValue` (case-insensitive),
+  `safeJsonParse` / `safeJsonObject` (never throw) and `resolveJsonPath`
+  (flow-learn bind paths).
+- **`store.ts`** — besides `SqliteStore` (which creates its database file 0600
+  and tightens older files and `-wal`/`-shm` siblings), `restrictToOwner(path)`:
+  best-effort, drops group/other bits of a regular file or directory.
 
 ## Interaction flows
 

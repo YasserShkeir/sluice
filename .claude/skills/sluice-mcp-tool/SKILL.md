@@ -131,30 +131,49 @@ app-loom and app-linkedin already do.
 
 ### Network-touching app tools must use `ctx.replay`
 
-`AppToolContext` is `{ store?: ReadOnlyStore, replay(req), replayFlow?(templateId, params, opts) }`,
-built fresh per app and passed as `run(args, ctx)`. `ctx.replay` is the same
-pipeline the `replay` core tool uses:
+`AppToolContext` is `{ store?: ReadOnlyStore, replay(req), replayAction?(actionId, params, opts), replayFlow?(templateId, params, opts) }`,
+built fresh per app and passed as `run(args, ctx)`. `ctx.replay` is the send half
+of the pipeline the `replay` core tool uses:
 
 ```
-faithfulReplayRequest(store, base)   // overlay the real client's learned fingerprint
-  → runReplay(req)                   // method allowlist → write-op denylist → 60/60s budget → single-flight
-  → record(capture)                  // adapterId stamped, insertCapture, applyParseResult
+faithfulReplayRequest(store, base)             // overlay the real client's learned fingerprint
+  → runReplay(req, { allowedHosts: app.hosts })  // method allowlist → write-op denylist → app host rail → 60/60s budget → single-flight
+  → persistCapture(store, capture, app)        // core's funnel: redact, attribute, classify, parse, seed
 ```
 
-with a 401 → re-extract → retry-once refresh wrapped around it, both attempts
-recorded. A bare `fetch` gets none of that: it is *more* anomalous to the service
-(it does not match the browser's real fingerprint), it skips the rails and the
-process-global budget shared with the CLI and the dashboard, and it never enters
-the store, so it is invisible to the cartographer, the dashboard and the audit
-trail.
+as a single attempt with no host-side refresh: the tool hands over a finished
+request, so the host has no session to re-extract and re-inject. Only the core
+`replay` tool and `ctx.replayAction` get 401 → re-extract → retry-once (both
+attempts recorded). The request URL must be on one of the app's declared `hosts`
+(subdomains included), or `runReplay` refuses it with `host_not_allowed`.
+
+- **`ctx.replayAction(actionId, params?, { workspaceId? })`** runs one of THIS
+  app's declared replay actions under a session the host acquires — use it when
+  the request needs the app's credentials. `linkedin_fetch_me` does:
+  `ctx.replayAction('linkedin.me')`. Optional in the type; throw a named error
+  when it is absent.
+- **`ctx.replayFlow`** runs only the calling app's own templates.
+
+A bare `fetch` gets none of that: it is *more* anomalous to the service (it does
+not match the browser's real fingerprint), it skips the rails and the budget (per
+process — the MCP server's own bucket), and it never enters the store, so it is
+invisible to the cartographer, the dashboard and the audit trail.
 
 Every shipped network tool routes through the context: `runSpeedTest(ctx)` issues
-its config call via `ctx.replay`, `trello_my_cards` passes `ctx` into
-`trelloGet(…, ctx)`, Loom's four tools go through `replayOrFetch(ctx)`, and
-`linkedin_fetch_me` throws if `ctx.replay` is absent.
+its config call via `ctx.replay`; Trello, Loom and Notion tools read their own
+Chrome cookie and send through `replayAttempt(req, ctx)` /
+`withCookieRefresh(cookie, send, reread)` from `@sluice/adapter-sdk`, which retry
+once, sequentially, after an auth failure. There is deliberately **no fetch
+fallback**: without a host `ctx` they throw "Run it through `sluice-mcp`" rather
+than send a live cookie outside the rails. A tool that reads a local cookie should
+take an injectable cookie source so tests never reach the Keychain (see app-loom's
+`createLoomMcpTools(cookies?)`).
 
-The **one** deliberate bare fetch left is fast.com's multi-megabyte range
-download, which stays outside the pipeline so a ~25 MiB body never enters SQLite.
+The deliberate bare fetches left are fast.com's: the credential-free token scrape
+(`fetchToken` GETs the home page and its app bundle) and the multi-megabyte range
+downloads, which stay outside the pipeline so a ~25 MiB body never enters SQLite
+(`fetchConfig` also falls back to a plain fetch without a `ctx`, for direct
+library use).
 If you keep a bare fetch, say why in a comment so the divergence is a decision.
 
 For multiple hops, prefer `ctx.replayFlow(templateId, params)` over chaining
@@ -162,10 +181,12 @@ For multiple hops, prefer `ctx.replayFlow(templateId, params)` over chaining
 self-deadlocks on re-entry. Loom's cookie refresh issues its second attempt
 sequentially for exactly this reason.
 
-`ctx.store` is optional in the type and must be treated as such. Gmail's and
-LinkedIn's store-backed tools throw a named error when it is absent — "This tool
-reads the Sluice capture store, and the host did not provide one. Run it through
-`sluice-mcp`." — rather than assuming a host provides it.
+`ctx.store` is optional in the type and must be treated as such. Use
+`requireStore(ctx)` from `@sluice/adapter-sdk`, which throws the named error — "This
+tool reads the Sluice capture store, and the host did not provide one. Run it
+through `sluice-mcp`." — rather than assuming a host provides it. The same module
+has `pageArgs(args, { defaultLimit, maxLimit })` (bounded limit/offset), `isoTime`
+and `previewText` for store-backed tools.
 
 ## Error handling
 
@@ -213,11 +234,15 @@ Core tools (not app tools) for observation-learned bursts:
 - `sluice_describe_flow` — step roles, binding **kinds only**,
   `offsetFromPrimaryMsP50` / `offsetSpreadMs`, unreproducible flags, qualityNotes.
   No secrets, no token values.
-- `sluice_replay_flow` — sequential read-only run via `buildFlowStepRequest`
-  (**must pass `allowedHosts: app.hosts`**) + `runFlowReplay` + `runReplay`.
+- `sluice_replay_flow` — sequential run via `flowStepBuilder(template, app)` (the
+  app's host rail plus its replay actions as the read surface a non-GET step must
+  match) + `runFlowReplay` + `runReplay(req, { allowedHosts: app.hosts })`. Its
+  error and step details are redacted before they are returned.
 
-Note the asymmetry worth preserving: flow replay enforces a host allowlist per
-step; single-request `replay` does not.
+Both single-request `replay` and flow replay enforce the app's host allowlist at
+send time; flow build checks it again, before a step is ever sent. Params on both
+tools are bounded like the dashboard's frames (`REPLAY_PARAM_LIMITS`: 64 entries,
+1024-char keys, 8192-char values).
 
 ### Operational contract (do not omit from tool descriptions)
 
@@ -229,15 +254,19 @@ step; single-request `replay` does not.
    `loaderId`/`pageLoadId`. WS is excluded from HTTP bursts.
 4. Sibling pacing is **primary-anchored** (`offsetFromPrimaryMsP50`, 2 s cap);
    negative offsets mean pre-primary, fire immediately if late.
-5. Soft unreproducible companions skip; required failures stop the flow; no write
-   ops; hosts must match the adapter allowlist. Whole-flow timeout 120 s.
+5. Soft unreproducible companions skip; required failures stop the flow; the
+   write-op denylist and read-action rail refuse what they recognise (best-effort,
+   not a proof of read-only); hosts must match the adapter allowlist. Whole-flow
+   timeout 120 s.
 6. List/describe expose `qualityNotes` so agents can reject asset-primary or
    single-sample junk without re-deriving heuristics.
 
 ### Checklist (flow-related)
 
-- Descriptions state read-only, budgeted, this-machine-only, skip-don't-guess.
-- `allowedHosts: app.hosts` on every `buildFlowStepRequest` call site.
+- Descriptions state read-oriented rails (heuristic, not a guarantee), budgeted,
+  this-machine-only, skip-don't-guess.
+- `flowStepBuilder(tmpl, app)` for every build, and `allowedHosts: app.hosts` on
+  every `runReplay` call site.
 - No secrets in list/describe/replay results.
 - `pnpm --filter @sluice/mcp test` after description or schema changes.
 

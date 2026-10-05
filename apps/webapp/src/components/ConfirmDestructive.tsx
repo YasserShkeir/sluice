@@ -12,6 +12,7 @@
  */
 import { useEffect, useState } from 'react';
 import { Button } from '../ui/button.js';
+import { DialogShell, useEscapeKey } from '../ui/dialog.js';
 import { Input } from '../ui/input.js';
 
 interface Props {
@@ -44,27 +45,13 @@ export function ConfirmDestructive({
   useEffect(() => {
     if (open) setTyped('');
   }, [open]);
-  // Escape cancels — the keyboard equivalent of dismissing the dialog, and the
-  // reason the backdrop does not need a (non-accessible) click handler.
-  useEffect(() => {
-    if (!open) return;
-    const onKey = (e: KeyboardEvent): void => {
-      if (e.key === 'Escape') onCancel();
-    };
-    window.addEventListener('keydown', onKey);
-    return () => window.removeEventListener('keydown', onKey);
-  }, [open, onCancel]);
+  useEscapeKey(open, onCancel);
   if (!open) return null;
 
   const armed = requirePhrase === undefined || typed === requirePhrase;
 
   return (
-    <div
-      className="fixed inset-0 z-[60] flex items-center justify-center bg-black/50 p-4"
-      role="dialog"
-      aria-modal="true"
-      aria-label={title}
-    >
+    <DialogShell label={title} className="z-[60] items-center">
       <div className="w-full max-w-md rounded-lg border border-border bg-bg-1 p-4 shadow-2xl">
         <h2 className="text-[14px] font-semibold text-fg">{title}</h2>
         <div className="mt-2 text-[12.5px] leading-relaxed text-fg-dim">{body}</div>
@@ -107,6 +94,6 @@ export function ConfirmDestructive({
           </Button>
         </div>
       </div>
-    </div>
+    </DialogShell>
   );
 }

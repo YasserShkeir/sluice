@@ -17,7 +17,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import type { Capture } from '@sluice/core';
-import { formatFilter, isEmptyQuery, matchesFilter, parseFilter, serverSideTerms } from './filter.js';
+import { matchesFilter, parseFilter, serverSideTerms } from './filter.js';
 
 function capture(over: Partial<Capture> = {}): Capture {
   return {
@@ -48,7 +48,7 @@ const match = (input: string, over: Partial<Capture> = {}): boolean =>
 test('no input at all yields a query that matches everything', () => {
   for (const input of ['', '   ', '\t\n']) {
     const q = parseFilter(input);
-    assert.ok(isEmptyQuery(q));
+    assert.ok(q.terms.length === 0);
     assert.equal(matchesFilter(capture(), q), true);
   }
 });
@@ -58,7 +58,7 @@ test('half-typed input never throws and never blanks the table', () => {
   for (const input of ['status:', 'dur:>', '-', ':', 'body:"unclosed', 'op:', '--', '>500', '"']) {
     const q = parseFilter(input);
     assert.doesNotThrow(() => matchesFilter(capture(), q), `threw on ${JSON.stringify(input)}`);
-    if (isEmptyQuery(q)) {
+    if (q.terms.length === 0) {
       assert.equal(matchesFilter(capture(), q), true, `${JSON.stringify(input)} must not hide every row`);
     }
   }
@@ -165,6 +165,12 @@ test('size measures both bodies', () => {
   assert.equal(match('size:>5', { reqBody: 'x'.repeat(10), resBody: null }), true);
 });
 
+test('size uses the full length of a cut-short preview row', () => {
+  const preview = { resBody: 'x'.repeat(10), bodyLengths: { req: 0, res: 500 } };
+  assert.equal(match('size:>100', preview), true, 'the stored body is 500 chars, not the 10 the row holds');
+  assert.equal(match('size:<100', preview), false);
+});
+
 // ── Composition ──────────────────────────────────────────────────────────────
 
 test('terms are ANDed, never ORed', () => {
@@ -225,10 +231,4 @@ test('body terms are flagged for the server, because the client window is partia
   assert.equal(server.length, 1);
   assert.equal(server[0]?.value, 'not_in_channel');
   assert.equal(serverSideTerms(parseFilter('status:429')).length, 0);
-});
-
-test('a query round-trips through formatFilter', () => {
-  const input = 'status:429 op:conversations.* dur:>1500 -op:client.counts';
-  assert.equal(formatFilter(parseFilter(input)), input);
-  assert.equal(formatFilter(parseFilter('body:"rate limited"')), 'body:"rate limited"');
 });

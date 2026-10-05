@@ -11,48 +11,17 @@
  * Profile identity is carried on the LinkedIn workspace's `raw` (filled by
  * parse of `/voyager/api/me`). `ReadOnlyStore` has no actor list method.
  */
-import { num, obj, str } from '@sluice/adapter-sdk';
+import { isoTime, num, obj, pageArgs, previewText, requireStore, str } from '@sluice/adapter-sdk';
 import type { AppMcpTool, AppToolContext, Item, ReadOnlyStore, Workspace } from '@sluice/core';
 import { z } from 'zod';
 import { ADAPTER_ID, JOBS_CONTAINER_ID, WORKSPACE_ID } from './linkedin-adapter.js';
 
-const DEFAULT_PAGE = 50;
 const MAX_PAGE = 500;
-const SNIPPET_CHARS = 240;
 
 const PAGE_SCHEMA = {
   limit: z.number().int().positive().max(MAX_PAGE).optional(),
   offset: z.number().int().min(0).optional(),
 };
-
-function requireStore(ctx?: AppToolContext): ReadOnlyStore {
-  if (ctx?.store === undefined) {
-    throw new Error(
-      'This tool reads the Sluice capture store, and the host did not provide one. Run it through `sluice-mcp`.',
-    );
-  }
-  return ctx.store;
-}
-
-function page(args: Record<string, unknown>): { limit: number; offset: number } {
-  const limit = num(args.limit);
-  const offset = num(args.offset);
-  return {
-    limit: limit !== undefined && limit > 0 ? Math.min(Math.floor(limit), MAX_PAGE) : DEFAULT_PAGE,
-    offset: offset !== undefined && offset > 0 ? Math.floor(offset) : 0,
-  };
-}
-
-function preview(text: string): string {
-  const flat = text.replace(/\s+/g, ' ').trim();
-  return flat.length > SNIPPET_CHARS ? `${flat.slice(0, SNIPPET_CHARS)}…` : flat;
-}
-
-function isoOf(ts: number | null | undefined): string | null {
-  if (ts === null || ts === undefined) return null;
-  const at = new Date(ts);
-  return Number.isNaN(at.getTime()) ? null : at.toISOString();
-}
 
 function linkedInWorkspaces(store: ReadOnlyStore): Workspace[] {
   return store.listWorkspaces().filter((w) => w.adapterId === ADAPTER_ID);
@@ -67,27 +36,17 @@ function jobView(item: Item): {
   text: string;
 } {
   const raw = obj(item.raw) ?? {};
-  const title =
-    (typeof raw.title === 'string' ? raw.title : undefined) ??
-    item.text.split(' · ')[0] ??
-    item.text;
   const parts = item.text.split(' · ').map((p) => p.trim()).filter(Boolean);
-  const stitchedCompany = str(raw.companyName);
-  const cd = obj(raw.companyDetails);
-  const company =
-    stitchedCompany ||
-    (cd && str(cd.name)) ||
-    (parts.length >= 2 ? parts[1]! : null);
-  const location =
-    str(raw.formattedLocation) ||
-    (parts.length >= 3 ? parts[2]! : null);
+  const title = str(raw.title) ?? item.text.split(' · ')[0] ?? item.text;
+  const company = str(raw.companyName) || str(obj(raw.companyDetails)?.name) || parts[1] || null;
+  const location = str(raw.formattedLocation) || parts[2] || null;
   return {
     id: item.id,
     title,
     company: company && !company.startsWith('urn:') ? company : null,
     location: location && !location.startsWith('urn:') ? location : null,
-    listedAt: isoOf(item.ts > 0 ? item.ts : null),
-    text: preview(item.text),
+    listedAt: isoTime(item.ts > 0 ? item.ts : null),
+    text: previewText(item.text),
   };
 }
 
@@ -123,7 +82,7 @@ async function syncStatus(_args: Record<string, unknown>, ctx?: AppToolContext):
     messages: messageCount,
     items,
     captures,
-    newestCaptureAt: isoOf(newest),
+    newestCaptureAt: isoTime(newest),
     complete: false,
     note:
       'Answers reflect only what Sluice has captured from LinkedIn Voyager traffic — not a full account export.',
@@ -132,7 +91,7 @@ async function syncStatus(_args: Record<string, unknown>, ctx?: AppToolContext):
 
 async function listJobs(args: Record<string, unknown>, ctx?: AppToolContext): Promise<unknown> {
   const store = requireStore(ctx);
-  const { limit, offset } = page(args);
+  const { limit, offset } = pageArgs(args, { maxLimit: MAX_PAGE });
   const q = str(args.q)?.trim();
 
   let jobs: Item[];
@@ -159,7 +118,7 @@ async function listJobs(args: Record<string, unknown>, ctx?: AppToolContext): Pr
     : store.countItems({ adapterId: ADAPTER_ID, containerId: JOBS_CONTAINER_ID });
   const slice = jobs.slice(offset, offset + limit);
   return {
-    total: q ? jobs.length : total,
+    total,
     offset,
     limit,
     jobs: slice.map(jobView),
@@ -197,7 +156,7 @@ async function listConversations(
   ctx?: AppToolContext,
 ): Promise<unknown> {
   const store = requireStore(ctx);
-  const { limit, offset } = page(args);
+  const { limit, offset } = pageArgs(args, { maxLimit: MAX_PAGE });
   const threads = store
     .listContainers()
     .filter((c) => c.adapterId === ADAPTER_ID && c.kind === 'thread');
@@ -217,7 +176,7 @@ async function listConversations(
 
 async function listMessages(args: Record<string, unknown>, ctx?: AppToolContext): Promise<unknown> {
   const store = requireStore(ctx);
-  const { limit, offset } = page(args);
+  const { limit, offset } = pageArgs(args, { maxLimit: MAX_PAGE });
   const conversationId = str(args.conversationId);
 
   let messages = store.queryItems({
@@ -239,8 +198,8 @@ async function listMessages(args: Record<string, unknown>, ctx?: AppToolContext)
       id: m.id,
       conversationId: m.containerId,
       authorId: m.authorId ?? null,
-      at: isoOf(m.ts > 0 ? m.ts : null),
-      text: preview(m.text),
+      at: isoTime(m.ts > 0 ? m.ts : null),
+      text: previewText(m.text),
     })),
   };
 }
@@ -251,7 +210,7 @@ async function search(args: Record<string, unknown>, ctx?: AppToolContext): Prom
   if (!q || q.trim().length === 0) {
     throw new Error('linkedin_search requires a non-empty `q` string.');
   }
-  const { limit, offset } = page(args);
+  const { limit, offset } = pageArgs(args, { maxLimit: MAX_PAGE });
   const items = store.searchItems(q, {
     adapterId: ADAPTER_ID,
     limit: offset + limit,
@@ -267,27 +226,25 @@ async function search(args: Record<string, unknown>, ctx?: AppToolContext): Prom
       id: i.id,
       kind: i.kind,
       containerId: i.containerId,
-      at: isoOf(i.ts > 0 ? i.ts : null),
-      text: preview(i.text),
+      at: isoTime(i.ts > 0 ? i.ts : null),
+      text: previewText(i.text),
     })),
   };
 }
 
+/**
+ * Live GET /voyager/api/me as the signed-in member. Goes through
+ * `ctx.replayAction('linkedin.me')`, so the host acquires the LinkedIn session
+ * and injects its cookie and csrf-token: a bare `ctx.replay` of the same URL
+ * carries no credentials and only ever came back unauthenticated.
+ */
 async function fetchMeLive(_args: Record<string, unknown>, ctx?: AppToolContext): Promise<unknown> {
-  if (!ctx?.replay) {
+  if (!ctx?.replayAction) {
     throw new Error(
-      'linkedin_fetch_me needs AppToolContext.replay — run it through `sluice-mcp` with a live session.',
+      'linkedin_fetch_me needs AppToolContext.replayAction — run it through `sluice-mcp` with a live session.',
     );
   }
-  const capture = await ctx.replay({
-    method: 'GET',
-    url: 'https://www.linkedin.com/voyager/api/me',
-    headers: {
-      Accept: 'application/vnd.linkedin.normalized+json+2.1',
-      'x-restli-protocol-version': '2.0.0',
-      Referer: 'https://www.linkedin.com/',
-    },
-  });
+  const capture = await ctx.replayAction('linkedin.me');
   return {
     status: capture.status,
     captureId: capture.id,

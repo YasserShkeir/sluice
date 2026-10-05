@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-/** Tiny display helpers — no dependencies, all pure. */
+/** Tiny display helpers — no runtime dependencies, all pure. */
+import type { Capture } from '@sluice/core';
 
 export function formatClock(ms: number): string {
   const d = new Date(ms);
@@ -7,11 +8,15 @@ export function formatClock(ms: number): string {
   return `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}.${p(d.getMilliseconds(), 3)}`;
 }
 
-
 export function formatDuration(ms: number | null): string {
   if (ms === null) return '—';
   if (ms < 1000) return `${Math.round(ms)}ms`;
   return `${(ms / 1000).toFixed(2)}s`;
+}
+
+/** The message of a thrown value, for an inline error line. */
+export function errorMessage(e: unknown): string {
+  return e instanceof Error ? e.message : String(e);
 }
 
 /** Humanize a raw byte count (B / KB / MB / GB). */
@@ -26,6 +31,22 @@ export function formatBytes(n: number): string {
 export function humanizeBytes(body: string | null): string {
   if (body === null) return '—';
   return formatBytes(body.length);
+}
+
+/**
+ * The full lengths of a capture's bodies (chars). A list or WebSocket row may
+ * be a preview with cut-short bodies; the runner then says how long the stored
+ * ones are, and every size shown or filtered on must use that.
+ */
+export function bodyLengths(c: Pick<Capture, 'reqBody' | 'resBody' | 'bodyLengths'>): { req: number; res: number } {
+  return c.bodyLengths ?? { req: c.reqBody?.length ?? 0, res: c.resBody?.length ?? 0 };
+}
+
+/** The table's Size cell: the response body, else the request's, at full size. */
+export function captureSize(c: Pick<Capture, 'reqBody' | 'resBody' | 'bodyLengths'>): string {
+  if (c.resBody === null && c.reqBody === null) return '—';
+  const n = bodyLengths(c);
+  return formatBytes(c.resBody !== null ? n.res : n.req);
 }
 
 /** Best-effort pretty JSON; falls back to the raw string when it isn't JSON. */

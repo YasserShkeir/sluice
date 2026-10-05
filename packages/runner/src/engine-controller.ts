@@ -3,11 +3,8 @@
  * Runtime control of the capture engine + system proxy, so the DASHBOARD can
  * start and stop capture instead of it being fixed at `sluice start` time.
  *
- * The engine used to be a `const` built inside `cmdStart`, downstream of nothing
- * — construct, start, set proxy, done. Making it toggleable at runtime turns it
- * into mutable state two dashboards and a supervisor can all reach at once, and
- * the architecture review found the concrete races that opens. This controller
- * is the serialized state machine that closes them:
+ * The engine is toggleable runtime state shared by dashboards and the supervisor,
+ * so this controller serializes its lifecycle:
  *
  *   - **Single-flight.** start/stop chain onto one in-flight promise, so a
  *     double-click or two dashboards cannot run `engine.start()` twice (which
@@ -28,7 +25,7 @@
  * Dependencies are injected (engine factory, supervise fn, proxy ops) so the
  * lifecycle is testable without a real mockttp server or touching the OS proxy.
  */
-import type { EngineStatus } from '@sluice/core';
+import { errorMessage, type EngineStatus, type EnvironmentMsg, type SystemProxyReport } from '@sluice/core';
 import type { Supervisor } from '@sluice/interceptor';
 
 /** The slice of a capture engine the controller drives. `MitmEngine` satisfies it. */
@@ -47,25 +44,8 @@ export interface SystemProxyOps {
   state(): Promise<SystemProxyReport>;
 }
 
-export interface SystemProxyReport {
-  supported: boolean;
-  enabled: boolean;
-  host?: string;
-  port?: number;
-  /** Whether the enabled proxy points at OUR port (vs. someone else's). */
-  ours: boolean;
-  detail?: string;
-}
-
-/** What `environment()` reports — everything the dashboard's control page renders. */
-export interface EnvironmentState {
-  systemProxy: SystemProxyReport;
-  /** The port the engine is (or was last) bound to, when known. */
-  proxyPort?: number;
-  /** Whether the CA cert exists on disk (trust is a separate, CLI-only step). */
-  caGenerated: boolean;
-  caPath?: string;
-}
+/** What environment() reports: the environment frame's payload. */
+export type EnvironmentState = Omit<EnvironmentMsg, 'type' | 'seq'>;
 
 export interface EngineControllerDeps {
   /** Build a FRESH engine. Called once per start — never reused across a stop. */
@@ -79,7 +59,17 @@ export interface EngineControllerDeps {
   onEnvironment: (e: EnvironmentState) => void;
   /** Whether the CA cert file exists, and where — for `environment()`. */
   caInfo: () => { generated: boolean; path?: string };
+  /**
+   * Engine A is bound on the LAN (`--lan-proxy`). The system proxy is then
+   * refused, exactly as `sluice proxy on` refuses it: this Mac's own traffic has
+   * no business going through a proxy the whole network can reach.
+   */
+  lanProxy?: boolean;
 }
+
+/** Shared with `sluice proxy on`, so the dashboard and the CLI refuse in the same words. */
+export const LAN_PROXY_REFUSAL =
+  'This runner bound Engine A on the LAN (--lan-proxy). The system proxy would point THIS Mac at it too, so it is refused — set the HTTP(S) proxy only on the phone.';
 
 const STOPPED: EngineStatus = { engine: 'mitm', state: 'stopped' };
 
@@ -124,7 +114,7 @@ export class EngineController {
     try {
       return await this.deps.proxy.state();
     } catch (e) {
-      return { supported: false, enabled: false, ours: false, detail: errText(e) };
+      return { supported: false, enabled: false, ours: false, detail: errorMessage(e) };
     }
   }
 
@@ -181,6 +171,7 @@ export class EngineController {
   /** Route the machine's HTTPS through the proxy — only while the engine runs. */
   proxyOn(): Promise<void> {
     return this.serialize(async () => {
+      if (this.deps.lanProxy) throw new Error(LAN_PROXY_REFUSAL);
       if (this.status().state !== 'running' || this.port === undefined) {
         throw new Error('Start capture before turning the system proxy on.');
       }
@@ -205,20 +196,9 @@ export class EngineController {
    * black-holed on a dead loopback port. Also clear when `state().ours` is true.
    */
   private async clearProxyIfPointingAtUs(): Promise<void> {
-    let shouldClear = this.proxyOurs;
-    if (!shouldClear) {
-      try {
-        shouldClear = (await this.deps.proxy.state()).ours;
-      } catch {
-        shouldClear = false;
-      }
-    }
-    if (!shouldClear) {
-      this.proxyOurs = false;
-      return;
-    }
+    const clear = this.proxyOurs || (await this.deps.proxy.state().then((s) => s.ours, () => false));
     try {
-      await this.deps.proxy.off();
+      if (clear) await this.deps.proxy.off();
     } finally {
       this.proxyOurs = false;
     }
@@ -254,9 +234,4 @@ export class EngineController {
     this.engine = undefined;
     this.supervisor = undefined;
   }
-}
-
-/** Kept local so the controller does not depend on core's redactText for one string. */
-function errText(e: unknown): string {
-  return e instanceof Error ? e.message : String(e);
 }

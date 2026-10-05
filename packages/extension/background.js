@@ -6,26 +6,16 @@
  * Two rules keep this privacy-safe by construction:
  *   - It sends NOTHING until the user has configured a runner endpoint + ingest
  *     token AND at least one in-scope host. An unconfigured extension is inert.
- *   - It only forwards exchanges whose host matches the user's allowlist, so
- *     "capture my Slack" never quietly ships your bank. Scope lives here, not in
- *     the page patch, which stays a dumb observer.
+ *   - It only forwards an exchange when BOTH the page it came from (the sending
+ *     frame, as the browser reports it) and the request's own host match the
+ *     user's allowlist, so "capture my Slack" never quietly ships your bank, and
+ *     an unrelated site cannot post a capture that merely claims a Slack URL.
+ *     Scope lives here, not in the page patch, which stays a dumb observer.
  *
  * The token is the runner's ingest secret (printed by `sluice serve --ingest`);
  * host_permissions for loopback let this fetch bypass CORS.
  */
-const KEYS = ['endpoint', 'token', 'hosts', 'enabled'];
-
-/** Only loopback runners are allowed — never ship captures off-box. */
-function isLoopbackEndpoint(endpoint) {
-  try {
-    const u = new URL(endpoint);
-    if (u.protocol !== 'http:' && u.protocol !== 'https:') return false;
-    const h = (u.hostname || '').toLowerCase();
-    return h === '127.0.0.1' || h === 'localhost' || h === '[::1]' || h === '::1';
-  } catch {
-    return false;
-  }
-}
+import { DEFAULT_ENDPOINT, KEYS, isLoopbackEndpoint } from './shared.js';
 
 const FLUSH_MS = 2000;
 const FLUSH_AT = 50;
@@ -37,7 +27,7 @@ let flushTimer = null;
 async function config() {
   const c = await chrome.storage.local.get(KEYS);
   return {
-    endpoint: (c.endpoint || 'http://127.0.0.1:7788').replace(/\/+$/, ''),
+    endpoint: (c.endpoint || DEFAULT_ENDPOINT).replace(/\/+$/, ''),
     token: c.token || '',
     hosts: String(c.hosts || '')
       .split(/[,\n]/)
@@ -58,14 +48,25 @@ function hostAllowed(url, hosts) {
   return hosts.some((h) => host === h || host.endsWith(`.${h}`));
 }
 
-chrome.runtime.onMessage.addListener((msg) => {
-  if (msg && msg.type === 'sluice-capture') void enqueue(msg.entry);
+chrome.runtime.onMessage.addListener((msg, sender) => {
+  // Only this extension's own content script, running in a tab.
+  if (sender.id !== chrome.runtime.id || !sender.tab) return;
+  if (msg && msg.type === 'sluice-capture') void enqueue(msg.entry, sender.origin ?? sender.url);
 });
 
-async function enqueue(entry) {
+/**
+ * `frameUrl` is the origin (or URL) of the frame that ran content.js, set by the
+ * BROWSER. `entry.url` is page-controlled: any site can postMessage a capture
+ * claiming an in-scope URL, so it cannot scope anything on its own.
+ */
+async function enqueue(entry, frameUrl) {
+  if (!entry || typeof entry !== 'object') return;
   const cfg = await config();
   if (!cfg.enabled || !cfg.token) return;
-  if (!hostAllowed(entry.url, cfg.hosts)) return;
+  // Both the page and the request host must be in scope. A missing or opaque
+  // frame origin fails closed: hostAllowed(undefined) and hostAllowed('null')
+  // are false, because the URL parse throws.
+  if (!hostAllowed(frameUrl, cfg.hosts) || !hostAllowed(entry.url, cfg.hosts)) return;
   queue.push(entry);
   if (queue.length >= FLUSH_AT) void flush();
   else scheduleFlush();

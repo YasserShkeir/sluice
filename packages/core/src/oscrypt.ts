@@ -15,10 +15,11 @@
  */
 import { execFileSync } from 'node:child_process';
 import { createDecipheriv, pbkdf2Sync } from 'node:crypto';
-import { chmodSync, cpSync, existsSync, mkdtempSync, rmSync } from 'node:fs';
+import { chmodSync, existsSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import Database from 'better-sqlite3';
+import { copyFileSafe, sweepStaleTempDirs } from './safe-copy.js';
 
 /** OSCrypt macOS (`v10`): AES-128-CBC, IV = 16 spaces, PBKDF2-SHA1 salt 'saltysalt'. */
 const IV = Buffer.alloc(16, 0x20);
@@ -73,28 +74,66 @@ export function decryptOscryptV10(
 }
 
 /**
+ * What to tell the user before a Keychain read. "Always Allow" adds
+ * `/usr/bin/security` to the item's ACL, after which ANY same-user process can
+ * read the Safe Storage key without a prompt and decrypt every cookie. Printed
+ * by the CLI/runner (core never writes to the terminal).
+ */
+export const KEYCHAIN_ALLOW_ADVICE =
+  'macOS will ask for Keychain access: click "Allow", not "Always Allow" — "Always Allow" lets any program read this key without asking.';
+
+/**
+ * How long a Keychain read may wait on the consent prompt. It bounds how long
+ * the (synchronous) call can stall the event loop; it does not remove the stall.
+ */
+const KEYCHAIN_TIMEOUT_MS = 120_000;
+
+/** `security` exits 44 (errSecItemNotFound) when no item matches the query. */
+const SECURITY_ITEM_NOT_FOUND = 44;
+
+/** The `execFileSync` shape {@link keychainPassphrase} needs — a test seam. */
+export type KeychainExec = (
+  file: string,
+  args: string[],
+  options: { encoding: 'utf8'; timeout: number; stdio: ['ignore', 'pipe', 'pipe'] },
+) => string;
+
+/**
  * Read a macOS Keychain generic-password item (Chrome / Slack Safe Storage).
  * Triggers the OS consent prompt — never suppress or cache across processes.
+ * Tell the user {@link KEYCHAIN_ALLOW_ADVICE} first.
  *
  * Tries `service` + `account` first, then service alone (account labels vary
- * across Chromium builds).
+ * across Chromium builds) — but ONLY when the first lookup found no item. A
+ * Deny, a timeout or any other failure is final, so a user who clicks Deny is
+ * not asked a second time.
+ *
+ * `exec` is a test seam; production always uses `execFileSync`.
  */
-export function keychainPassphrase(service: string, account?: string): Buffer {
+export function keychainPassphrase(
+  service: string,
+  account?: string,
+  exec: KeychainExec = execFileSync,
+): Buffer {
   if (process.platform !== 'darwin') {
     throw new Error(
       'keychainPassphrase supports macOS (darwin) only — use paste-in credentials on other platforms.',
     );
   }
   const base = ['find-generic-password', '-w', '-s', service];
+  const options: Parameters<KeychainExec>[2] = {
+    encoding: 'utf8',
+    timeout: KEYCHAIN_TIMEOUT_MS,
+    stdio: ['ignore', 'pipe', 'pipe'],
+  };
+  const run = (args: string[]): string => exec('/usr/bin/security', args, options);
   let raw: string;
   try {
-    raw = account
-      ? execFileSync('/usr/bin/security', [...base, '-a', account], { encoding: 'utf8' })
-      : execFileSync('/usr/bin/security', base, { encoding: 'utf8' });
+    raw = account ? run([...base, '-a', account]) : run(base);
   } catch (first) {
-    if (!account) throw first;
+    if (!account || (first as { status?: number | null }).status !== SECURITY_ITEM_NOT_FOUND) throw first;
     // Account label varies across builds; retry keyed on the service only.
-    raw = execFileSync('/usr/bin/security', base, { encoding: 'utf8' });
+    raw = run(base);
   }
   return Buffer.from(raw.trim(), 'utf8');
 }
@@ -104,19 +143,17 @@ export function keychainPassphrase(service: string, account?: string): Buffer {
  * readonly, run `fn`, and shred the copy in `finally`. Copy-then-read dodges
  * exclusive locks while Chrome / Slack hold the live DB open.
  */
-export function withCopiedSqliteDb<T>(
-  dbPath: string,
-  fn: (db: Database.Database) => T,
-  tempPrefix = 'sluice-cookies-',
-): T {
-  const work = mkdtempSync(join(tmpdir(), tempPrefix));
+export function withCopiedSqliteDb<T>(dbPath: string, fn: (db: Database.Database) => T): T {
+  sweepStaleTempDirs(); // a killed earlier run's copy, which `finally` never removed
+  const work = mkdtempSync(join(tmpdir(), 'sluice-cookies-')); // the prefix sweepStaleTempDirs knows
   try {
     chmodSync(work, 0o700);
     const dst = join(work, 'db');
-    cpSync(dbPath, dst);
+    // Not cpSync: it can abort the process inside an app container (see safe-copy.ts).
+    copyFileSafe(dbPath, dst);
     for (const suffix of ['-wal', '-shm']) {
       const extra = dbPath + suffix;
-      if (existsSync(extra)) cpSync(extra, dst + suffix);
+      if (existsSync(extra)) copyFileSafe(extra, dst + suffix);
     }
     const db = new Database(dst, { readonly: true, fileMustExist: true });
     try {

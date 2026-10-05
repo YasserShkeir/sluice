@@ -118,8 +118,11 @@ that it is trustworthy. Test external-adapter loading against it, not against
 For burst-shaped and ingest tests there is a fixture loop: **`scrubCaptures`**
 turns a real recording into a committable fixture (preserving array lengths,
 nesting, keys, types, string lengths and relative timestamp order while replacing
-every character — deterministically, from a salted hash, so re-scrubbing is
-byte-identical), and **`runMockCaptures(captures, sink, opts)`** replays NDJSON
+every character — it keys an HMAC-SHA256 with a random salt and shifts timestamps
+by a random offset on every call, so pass `ScrubOptions.salt` / `shiftMs` only in a
+deterministic test, and never publish a fixture scrubbed with a fixed or committed
+salt; re-scrub with `toNdjson(scrubCaptures(parseNdjson(text).captures))`, then
+re-derive any literals the tests pin), and **`runMockCaptures(captures, sink, opts)`** replays NDJSON
 through the *same* ingest sink the live engines use, with no credentials
 anywhere. `parseNdjson` skips malformed lines by line number rather than losing
 the whole fixture.
@@ -170,10 +173,11 @@ rowid changes and orphans the index), and bodies above 2048 chars round-trip
 through gzip.
 
 **`packages/runner/src/server.ts`** — the loopback auth boundary, and the three
-independent secrets it mints: the read token (gates `/ws` and every GET `/api/*`),
-a pty token minted only with `--terminal`, an ingest token minted only with
-`--ingest`. Assert that the read token cannot open `/pty`, that a bad Origin and
-a wrong token are both refused, and that the static handler's path-traversal
+independent secrets it mints: the session token (gates `/ws` and every GET
+`/api/*`, and is full dashboard control, not read-only), a pty token minted only
+with `--terminal`, an ingest token minted only with `--ingest`. Assert that the
+session token cannot open `/pty`, that a bad Origin (including another local
+port) and a wrong token are both refused, and that the static handler's path-traversal
 guard holds. These need a real server on an ephemeral port — start it, hit it,
 close it in a `finally`.
 
@@ -204,10 +208,16 @@ accept one is part of the work.
 ## Things that need care
 
 - **No network in tests.** App tools take an injection seam — pass a fake
-  `AppToolContext` (`{ replay: async (req) => makeCapture({ … }), store }`) rather
-  than monkeypatching global `fetch`. `runSpeedTest(ctx)` and `fetchMyCards(ctx)`
-  both route through it. Only `runReplay` itself, and fast.com's range download,
-  genuinely reach the network — leave those to manual verification.
+  `AppToolContext` (`{ replay: async (req) => makeCapture({ … }), replayAction, store }`)
+  rather than monkeypatching global `fetch`. `runSpeedTest(ctx)`, `fetchMyCards(ctx)`
+  and the Trello/Loom/Notion tools (via `replayAttempt`) all route through it; a tool
+  that reads a local cookie takes an injectable cookie source (app-loom's
+  `createLoomMcpTools(cookies?)`) so a test never reaches the Keychain. `runReplay`
+  itself can be exercised against a local `node:http` server on `127.0.0.1` with
+  `allowedHosts: ['127.0.0.1']`; fast.com's range download is left to manual
+  verification.
+- **Never touch the real `~/.sluice`.** Spawned CLI commands run with a temp `HOME`
+  (see `cli.test.ts`), because opening a store creates and chmods `~/.sluice`.
 - **`ctx.replay` is single-flight.** A fake context that calls back into another
   `ctx.replay` deadlocks the same way the real one does; keep fakes flat.
 - **macOS-only paths.** Credential extraction returns `[]` or throws off darwin.

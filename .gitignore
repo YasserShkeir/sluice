@@ -18,6 +18,14 @@ out/
 captures/
 *.har
 *.pcap
+exports/
+*.ndjson
+*.jsonl
+# ...except adapter fixtures, which are scrubbed synthetic captures by design.
+# The project graph drops tracked files an ignore rule matches, so this
+# re-include is what keeps packages/app-*/fixtures/*.ndjson indexed.
+!**/fixtures/**/*.ndjson
+!**/fixtures/**/*.jsonl
 
 # Secrets / credentials (belt-and-suspenders — the tool keeps these in memory only)
 *.pem
@@ -25,6 +33,23 @@ captures/
 .env
 .env.*
 !.env.example
+.envrc
+.netrc
+.git-credentials
+.yarnrc.yml
+.docker/config.json
+id_rsa*
+id_dsa*
+id_ecdsa*
+id_ed25519*
+!id_*.pub
+*.p8
+*.jks
+*.keystore
+*.gpg
+*.asc
+*.tfstate
+*.tfstate.*
 
 # Local CA material
 ca/
@@ -41,6 +66,7 @@ logs/
 !.vscode/extensions.json
 !.vscode/settings.example.json
 *.swp
+CLAUDE.local.md
 
 # Design docs, plans and captured API catalogs — kept locally, not in the repo.
 # The API catalogs in particular are rendered from real captured traffic.
@@ -52,3 +78,6 @@ docs/*
 # everything else under docs/ either contains real captured traffic or is a
 # private working note.
 !docs/public/
+
+# Claude Code per-user permissions (can hold local paths/commands)
+.claude/settings.local.json

@@ -1,0 +1,4 @@
+interface:
+  display_name: "Sluice Project Graph"
+  short_description: "Navigate and maintain Sluice source knowledge"
+  default_prompt: "Use $sluice-project-graph to orient to this Sluice change and assess its impact."

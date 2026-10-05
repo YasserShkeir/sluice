@@ -2,12 +2,6 @@
 /**
  * The traffic filter language.
  *
- * What it replaces: six fixed `<select>` dropdowns plus one substring box, each
- * dimension an exact-equality `continue` in a hand-written loop. That design
- * could express "app = slack" and nothing else — not "429s", not "slower than a
- * second and a half", not "anything but client.counts", and not two values for
- * the same field. Every new dimension cost a dropdown, a state key and a branch.
- *
  * The language:
  *
  *   status:429              a field equals a value
@@ -31,21 +25,11 @@
  * has no component-test infrastructure, only plain node:test over pure modules.
  */
 import type { Capture } from '@sluice/core';
+import { bodyLengths } from './format.js';
 
+const FIELD_NAMES = ['text', 'app', 'source', 'method', 'host', 'path', 'op', 'status', 'dur', 'size', 'tab', 'body'] as const;
 /** Fields a term can address. `text` is the bare-word case: match anything. */
-export type FilterField =
-  | 'text'
-  | 'app'
-  | 'source'
-  | 'method'
-  | 'host'
-  | 'path'
-  | 'op'
-  | 'status'
-  | 'dur'
-  | 'size'
-  | 'tab'
-  | 'body';
+export type FilterField = (typeof FIELD_NAMES)[number];
 
 export type Comparator = '=' | '>' | '<' | '>=' | '<=';
 
@@ -65,20 +49,7 @@ export interface FilterQuery {
 /** Fields compared as numbers; everything else is compared as text. */
 const NUMERIC: ReadonlySet<FilterField> = new Set<FilterField>(['status', 'dur', 'size']);
 
-const FIELDS: ReadonlySet<string> = new Set<FilterField>([
-  'text',
-  'app',
-  'source',
-  'method',
-  'host',
-  'path',
-  'op',
-  'status',
-  'dur',
-  'size',
-  'tab',
-  'body',
-]);
+const FIELDS: ReadonlySet<string> = new Set<FilterField>(FIELD_NAMES);
 
 /** Field names people reach for that are not the canonical one. */
 const ALIASES: Readonly<Record<string, FilterField>> = {
@@ -173,18 +144,15 @@ export function parseFilter(input: string): FilterQuery {
   return { terms, errors };
 }
 
-/** Does the query constrain anything? An empty query matches every row. */
-export function isEmptyQuery(q: FilterQuery): boolean {
-  return q.terms.length === 0;
-}
-
 /**
  * Terms the client cannot answer alone.
  *
  * `body:` is the one predicate whose data is not in the row the table holds:
- * the WS backfill is a bounded window, so a body search restricted to it
- * silently answers a different question than the user asked. Those terms go to
- * the server's FTS-backed search instead.
+ * the WS backfill is a bounded window, and each row's bodies are 64 KiB
+ * previews. A positive body term answered locally would silently answer a
+ * narrower question, so it goes to the server's FTS-backed search. A negated
+ * one stays local and sees only the preview: a row whose match lies past the
+ * cut still passes `-body:`.
  */
 export function serverSideTerms(q: FilterQuery): FilterTerm[] {
   return q.terms.filter((t) => t.field === 'body' && !t.negated);
@@ -245,9 +213,10 @@ function compare(actual: number | null | undefined, comparator: Comparator, valu
   }
 }
 
-/** Rough response size, matching what the table's Size column shows. */
+/** Rough size of both bodies — at full length, even on a cut-short preview row. */
 function bodySize(c: Capture): number {
-  return (c.resBody?.length ?? 0) + (c.reqBody?.length ?? 0);
+  const n = bodyLengths(c);
+  return n.res + n.req;
 }
 
 /** Everything a bare word searches. Built per row, so keep it cheap. */
@@ -299,19 +268,3 @@ export function matchesFilter(c: Capture, q: FilterQuery): boolean {
   }
   return true;
 }
-
-/** Render a query back to text — for a "copy this filter" affordance. */
-export function formatFilter(q: FilterQuery): string {
-  return q.terms
-    .map((t) => {
-      const value = /\s/.test(t.value) ? `"${t.value}"` : t.value;
-      const body = t.field === 'text' ? value : `${t.field}:${t.comparator === '=' ? '' : t.comparator}${value}`;
-      return `${t.negated ? '-' : ''}${body}`;
-    })
-    .join(' ');
-}
-
-/** The field names, for a completion menu or a cheatsheet. */
-export const FILTER_FIELDS: readonly FilterField[] = [...FIELDS].filter(
-  (f): f is FilterField => f !== 'text',
-);

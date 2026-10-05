@@ -1,0 +1,723 @@
+{
+  "version": 1,
+  "description": "Reviewed Sluice architecture, runtime flows, invariants, trust boundaries, and open findings. Auto-indexed source facts remain separate and authoritative.",
+  "nodes": [
+    {
+      "id": "layer:foundation",
+      "kind": "layer",
+      "name": "Foundation contracts and storage",
+      "description": "Portable contracts, normalized types, redaction, SQLite storage, adapter authoring helpers, and browser-safe protocol validation. Core, adapter-sdk, and protocol are the lowest reusable layer.",
+      "path": "packages/core/src/types.ts",
+      "metadata": { "evidence": ["CONTRIBUTING.md", "packages/core/src/types.ts", "packages/protocol/src/index.ts"] }
+    },
+    {
+      "id": "layer:capture-replay",
+      "kind": "layer",
+      "name": "Capture and replay",
+      "description": "MITM, CDP, extension capture, local credential reconstruction, replay execution, flow execution, and their safety rails.",
+      "path": "packages/interceptor/src/index.ts",
+      "metadata": { "evidence": ["packages/interceptor/src/index.ts", "packages/extension/manifest.json"] }
+    },
+    {
+      "id": "layer:derivation",
+      "kind": "layer",
+      "name": "Derivation and cartography",
+      "description": "Derives API catalogs, faithful request fingerprints, per-app materialized tables, observed interaction flows, and learned flow templates from stored captures.",
+      "path": "packages/cartographer/src/index.ts",
+      "metadata": { "evidence": ["packages/cartographer/src/index.ts"] }
+    },
+    {
+      "id": "layer:integrations",
+      "kind": "layer",
+      "name": "App integrations",
+      "description": "The generic app contract plus the single installed-app registry and the `packages/app-*` service packages it registers.",
+      "path": "packages/apps/src/index.ts",
+      "metadata": { "evidence": ["packages/apps/src/index.ts", "packages/core/src/types.ts"] }
+    },
+    {
+      "id": "layer:control-interfaces",
+      "kind": "layer",
+      "name": "Control plane and interfaces",
+      "description": "Runner composition root, CLI, HTTP/WS/PTY server, process supervision, system proxy control, runtime-data MCP, and the thin published CLI launcher.",
+      "path": "packages/runner/src/cli.ts",
+      "metadata": { "evidence": ["packages/runner/src/cli.ts", "packages/runner/src/server.ts", "packages/mcp/src/server.ts"] }
+    },
+    {
+      "id": "layer:presentation",
+      "kind": "layer",
+      "name": "Dashboard presentation",
+      "description": "React/Vite dashboard for overview, traffic inspection, app detail, data exploration, replay, storage, activity, capture control, and an optional terminal.",
+      "path": "apps/webapp/src/App.tsx",
+      "metadata": { "evidence": ["apps/webapp/src/App.tsx", "apps/webapp/src/router.ts"] }
+    },
+    {
+      "id": "layer:tooling-knowledge",
+      "kind": "layer",
+      "name": "Build, CI, diagrams, and project knowledge",
+      "description": "Workspace/build configuration, CI, generated architecture diagrams, agent skills, and the separate source-code project graph and MCP.",
+      "path": "packages/project-graph/src/cli.ts",
+      "metadata": { "evidence": ["scripts/build.mjs", ".github/workflows/ci.yml", "assets/architecture/src/01-pipeline.html"] }
+    },
+    {
+      "id": "component:app-contract",
+      "kind": "component",
+      "name": "App / Adapter contract",
+      "description": "App extends Adapter with matchRequest, parse, replay actions/building, optional classification/cursors/reconcile/flow hints, credential provider, MCP tools, and app redaction.",
+      "path": "packages/core/src/types.ts",
+      "metadata": { "evidence": ["packages/core/src/types.ts"] }
+    },
+    {
+      "id": "component:app-registry",
+      "kind": "component",
+      "name": "Installed app registry",
+      "description": "The only first-party seam that imports concrete app packages, registers their global redaction patterns, selects enabled apps, and resolves adapter ownership in registration order.",
+      "path": "packages/apps/src/index.ts",
+      "metadata": { "evidence": ["packages/apps/src/index.ts", "packages/apps/src/discover.ts"] }
+    },
+    {
+      "id": "component:mitm-engine",
+      "kind": "component",
+      "name": "Engine A — MITM proxy",
+      "description": "Passive mockttp HTTP/HTTPS/WebSocket interception. Decrypts all routed hosts by default; scoped-out hosts are CONNECT-tunnelled as opaque bytes. Requests are passed through without mutation.",
+      "path": "packages/interceptor/src/mitm-engine.ts",
+      "metadata": { "evidence": ["packages/interceptor/src/mitm-engine.ts", "assets/architecture/src/02-capture-engines.html"] }
+    },
+    {
+      "id": "component:cdp-engine",
+      "kind": "component",
+      "name": "Engine C — CDP capture",
+      "description": "Attaches to Chrome page targets over DevTools, captures XHR/Fetch and text WebSocket traffic, and preserves tab/load correlation without installing a CA or proxying traffic.",
+      "path": "packages/interceptor/src/cdp-engine.ts",
+      "metadata": { "evidence": ["packages/interceptor/src/cdp-engine.ts"] }
+    },
+    {
+      "id": "component:extension-engine",
+      "kind": "component",
+      "name": "Engine C — MV3 extension",
+      "description": "MAIN-world fetch/XHR patch sends captures through a window bridge, isolated content script, service worker host allowlist/batch queue, and authenticated POST /api/ingest.",
+      "path": "packages/extension/inject.js",
+      "metadata": { "evidence": ["packages/extension/inject.js", "packages/extension/content.js", "packages/extension/background.js"] }
+    },
+    {
+      "id": "component:credential-replay",
+      "kind": "component",
+      "name": "Engine B — local session replay",
+      "description": "App credential providers reconstruct this machine's signed-in session in memory; apps build synthetic read-intended requests which pass through faithful fingerprinting and replay policy.",
+      "path": "packages/interceptor/src/replay.ts",
+      "metadata": { "evidence": ["packages/core/src/types.ts", "packages/interceptor/src/replay.ts"] }
+    },
+    {
+      "id": "component:ingest-funnel",
+      "kind": "component",
+      "name": "Runner ingest funnel",
+      "description": "Core persistCapture: redacts a Capture (headers, bodies, URL-like fields), attributes it to an app, classifies it, inserts it, parses normalized entities (a throwing parser leaves it unparsed), and seeds pagination. The runner then broadcasts a body preview and schedules materialization; the CLI and MCP record paths use the same function.",
+      "path": "packages/runner/src/server.ts",
+      "metadata": { "evidence": ["packages/runner/src/server.ts", "assets/architecture/src/03-ingest-normalization.html", "packages/core/src/persist.ts"] }
+    },
+    {
+      "id": "component:normalized-model",
+      "kind": "component",
+      "name": "Normalized entity model",
+      "description": "Service-independent Workspace, Actor, Container, Item, and polymorphic Edge types. Items can carry source capture ids; containment uses logical ids rather than SQL foreign keys.",
+      "path": "packages/core/src/types.ts",
+      "metadata": { "evidence": ["packages/core/src/types.ts", "packages/core/src/schema.ts"] }
+    },
+    {
+      "id": "database:runtime-captures",
+      "kind": "database",
+      "name": "Runtime capture store",
+      "description": "WAL-mode SQLite at ~/.sluice/sluice.db. Holds redacted captures, normalized entities, sessions without credential values, pagination work, flows/templates, FTS indexes, and cartographer materializations.",
+      "path": "packages/core/src/schema.ts",
+      "metadata": { "defaultPath": "~/.sluice/sluice.db", "evidence": ["packages/core/src/schema.ts", "packages/core/src/store.ts"] }
+    },
+    {
+      "id": "database:project-graph",
+      "kind": "database",
+      "name": "Project source graph",
+      "description": "Separate local SQLite/FTS graph at <repo>/.sluice/project-graph.sqlite. It indexes repository source and architecture but never imports apps, opens the capture store, extracts credentials, or reaches the network.",
+      "path": "packages/project-graph/src/schema.ts",
+      "metadata": { "defaultPath": ".sluice/project-graph.sqlite", "evidence": ["packages/project-graph/src/schema.ts", "packages/project-graph/src/server.ts"] }
+    },
+    {
+      "id": "component:cartographer",
+      "kind": "component",
+      "name": "Cartographer",
+      "description": "Transforms capture history into endpoint maps, Markdown API catalogs, inferred per-app tables, faithful request fingerprints, observed bursts, and parameterized multi-step flow templates.",
+      "path": "packages/cartographer/src/index.ts",
+      "metadata": { "evidence": ["packages/cartographer/src/index.ts"] }
+    },
+    {
+      "id": "component:engine-controller",
+      "kind": "component",
+      "name": "EngineController",
+      "description": "Serializes capture engine start/stop/proxy transitions, constructs a fresh supervisor per start, and coordinates teardown ordering.",
+      "path": "packages/runner/src/engine-controller.ts",
+      "metadata": { "evidence": ["packages/runner/src/engine-controller.ts"] }
+    },
+    {
+      "id": "component:supervisor",
+      "kind": "component",
+      "name": "Capture supervisor",
+      "description": "Probes the capture proxy port every five seconds and performs at most five exponential-backoff restarts before a terminal error.",
+      "path": "packages/interceptor/src/supervisor.ts",
+      "metadata": { "evidence": ["packages/interceptor/src/supervisor.ts"] }
+    },
+    {
+      "id": "interface:runner-http",
+      "kind": "interface",
+      "name": "Read-oriented HTTP API",
+      "description": "Loopback GET endpoints expose status, captures (body previews), entities, flows, tables, storage, apps, and API docs; /api/captures/:id/body returns a whole body. The extension ingest POST is a separate token-gated route.",
+      "path": "packages/runner/src/api.ts",
+      "metadata": { "evidence": ["packages/runner/src/api.ts", "packages/runner/src/server.ts"] }
+    },
+    {
+      "id": "interface:runner-websocket",
+      "kind": "interface",
+      "name": "Dashboard WebSocket control channel",
+      "description": "Authenticated bidirectional channel for capture streams, replay, sync, engine/proxy control, exports, and destructive data operations, with a 500-frame replay ring.",
+      "path": "packages/runner/src/server.ts",
+      "metadata": { "evidence": ["packages/core/src/protocol.ts", "packages/protocol/src/index.ts", "packages/runner/src/server.ts"] }
+    },
+    {
+      "id": "interface:runtime-mcp",
+      "kind": "interface",
+      "name": "Captured-data MCP",
+      "description": "The existing sluice-mcp stdio server exposes the runtime capture store, app tools, and credential-backed read-intended replay. It is operationally distinct from source-code knowledge.",
+      "path": "packages/mcp/src/server.ts",
+      "metadata": { "evidence": ["packages/mcp/src/server.ts", "packages/mcp/README.md"] }
+    },
+    {
+      "id": "interface:project-graph-mcp",
+      "kind": "interface",
+      "name": "Project graph MCP",
+      "description": "The sluice-project-graph stdio server supplies status, GraphRAG retrieval, exact lookup, neighborhoods, traces, impact analysis, refresh, validation, and version-checked manual notes.",
+      "path": "packages/project-graph/src/server.ts",
+      "metadata": { "evidence": ["packages/project-graph/src/server.ts"] }
+    },
+    {
+      "id": "runtime:runner-parent",
+      "kind": "runtime_process",
+      "name": "Runner parent process",
+      "description": "The main sluice process owns configuration, the capture database, app registry, HTTP/WS/PTY control plane, attribution/parsing, EngineController, replay orchestration, and optional child-engine supervision.",
+      "path": "packages/runner/src/cli.ts",
+      "metadata": { "evidence": ["packages/runner/src/cli.ts", "packages/runner/src/server.ts"] }
+    },
+    {
+      "id": "runtime:engine-child",
+      "kind": "runtime_process",
+      "name": "Isolated MITM engine child",
+      "description": "Optional isolated process started by ChildEngine. It owns mockttp/MITM capture and streams NDJSON captures over file descriptor 3; adapter attribution and parsing remain in the parent.",
+      "path": "packages/runner/src/engine-child.ts",
+      "metadata": { "evidence": ["packages/runner/src/engine-child.ts", "packages/runner/src/child-engine.ts"] }
+    },
+    {
+      "id": "runtime:webapp-browser",
+      "kind": "runtime_process",
+      "name": "Dashboard browser runtime",
+      "description": "Vite/React client that reads loopback HTTP, subscribes to the dashboard WebSocket, issues replay/control operations, and optionally attaches to the persistent PTY channel.",
+      "path": "apps/webapp/src/App.tsx",
+      "metadata": { "evidence": ["apps/webapp/src/App.tsx", "apps/webapp/src/ws.ts", "apps/webapp/src/api.ts"] }
+    },
+    {
+      "id": "runtime:extension-main",
+      "kind": "runtime_process",
+      "name": "Extension MAIN-world hook",
+      "description": "Page-world script patches fetch and XHR, clones textual responses, and posts shaped capture entries into the page window.",
+      "path": "packages/extension/inject.js",
+      "metadata": { "evidence": ["packages/extension/inject.js"] }
+    },
+    {
+      "id": "runtime:extension-content",
+      "kind": "runtime_process",
+      "name": "Extension isolated bridge",
+      "description": "Content script receives window messages from the page world and forwards only the whitelisted capture fields to the extension service worker.",
+      "path": "packages/extension/content.js",
+      "metadata": { "evidence": ["packages/extension/content.js"] }
+    },
+    {
+      "id": "runtime:extension-worker",
+      "kind": "runtime_process",
+      "name": "Extension service worker",
+      "description": "MV3 background worker owns configured host scope (checked against both the sender frame and the request URL), batching, and the ingest capability before POSTing entries to the runner.",
+      "path": "packages/extension/background.js",
+      "metadata": { "evidence": ["packages/extension/background.js", "packages/extension/manifest.json"] }
+    },
+    {
+      "id": "runtime:captured-data-mcp",
+      "kind": "runtime_process",
+      "name": "Captured-data MCP process",
+      "description": "Independent stdio process that opens the Sluice capture database, loads app integrations, exposes normalized/store tools, and can execute credential-backed replay tools.",
+      "path": "packages/mcp/src/cli.ts",
+      "metadata": { "evidence": ["packages/mcp/src/cli.ts", "packages/mcp/src/server.ts"] }
+    },
+    {
+      "id": "runtime:project-graph-mcp",
+      "kind": "runtime_process",
+      "name": "Project graph MCP process",
+      "description": "Independent stdio process that opens only the repository source graph, refreshes safe source facts, and exposes local retrieval/maintenance tools without importing apps or calling the network.",
+      "path": "packages/project-graph/src/cli.ts",
+      "metadata": { "evidence": ["packages/project-graph/src/cli.ts", "packages/project-graph/src/server.ts"] }
+    },
+    {
+      "id": "build:webapp",
+      "kind": "build_target",
+      "name": "Dashboard Vite build",
+      "description": "Builds apps/webapp/dist, which scripts/build.mjs copies into packages/runner/dist/webapp for the runner to serve.",
+      "path": "apps/webapp/package.json",
+      "metadata": { "output": "apps/webapp/dist", "evidence": ["apps/webapp/package.json", "scripts/build.mjs"] }
+    },
+    {
+      "id": "build:runner-cli",
+      "kind": "build_target",
+      "name": "Runner CLI bundle",
+      "description": "esbuild Node 20 ESM bundle for the main sluice CLI and control-plane process.",
+      "path": "scripts/build.mjs",
+      "metadata": { "entry": "packages/runner/src/cli.ts", "output": "packages/runner/dist/cli.js", "evidence": ["scripts/build.mjs"] }
+    },
+    {
+      "id": "build:engine-child",
+      "kind": "build_target",
+      "name": "Engine child bundle",
+      "description": "Separate Node 20 ESM bundle for the isolated capture engine process.",
+      "path": "scripts/build.mjs",
+      "metadata": { "entry": "packages/runner/src/engine-child.ts", "output": "packages/runner/dist/engine-child.js", "evidence": ["scripts/build.mjs"] }
+    },
+    {
+      "id": "build:runtime-mcp",
+      "kind": "build_target",
+      "name": "Captured-data MCP bundle",
+      "description": "Plain-Node bundle for sluice-mcp. It excludes mockttp so the data server cannot accidentally carry the capture engine.",
+      "path": "scripts/build.mjs",
+      "metadata": { "entry": "packages/mcp/src/cli.ts", "output": "packages/mcp/dist/cli.js", "evidence": ["scripts/build.mjs"] }
+    },
+    {
+      "id": "build:project-mcp",
+      "kind": "build_target",
+      "name": "Project graph MCP bundle",
+      "description": "Plain-Node bundle for the local source graph. TypeScript and native SQLite remain runtime externals.",
+      "path": "scripts/build.mjs",
+      "metadata": { "entry": "packages/project-graph/src/cli.ts", "output": "packages/project-graph/dist/cli.js", "evidence": ["scripts/build.mjs"] }
+    },
+    {
+      "id": "capability:dashboard-control",
+      "kind": "capability",
+      "name": "Dashboard and WebSocket token",
+      "description": "Per-run bearer capability that authorizes HTTP reads and the full dashboard WebSocket control/mutation surface.",
+      "path": "packages/runner/src/server.ts",
+      "metadata": { "persisted": false, "evidence": ["packages/runner/src/server.ts"] }
+    },
+    {
+      "id": "capability:extension-ingest",
+      "kind": "capability",
+      "name": "Extension ingest token",
+      "description": "Optional independent capability that gates POST /api/ingest when extension ingestion is enabled.",
+      "path": "packages/runner/src/server.ts",
+      "metadata": { "persisted": false, "evidence": ["packages/runner/src/server.ts", "packages/extension/background.js"] }
+    },
+    {
+      "id": "capability:pty",
+      "kind": "capability",
+      "name": "PTY token",
+      "description": "Independent per-run capability for the loopback /pty channel and embedded Claude Code terminal.",
+      "path": "packages/runner/src/claude-terminal.ts",
+      "metadata": { "persisted": false, "evidence": ["packages/runner/src/server.ts", "packages/runner/src/claude-terminal.ts"] }
+    },
+    {
+      "id": "config:runner-precedence",
+      "kind": "config_key",
+      "name": "Runner configuration precedence",
+      "description": "CLI flags override the nearest project .sluice.json, then the home ~/.sluice/config.json, then compiled defaults. External adapter discovery reads only the home config.",
+      "path": "packages/runner/src/config.ts",
+      "metadata": { "evidence": ["packages/runner/src/config.ts", "packages/apps/src/discover.ts"] }
+    },
+    {
+      "id": "documentation:agent-contract",
+      "kind": "documentation",
+      "name": "Repository agent contract",
+      "description": "Root instructions require graph freshness/orientation/impact before source changes and refresh/validation afterward, while preserving source authority and secret boundaries.",
+      "path": "AGENTS.md",
+      "metadata": { "evidence": ["AGENTS.md", "CLAUDE.md", ".claude/skills/sluice-project-graph/SKILL.md"] }
+    },
+    {
+      "id": "workflow:capture-ingest",
+      "kind": "workflow",
+      "name": "Capture → ingest → normalize",
+      "description": "Routed client/CDP/page hooks produce Capture objects; core persistCapture redacts, attributes, classifies, persists/FTS-indexes, parses normalized entities and enqueues cursors; the runner broadcasts body previews and schedules materialization.",
+      "path": "packages/runner/src/server.ts",
+      "metadata": { "evidence": ["assets/architecture/src/01-pipeline.html", "packages/runner/src/server.ts", "packages/core/src/persist.ts"] }
+    },
+    {
+      "id": "workflow:single-replay",
+      "kind": "workflow",
+      "name": "Single-request replay",
+      "description": "Caller selects an app ReplayAction and the session of the workspace the params name (never a silent first session); app builds a request; cartographer overlays a host-scoped learned fingerprint; policy checks method/operation/host/budget/single-flight; fetch (no redirects) returns a redacted replay Capture which re-enters the persistCapture funnel.",
+      "path": "packages/interceptor/src/replay.ts",
+      "metadata": { "evidence": ["packages/cartographer/src/faithful.ts", "packages/interceptor/src/replay-policy.ts", "packages/interceptor/src/replay.ts"] }
+    },
+    {
+      "id": "workflow:flow-learning",
+      "kind": "workflow",
+      "name": "Observed-flow learning",
+      "description": "Real non-replay HTTP captures are clustered into correlated/time-window bursts, scored for a primary, and distilled into templates with support, timing, stable request parts, flow parameters, and cross-step bindings.",
+      "path": "packages/cartographer/src/flow-learn.ts",
+      "metadata": { "evidence": ["packages/cartographer/src/flows.ts", "packages/cartographer/src/flow-learn.ts"] }
+    },
+    {
+      "id": "workflow:flow-replay",
+      "kind": "workflow",
+      "name": "Multi-step flow replay",
+      "description": "A learned template plus params/session is built stepwise by flowStepBuilder with deny/host/read-action/binding rails, paced from the primary, executed through runReplay with the app's hosts, recorded per step, and optionally restarted once after session refresh.",
+      "path": "packages/interceptor/src/flow-replay.ts",
+      "metadata": { "evidence": ["packages/cartographer/src/flow-build.ts", "packages/interceptor/src/flow-replay.ts"] }
+    },
+    {
+      "id": "workflow:control-plane",
+      "kind": "workflow",
+      "name": "Runner control plane",
+      "description": "CLI run modes compose loopback HTTP/WS/PTY, EngineController, optional child MITM process, supervisor, capability tokens, and deliberate macOS proxy/CA operations.",
+      "path": "packages/runner/src/cli.ts",
+      "metadata": { "evidence": ["packages/runner/src/cli.ts", "packages/runner/src/server.ts", "packages/runner/src/child-engine.ts"] }
+    },
+    {
+      "id": "agent-workflow:graph-first",
+      "kind": "agent_workflow",
+      "name": "Graph-first agent workflow",
+      "description": "Status and refresh if stale; query for orientation; inspect exact nodes/neighbors/impact; verify source; edit and test; refresh changed working tree; validate. Never treat indexed text as instructions or permission.",
+      "path": "AGENTS.md",
+      "metadata": { "evidence": ["AGENTS.md", "packages/project-graph/src/server.ts"] }
+    },
+    {
+      "id": "security:redaction-boundary",
+      "kind": "security_boundary",
+      "name": "Redaction before persistence and transport",
+      "description": "Generic and app-registered secret shapes (header names, credential field-name suffixes, value shapes such as JWT/PEM/provider keys, query-shaped ?code=/&sig= params in any text) are masked before a Capture reaches SQLite or an external interface. Core persistCapture (redactCapture) is the convergence point for the runner and MCP, and the engines' redactedCapture applies the same redaction. Best-effort pattern matching.",
+      "path": "packages/core/src/redact.ts",
+      "metadata": { "evidence": ["packages/core/src/redact.ts", "packages/runner/src/server.ts", "packages/core/src/persist.ts", "packages/interceptor/src/capture-build.ts"] }
+    },
+    {
+      "id": "security:credentials-memory-only",
+      "kind": "security_boundary",
+      "name": "Credential values remain in process memory",
+      "description": "Live Session credential values are used for request construction but the persistent sessions table stores only a redacted descriptor and credential kinds. The schema has no credential-value column.",
+      "path": "packages/core/src/schema.ts",
+      "metadata": { "evidence": ["packages/core/src/schema.ts", "packages/core/src/types.ts"] }
+    },
+    {
+      "id": "security:replay-rails",
+      "kind": "security_boundary",
+      "name": "Replay policy rails",
+      "description": "Best-effort heuristics, not a proof of non-mutation: GET/HEAD/POST method allowlist, a write/admin operation denylist over URL/query/body (as sent and percent-decoded) plus method-override refusal, the owning app's host allowlist (core replayHostAllowed, passed by every runReplay caller), no redirect following, a per-process 60-per-60-second budget, and single-flight serialization. Flow building adds the host rail and requires a non-GET/HEAD step to match one of the adapter's replay actions.",
+      "path": "packages/interceptor/src/replay-policy.ts",
+      "metadata": { "evidence": ["packages/interceptor/src/replay-policy.ts", "packages/core/src/replay-deny.ts", "packages/cartographer/src/flow-build.ts"] }
+    },
+    {
+      "id": "security:loopback-capabilities",
+      "kind": "security_boundary",
+      "name": "Loopback listeners and capability tokens",
+      "description": "Dashboard/API/WS/PTY bind loopback and validate host, Origin (the runner's own port or the pinned dev UI :5273) and tokens. Session (dashboard), PTY, and extension-ingest tokens are independently minted; the session token authorizes both reads and full WS control.",
+      "path": "packages/runner/src/server.ts",
+      "metadata": { "evidence": ["packages/runner/src/server.ts"] }
+    },
+    {
+      "id": "security:tls-scope",
+      "kind": "security_boundary",
+      "name": "MITM TLS scope",
+      "description": "All routed hosts are decrypted by default except NEVER_DECRYPT_HOSTS (AI-assistant hosts, tunnelled). Explicit host configuration or interceptAllHosts=false scopes TLS termination; out-of-scope hosts are tunnelled unreadably. The proxy binds loopback by default; --lan-proxy binds 0.0.0.0 and accepts only loopback plus the --lan-allow clients.",
+      "path": "packages/interceptor/src/mitm-engine.ts",
+      "metadata": { "evidence": ["packages/interceptor/src/mitm-engine.ts", "SECURITY.md"] }
+    },
+    {
+      "id": "invariant:single-app-seam",
+      "kind": "invariant",
+      "name": "Concrete apps enter through one registry",
+      "description": "Nothing upstream of packages/apps/src/index.ts should import a specific first-party app package; the generic App contract is the architectural seam.",
+      "path": "packages/apps/src/index.ts",
+      "metadata": { "evidence": ["CONTRIBUTING.md", "packages/apps/src/index.ts"] }
+    },
+    {
+      "id": "invariant:additive-runtime-schema",
+      "kind": "invariant",
+      "name": "Runtime schema migrations are additive",
+      "description": "New persistent columns must appear in both fresh-create DDL and additive migration maps; dependent indexes run only after ALTER statements.",
+      "path": "packages/core/src/schema.ts",
+      "metadata": { "evidence": ["packages/core/src/schema.ts", "CONTRIBUTING.md"] }
+    },
+    {
+      "id": "invariant:graph-source-authority",
+      "kind": "invariant",
+      "name": "Source is authoritative over the graph",
+      "description": "The project graph is a local navigation and impact cache. Agents must verify cited source before edits, refresh after changes, and keep manual assertions evidence-backed.",
+      "path": "packages/project-graph/src/server.ts",
+      "metadata": { "evidence": ["AGENTS.md", "packages/project-graph/src/server.ts"] }
+    },
+    {
+      "id": "finding:materialized-drop-core-tables",
+      "kind": "finding",
+      "name": "Unvalidated materialization prefix can target flow tables",
+      "description": "Review finding (high): the core-table deny set omits interaction_flows, interaction_flow_steps, and flow_templates, while WS rematerialize/clearApp accepts arbitrary adapterId strings. Prefixes such as interaction or flow can therefore select core flow tables for DROP. Fixed: core schema.ts exports CORE_TABLE_NAMES as the single list of core tables; cartographer materialize.ts builds its reserved set from it and isReservedTable (core, *_fts, *_fts_*, sqlite_*) guards collect(), the materialize loop, listMaterializedTables and dropMaterialized; the runner refuses WS data.rematerialize/data.clearApp for an adapterId that is not installed (requireInstalled). Regressions: drop-materialized.test.ts and server.test.ts.",
+      "path": "packages/cartographer/src/materialize.ts",
+      "metadata": { "severity": "high", "status": "fixed", "confidence": 0.98, "evidence": ["packages/cartographer/src/materialize.ts", "packages/protocol/src/index.ts", "packages/runner/src/server.ts", "packages/core/src/schema.ts", "packages/cartographer/src/drop-materialized.test.ts", "packages/runner/src/server.test.ts"] }
+    },
+    {
+      "id": "finding:extension-forgeable-captures",
+      "kind": "finding",
+      "name": "Extension bridge permits page-authored capture forgery",
+      "description": "Review finding (high): the content bridge validates event.source and a public tag but no unforgeable provenance. A page script can post a shaped entry; the worker supplies its hidden ingest token, while the runner trusts caller id/host/path enough to permit evidence poisoning or an id-based upsert. Partially fixed: content.js forwards only the nine fields inject.js emits; background.js checks sender.id and requires both the sender frame (sender.origin ?? sender.url) and the request URL to be in scope; the server mints every capture id, derives host/path only from an absolute http(s) URL, drops relative/non-http(s) URLs and clamps future timestamps. Still open by construction: script on an in-scope page (MAIN world) can forge in-scope captures. Regressions: packages/extension/capture-scope.test.js, runner server.test.ts.",
+      "path": "packages/extension/content.js",
+      "metadata": { "severity": "high", "status": "partially-fixed", "confidence": 0.96, "evidence": ["packages/extension/content.js", "packages/extension/background.js", "packages/runner/src/server.ts", "packages/extension/capture-scope.test.js", "packages/runner/src/server.test.ts"] }
+    },
+    {
+      "id": "finding:url-redaction-gap",
+      "kind": "finding",
+      "name": "Central sanitizer omits URL-like fields",
+      "description": "Review finding (high): runner sanitization re-redacts headers and bodies but not url or tabUrl. Extension captures preserve raw query strings and CDP stores raw tab URLs, so query credentials or OAuth codes can bypass the intended central sink boundary. Fixed: core redactCaptureUrls redacts url, path, tabUrl and classification (redactUrl also masks URL-only params code/sig/signature/session/X-Amz-*/X-Goog-* in query, fragment and bare paths); core persistCapture applies it on every runner and MCP store path, the CDP/MITM engines build captures through capture-build.ts redactedCapture (the same core redactCapture), and sluice record re-redacts fixtures. Regressions: core redact.test.ts, persist.test.ts, runner server.test.ts.",
+      "path": "packages/runner/src/server.ts",
+      "metadata": { "severity": "high", "status": "fixed", "confidence": 0.98, "evidence": ["packages/runner/src/server.ts", "packages/interceptor/src/cdp-engine.ts", "packages/core/src/persist.ts", "packages/core/src/redact.test.ts", "packages/interceptor/src/capture-build.ts"] }
+    },
+    {
+      "id": "finding:read-token-controls-writes",
+      "kind": "finding",
+      "name": "Dashboard read token also grants mutation and control",
+      "description": "Review finding (high): the same token gates GET API access and the WebSocket. Once upgraded, it can replay/sync, control capture/system proxy, and prune/delete/rematerialize/vacuum/wipe data. Documentation and names that describe it as read-only understate its authority. Partially fixed: the token is now named and documented as the session token (full dashboard control, not read-only) in the runner README and SECURITY.md; the Origin check admits only the runner's own port or the pinned dev UI (:5273), not any loopback port; the webapp sends it as an Authorization header rather than ?token=. There is still no capability split between reads and WS control.",
+      "path": "packages/runner/src/server.ts",
+      "metadata": { "severity": "high", "status": "partially-fixed", "confidence": 1.0, "evidence": ["packages/core/src/protocol.ts", "packages/protocol/src/index.ts", "packages/runner/src/server.ts", "packages/runner/README.md", "SECURITY.md", "apps/webapp/src/api.ts"] }
+    },
+    {
+      "id": "finding:parsed-before-parse",
+      "kind": "finding",
+      "name": "Ingest stamps parsed state before parse succeeds",
+      "description": "Review finding (medium): ingest sets parsedAt before insertion, then invokes match/parse outside a consistent failure boundary. A thrown parser can leave a stored row marked parsed even though normalized entities, cursor seeds, and broadcasts were not completed. Fixed: core persistCapture stamps parsedAt only after the adapter parse succeeds; a throwing parser leaves the capture stored and streamed with parsedAt null for sluice reparse, and matchRequest/classify/nextCursors throws are contained. Regressions: core persist.test.ts and runner server.test.ts ('a capture whose parser throws is still stored, streamed, and left unparsed').",
+      "path": "packages/runner/src/server.ts",
+      "metadata": { "severity": "medium", "status": "fixed", "confidence": 0.97, "evidence": ["packages/runner/src/server.ts", "packages/core/src/persist.ts", "packages/core/src/persist.test.ts"] }
+    },
+    {
+      "id": "finding:ingest-path-divergence",
+      "kind": "finding",
+      "name": "CLI and server persistence paths diverge",
+      "description": "Review finding (medium): replay/sync/drain CLI paths duplicate insert+parse behavior instead of one shared ingest service, so parsedAt, cursor seeding, broadcasts, and materialization can differ. Capture pruning also does not consistently rebuild derived tables or normalized entities. Fixed: one funnel, core persistCapture (redact, attribute, classify, store, contained parse, cursor seeding), is used by the runner server ingest, every CLI path that writes a capture (replay, sync, drain, flow replay, reparse) and the MCP server's replay/flow/app-tool record paths; cartographer rebuildMaterialized (materialize.ts) runs after every capture delete (dashboard, prune, retention, build-db).",
+      "path": "packages/runner/src/cli.ts",
+      "metadata": { "severity": "medium", "status": "fixed", "confidence": 0.94, "evidence": ["packages/runner/src/cli.ts", "packages/runner/src/server.ts", "packages/core/src/persist.ts", "packages/cartographer/src/materialize.ts", "packages/mcp/src/server.ts"] }
+    },
+    {
+      "id": "finding:replay-readonly-overclaim",
+      "kind": "finding",
+      "name": "Replay rails do not prove read-only semantics",
+      "description": "Review finding (high): POST is allowed and a finite operation regex cannot prove an unknown RPC or persisted GraphQL request is non-mutating. Single-request replay also lacks the flow builder's host allowlist. Claims that replay cannot act or mutate are stronger than the implemented best-effort rails. Partially fixed: docs, tool descriptions and UI copy now call the rails best-effort heuristics, not a proof of non-mutation; every runReplay caller (runner, CLI, MCP, app-tool ctx.replay) passes the owning app's hosts to a runtime host rail (core replayHostAllowed, shared with flow build); redirects are never followed; the operation rail (core looksLikeDeniedReplay) checks percent-decoded path/body and refuses method-override headers/_method; flow build refuses a non-GET/HEAD step that matches none of the adapter's replay actions. Still inherent: POST plus a finite denylist cannot prove an unknown RPC/GraphQL operation is a read.",
+      "path": "packages/interceptor/src/replay-policy.ts",
+      "metadata": { "severity": "high", "status": "partially-fixed", "confidence": 0.95, "evidence": ["packages/interceptor/src/replay-policy.ts", "packages/core/src/replay-deny.ts", "packages/interceptor/src/replay.ts", "packages/interceptor/src/replay-policy.test.ts", "packages/cartographer/src/flow-build.ts"] }
+    },
+    {
+      "id": "finding:websocket-bodies-not-on-demand",
+      "kind": "finding",
+      "name": "Capture bodies travel through list and WebSocket paths",
+      "description": "Review finding (medium): Capture includes request/response bodies and whole objects are broadcast/backfilled/ring-buffered and returned by capture lists, contradicting comments that bodies are fetched only by the body inspector. The ring can retain large payloads. Fixed: runner api.ts previewCapture cuts each body to 64 KiB (setting bodyTruncated and the full bodyLengths) for capture.new frames and the resume ring, WS backfill, /api/captures and /api/captures/search; /api/captures/:id/body returns the whole body, the inspector fetches it by id, body: search runs server-side, and the webapp sizes rows by bodyLengths. Regression: runner server.test.ts ('lists and WebSocket frames carry body previews').",
+      "path": "packages/runner/src/server.ts",
+      "metadata": { "severity": "medium", "status": "fixed", "confidence": 0.98, "evidence": ["packages/core/src/types.ts", "packages/runner/src/server.ts", "packages/runner/src/api.ts", "packages/runner/src/server.test.ts", "apps/webapp/src/format.ts"] }
+    },
+    {
+      "id": "finding:webapp-hello-ack-missing",
+      "kind": "finding",
+      "name": "Webapp does not send hello.ok",
+      "description": "Review finding (medium): the server/protocol contract expects a client hello.ok version acknowledgement, but the webapp hello branch only stores the server version. A mismatched built UI and runner can remain connected without the intended compatibility gate. Fixed: ws.ts sends hello.ok { protocolVersion } on every hello and raises a notice on a version mismatch (protocolMismatch). Regression: apps/webapp/src/ws.test.ts.",
+      "path": "apps/webapp/src/ws.ts",
+      "metadata": { "severity": "medium", "status": "fixed", "confidence": 0.95, "evidence": ["apps/webapp/src/ws.ts", "packages/runner/src/server.ts", "packages/protocol/src/index.ts", "apps/webapp/src/ws.test.ts"] }
+    },
+    {
+      "id": "finding:webapp-capture-state-drift",
+      "kind": "finding",
+      "name": "Traffic dashboard capture state starts independently",
+      "description": "Review finding (medium): TrafficDashboard initializes recording=true rather than deriving it from the runner capturePaused state. Opening a paused runner can make the first apparent resume action send another pause. Fixed: TrafficDashboard's Record button acts on what it shows via ws.ts captureToggleAction(recording, capturePaused). Regression: apps/webapp/src/ws.test.ts.",
+      "path": "apps/webapp/src/components/TrafficDashboard.tsx",
+      "metadata": { "severity": "medium", "status": "fixed", "confidence": 0.93, "evidence": ["apps/webapp/src/components/TrafficDashboard.tsx", "apps/webapp/src/App.tsx", "apps/webapp/src/ws.ts", "apps/webapp/src/ws.test.ts"] }
+    },
+    {
+      "id": "finding:webapp-replay-session-ambiguity",
+      "kind": "finding",
+      "name": "Dashboard replay does not select a workspace session",
+      "description": "Review finding (high): replay/flow messages omit sessionId and the webapp ignores session.discovered. The runner falls back to the first same-app session, so a multi-workspace user can replay against the wrong signed-in workspace. Fixed: the webapp keeps discovered sessions, shows an account picker when an app has several, and sends sessionId on replay.run/flow.run; the runner's sessionFor refuses an unknown sessionId and, with several sessions and no id, refuses unless the params name a workspace (runner replay-actions.ts pickSession) — never sessions[0]. Regressions: runner server.test.ts, replay-actions.test.ts, apps/webapp/src/replay.test.ts.",
+      "path": "apps/webapp/src/pages/ReplayPage.tsx",
+      "metadata": { "severity": "high", "status": "fixed", "confidence": 0.96, "evidence": ["apps/webapp/src/pages/ReplayPage.tsx", "apps/webapp/src/ws.ts", "packages/runner/src/server.ts", "packages/runner/src/replay-actions.ts", "packages/runner/src/replay-actions.test.ts"] }
+    },
+    {
+      "id": "finding:gmail-replay-unreachable",
+      "kind": "finding",
+      "name": "Gmail replay action is normally session-unreachable",
+      "description": "Review finding (medium): Gmail advertises gmail.threads.list but has no credential provider, so normal runner dashboard replay has no active Gmail session. The gmail_get_thread guidance also says the list action fetches message bodies although the parser only obtains them from a different request shape. Fixed: gmailAdapter.listReplayActions() returns [] while nothing can supply a Gmail session; the action is kept, unadvertised, as GMAIL_THREADS_LIST for a future provider, and gmail_get_thread's empty note no longer points at it. Regressions: gmail.test.ts ('no replay action is offered while nothing can supply a Gmail session') and mcp-tools.test.ts.",
+      "path": "packages/app-gmail/src/gmail-adapter.ts",
+      "metadata": { "severity": "medium", "status": "fixed", "confidence": 0.9, "evidence": ["packages/app-gmail/src/gmail-adapter.ts", "packages/app-gmail/src/mcp-tools.ts", "packages/runner/src/server.ts", "packages/app-gmail/src/gmail.test.ts", "packages/app-gmail/src/mcp-tools.test.ts"] }
+    },
+    {
+      "id": "finding:linkedin-fetch-me-no-session-injection",
+      "kind": "finding",
+      "name": "LinkedIn fetch_me lacks credential injection",
+      "description": "Review finding (high): linkedin_fetch_me sends a finished request through the generic app replay context without Cookie/csrf headers; that context uses a synthetic session for app tools and does not call LinkedIn's credential-aware request builder, contradicting the local-session claim. Fixed: AppToolContext gains optional replayAction(actionId, params, { workspaceId }); the MCP server implements it with the same session acquisition, host rail and 401 retry-once as the replay tool (replayActionFor), and linkedin_fetch_me calls ctx.replayAction('linkedin.me') so the host injects the LinkedIn cookie and csrf-token. Regressions: linkedin.test.ts and mcp server.test.ts ('replayActionFor sends the app session\\'s credentials and stores none of them').",
+      "path": "packages/app-linkedin/src/mcp-tools.ts",
+      "metadata": { "severity": "high", "status": "fixed", "confidence": 0.93, "evidence": ["packages/app-linkedin/src/mcp-tools.ts", "packages/mcp/src/server.ts", "packages/app-linkedin/src/linkedin-adapter.ts", "packages/core/src/types.ts", "packages/app-linkedin/src/linkedin.test.ts", "packages/mcp/src/server.test.ts"] }
+    },
+    {
+      "id": "finding:normalized-parent-gaps",
+      "kind": "finding",
+      "name": "Some adapters emit children without parent workspaces",
+      "description": "Review finding (medium): Fast and Trello emit containers/items under workspace ids but never emit a Workspace; several Slack parses can emit child entities unless a workspace-bearing response was observed. Explore renders containers under existing workspace records, making such data hard to reach. Partially fixed: Fast (FAST_WORKSPACE) and Trello (the constant 'trello' workspace) now emit their parent workspace with any children; the webapp tree groups a container whose workspace is unknown under its own row instead of hiding it. Slack is intentionally left to its credential seeding path (listSlackWorkspaces), since its list parses know only a team id; no referential-integrity conformance rule was added.",
+      "path": "packages/app-fast/src/index.ts",
+      "metadata": { "severity": "medium", "status": "partially-fixed", "confidence": 0.9, "evidence": ["packages/app-fast/src/index.ts", "packages/app-trello/src/trello-adapter.ts", "packages/app-slack/src/parse.ts", "apps/webapp/src/pages/ExplorePage.tsx", "packages/app-fast/src/fast.test.ts", "packages/app-trello/src/trello.test.ts", "apps/webapp/src/explore.test.ts"] }
+    },
+    {
+      "id": "finding:trello-normalization-dead-ends",
+      "kind": "finding",
+      "name": "Trello replay work can produce no normalized rows",
+      "description": "Review finding (medium): board.lists and action-feed endpoints are classified/fetched and my.cards fans out to board.lists, but the parser does not normalize those responses, leaving some replay/pagination work semantically dead. Fixed: /1/boards/<id>/lists parses into containers (listToContainer) and commentCard actions in board/card action feeds parse into items (commentToItem, kind message, threadId = card id). Regressions: trello.test.ts.",
+      "path": "packages/app-trello/src/trello-adapter.ts",
+      "metadata": { "severity": "medium", "status": "fixed", "confidence": 0.91, "evidence": ["packages/app-trello/src/trello-adapter.ts", "packages/app-trello/src/trello.test.ts"] }
+    },
+    {
+      "id": "finding:loom-cursor-limit-coercion",
+      "kind": "finding",
+      "name": "Loom cursor limit coercion drops numeric values",
+      "description": "Review finding (low): cursor extraction reads numeric GraphQL limit/first fields through the string-only coercer, silently replacing custom page sizes with defaults; the notifications MCP path also omits its available cursor. Fixed: loomNextCursors reads variables.limit/first with num(), so numeric page sizes survive; loom_list_notifications takes and returns a cursor (nextCursor, hasNextPage). Regressions: loom.test.ts.",
+      "path": "packages/app-loom/src/loom-adapter.ts",
+      "metadata": { "severity": "low", "status": "fixed", "confidence": 0.9, "evidence": ["packages/app-loom/src/loom-adapter.ts", "packages/app-loom/src/loom.test.ts", "packages/app-loom/src/index.ts"] }
+    },
+    {
+      "id": "finding:adapter-sdk-node-test-runtime",
+      "kind": "finding",
+      "name": "Adapter SDK barrel pulls node:test into runtime imports",
+      "description": "Review finding (low): the public adapter-sdk barrel statically re-exports the conformance module, which imports node:test. Runtime consumers of the barrel therefore load a test-only module; the SDK README itself warns to import conformance only from tests. Fixed: conformance.ts now loads node:test lazily via createRequire inside runConformance; only a type import remains, so the barrel and bundles no longer carry a static node:test import (regression: conformance.test.ts).",
+      "path": "packages/adapter-sdk/src/index.ts",
+      "metadata": { "severity": "low", "status": "fixed", "confidence": 0.92, "evidence": ["packages/adapter-sdk/src/index.ts", "packages/adapter-sdk/src/conformance.ts", "packages/adapter-sdk/README.md", "packages/adapter-sdk/src/conformance.test.ts"] }
+    }
+  ],
+  "edges": [
+    { "from": "layer:foundation", "to": "package:@sluice/core", "kind": "contains_package", "description": "Core owns domain contracts, redaction, schema, and storage." },
+    { "from": "layer:foundation", "to": "package:@sluice/adapter-sdk", "kind": "contains_package" },
+    { "from": "layer:foundation", "to": "package:@sluice/protocol", "kind": "contains_package" },
+    { "from": "layer:capture-replay", "to": "package:@sluice/interceptor", "kind": "contains_package" },
+    { "from": "layer:capture-replay", "to": "package:@sluice/extension", "kind": "contains_package" },
+    { "from": "layer:derivation", "to": "package:@sluice/cartographer", "kind": "contains_package" },
+    { "from": "layer:integrations", "to": "package:@sluice/apps", "kind": "contains_package" },
+    { "from": "layer:integrations", "to": "package:@sluice/app-slack", "kind": "contains_package" },
+    { "from": "layer:integrations", "to": "package:@sluice/app-fast", "kind": "contains_package" },
+    { "from": "layer:integrations", "to": "package:@sluice/app-trello", "kind": "contains_package" },
+    { "from": "layer:integrations", "to": "package:@sluice/app-gmail", "kind": "contains_package" },
+    { "from": "layer:integrations", "to": "package:@sluice/app-loom", "kind": "contains_package" },
+    { "from": "layer:integrations", "to": "package:@sluice/app-linkedin", "kind": "contains_package" },
+    { "from": "layer:control-interfaces", "to": "package:@sluice/runner", "kind": "contains_package" },
+    { "from": "layer:control-interfaces", "to": "package:@sluice/mcp", "kind": "contains_package" },
+    { "from": "layer:control-interfaces", "to": "package:sluicejs", "kind": "contains_package" },
+    { "from": "layer:presentation", "to": "package:@sluice/webapp", "kind": "contains_package" },
+    { "from": "layer:tooling-knowledge", "to": "package:@sluice/project-graph", "kind": "contains_package" },
+    { "from": "layer:control-interfaces", "to": "runtime:runner-parent", "kind": "contains" },
+    { "from": "layer:control-interfaces", "to": "runtime:engine-child", "kind": "contains" },
+    { "from": "layer:control-interfaces", "to": "runtime:captured-data-mcp", "kind": "contains" },
+    { "from": "layer:presentation", "to": "runtime:webapp-browser", "kind": "contains" },
+    { "from": "layer:capture-replay", "to": "runtime:extension-main", "kind": "contains" },
+    { "from": "layer:capture-replay", "to": "runtime:extension-content", "kind": "contains" },
+    { "from": "layer:capture-replay", "to": "runtime:extension-worker", "kind": "contains" },
+    { "from": "layer:tooling-knowledge", "to": "runtime:project-graph-mcp", "kind": "contains" },
+    { "from": "layer:tooling-knowledge", "to": "build:webapp", "kind": "contains" },
+    { "from": "layer:tooling-knowledge", "to": "build:runner-cli", "kind": "contains" },
+    { "from": "layer:tooling-knowledge", "to": "build:engine-child", "kind": "contains" },
+    { "from": "layer:tooling-knowledge", "to": "build:runtime-mcp", "kind": "contains" },
+    { "from": "layer:tooling-knowledge", "to": "build:project-mcp", "kind": "contains" },
+    { "from": "component:app-contract", "to": "file:packages/core/src/types.ts", "kind": "declared_by" },
+    { "from": "component:app-registry", "to": "component:app-contract", "kind": "implements" },
+    { "from": "component:app-registry", "to": "file:packages/apps/src/index.ts", "kind": "declared_by" },
+    { "from": "component:mitm-engine", "to": "component:ingest-funnel", "kind": "flows_to" },
+    { "from": "component:cdp-engine", "to": "component:ingest-funnel", "kind": "flows_to" },
+    { "from": "component:extension-engine", "to": "component:ingest-funnel", "kind": "flows_to" },
+    { "from": "component:credential-replay", "to": "component:ingest-funnel", "kind": "flows_to" },
+    { "from": "component:ingest-funnel", "to": "component:app-registry", "kind": "uses" },
+    { "from": "component:ingest-funnel", "to": "database:runtime-captures", "kind": "writes_to" },
+    { "from": "component:ingest-funnel", "to": "component:normalized-model", "kind": "parses_into" },
+    { "from": "component:cartographer", "to": "database:runtime-captures", "kind": "reads_from" },
+    { "from": "component:cartographer", "to": "database:runtime-captures", "kind": "writes_derived_tables_to" },
+    { "from": "component:engine-controller", "to": "component:mitm-engine", "kind": "controls" },
+    { "from": "component:engine-controller", "to": "component:supervisor", "kind": "creates" },
+    { "from": "component:supervisor", "to": "component:mitm-engine", "kind": "supervises" },
+    { "from": "interface:runner-http", "to": "database:runtime-captures", "kind": "reads_from" },
+    { "from": "interface:runner-websocket", "to": "component:engine-controller", "kind": "controls" },
+    { "from": "interface:runner-websocket", "to": "workflow:single-replay", "kind": "invokes" },
+    { "from": "interface:runner-websocket", "to": "workflow:flow-replay", "kind": "invokes" },
+    { "from": "interface:runtime-mcp", "to": "database:runtime-captures", "kind": "reads_and_writes" },
+    { "from": "interface:runtime-mcp", "to": "workflow:single-replay", "kind": "invokes" },
+    { "from": "interface:runtime-mcp", "to": "workflow:flow-replay", "kind": "invokes" },
+    { "from": "interface:project-graph-mcp", "to": "database:project-graph", "kind": "reads_and_writes" },
+    { "from": "build:webapp", "to": "runtime:webapp-browser", "kind": "produces" },
+    { "from": "build:runner-cli", "to": "entrypoint:sluice:sluice", "kind": "builds" },
+    { "from": "build:engine-child", "to": "runtime:engine-child", "kind": "builds" },
+    { "from": "build:runtime-mcp", "to": "entrypoint:@sluice/mcp:sluice-mcp", "kind": "builds" },
+    { "from": "build:project-mcp", "to": "entrypoint:@sluice/project-graph:sluice-project-graph", "kind": "builds" },
+    { "from": "entrypoint:sluice:sluice", "to": "runtime:runner-parent", "kind": "starts" },
+    { "from": "entrypoint:@sluice/mcp:sluice-mcp", "to": "runtime:captured-data-mcp", "kind": "starts" },
+    { "from": "entrypoint:@sluice/project-graph:sluice-project-graph", "to": "runtime:project-graph-mcp", "kind": "starts" },
+    { "from": "runtime:runner-parent", "to": "runtime:engine-child", "kind": "spawns" },
+    { "from": "runtime:runner-parent", "to": "component:ingest-funnel", "kind": "hosts" },
+    { "from": "runtime:runner-parent", "to": "component:engine-controller", "kind": "uses" },
+    { "from": "runtime:engine-child", "to": "component:mitm-engine", "kind": "runs" },
+    { "from": "runtime:runner-parent", "to": "database:runtime-captures", "kind": "opens" },
+    { "from": "runtime:runner-parent", "to": "interface:runner-http", "kind": "serves" },
+    { "from": "runtime:runner-parent", "to": "interface:runner-websocket", "kind": "serves" },
+    { "from": "runtime:captured-data-mcp", "to": "interface:runtime-mcp", "kind": "serves" },
+    { "from": "runtime:captured-data-mcp", "to": "database:runtime-captures", "kind": "opens" },
+    { "from": "runtime:project-graph-mcp", "to": "interface:project-graph-mcp", "kind": "serves" },
+    { "from": "runtime:project-graph-mcp", "to": "database:project-graph", "kind": "opens" },
+    { "from": "runtime:webapp-browser", "to": "interface:runner-http", "kind": "calls" },
+    { "from": "runtime:webapp-browser", "to": "interface:runner-websocket", "kind": "connects_to" },
+    { "from": "runtime:extension-main", "to": "component:extension-engine", "kind": "part_of" },
+    { "from": "runtime:extension-content", "to": "component:extension-engine", "kind": "part_of" },
+    { "from": "runtime:extension-worker", "to": "component:extension-engine", "kind": "part_of" },
+    { "from": "runtime:extension-main", "to": "runtime:extension-content", "kind": "posts_message_to" },
+    { "from": "runtime:extension-content", "to": "runtime:extension-worker", "kind": "forwards_to" },
+    { "from": "runtime:extension-worker", "to": "http-endpoint:/api/ingest", "kind": "calls_endpoint" },
+    { "from": "http-endpoint:/api/ingest", "to": "workflow:capture-ingest", "kind": "feeds" },
+    { "from": "capability:dashboard-control", "to": "interface:runner-http", "kind": "gates" },
+    { "from": "capability:dashboard-control", "to": "interface:runner-websocket", "kind": "gates" },
+    { "from": "capability:extension-ingest", "to": "http-endpoint:/api/ingest", "kind": "gates" },
+    { "from": "capability:pty", "to": "http-endpoint:/pty", "kind": "gates" },
+    { "from": "config:runner-precedence", "to": "runtime:runner-parent", "kind": "configures" },
+    { "from": "documentation:agent-contract", "to": "agent-workflow:graph-first", "kind": "documents" },
+    { "from": "database:project-graph", "to": "repository:sluice", "kind": "indexes" },
+    { "from": "workflow:capture-ingest", "to": "component:ingest-funnel", "kind": "implemented_by" },
+    { "from": "workflow:capture-ingest", "to": "database-table:captures", "kind": "persists_to" },
+    { "from": "workflow:capture-ingest", "to": "component:normalized-model", "kind": "produces" },
+    { "from": "workflow:single-replay", "to": "security:replay-rails", "kind": "gated_by" },
+    { "from": "workflow:single-replay", "to": "workflow:capture-ingest", "kind": "flows_to" },
+    { "from": "workflow:flow-learning", "to": "database-table:interaction_flows", "kind": "reads_from" },
+    { "from": "workflow:flow-learning", "to": "database-table:flow_templates", "kind": "writes_to" },
+    { "from": "workflow:flow-replay", "to": "database-table:flow_templates", "kind": "reads_from" },
+    { "from": "workflow:flow-replay", "to": "security:replay-rails", "kind": "gated_by" },
+    { "from": "workflow:flow-replay", "to": "workflow:capture-ingest", "kind": "flows_to" },
+    { "from": "workflow:control-plane", "to": "component:engine-controller", "kind": "uses" },
+    { "from": "workflow:control-plane", "to": "security:loopback-capabilities", "kind": "gated_by" },
+    { "from": "agent-workflow:graph-first", "to": "interface:project-graph-mcp", "kind": "uses" },
+    { "from": "agent-workflow:graph-first", "to": "invariant:graph-source-authority", "kind": "enforces" },
+    { "from": "security:redaction-boundary", "to": "component:ingest-funnel", "kind": "enforced_at" },
+    { "from": "security:credentials-memory-only", "to": "database:runtime-captures", "kind": "constrains" },
+    { "from": "security:replay-rails", "to": "file:packages/interceptor/src/replay-policy.ts", "kind": "implemented_by" },
+    { "from": "security:replay-rails", "to": "file:packages/core/src/replay-deny.ts", "kind": "implemented_by" },
+    { "from": "security:loopback-capabilities", "to": "interface:runner-http", "kind": "gates" },
+    { "from": "security:loopback-capabilities", "to": "interface:runner-websocket", "kind": "gates" },
+    { "from": "security:tls-scope", "to": "component:mitm-engine", "kind": "constrains" },
+    { "from": "invariant:single-app-seam", "to": "component:app-registry", "kind": "governs" },
+    { "from": "invariant:additive-runtime-schema", "to": "database:runtime-captures", "kind": "governs" },
+    { "from": "finding:materialized-drop-core-tables", "to": "file:packages/cartographer/src/materialize.ts", "kind": "evidenced_by" },
+    { "from": "finding:materialized-drop-core-tables", "to": "database-table:flow_templates", "kind": "risks" },
+    { "from": "finding:extension-forgeable-captures", "to": "component:extension-engine", "kind": "affects" },
+    { "from": "finding:extension-forgeable-captures", "to": "database-table:captures", "kind": "risks" },
+    { "from": "finding:url-redaction-gap", "to": "security:redaction-boundary", "kind": "violates" },
+    { "from": "finding:read-token-controls-writes", "to": "security:loopback-capabilities", "kind": "contradicts" },
+    { "from": "finding:parsed-before-parse", "to": "component:ingest-funnel", "kind": "affects" },
+    { "from": "finding:ingest-path-divergence", "to": "workflow:capture-ingest", "kind": "contradicts" },
+    { "from": "finding:replay-readonly-overclaim", "to": "security:replay-rails", "kind": "qualifies" },
+    { "from": "finding:websocket-bodies-not-on-demand", "to": "interface:runner-websocket", "kind": "affects" },
+    { "from": "finding:webapp-hello-ack-missing", "to": "interface:runner-websocket", "kind": "affects" },
+    { "from": "finding:webapp-capture-state-drift", "to": "package:@sluice/webapp", "kind": "affects" },
+    { "from": "finding:webapp-replay-session-ambiguity", "to": "workflow:single-replay", "kind": "risks" },
+    { "from": "finding:gmail-replay-unreachable", "to": "package:@sluice/app-gmail", "kind": "affects" },
+    { "from": "finding:linkedin-fetch-me-no-session-injection", "to": "package:@sluice/app-linkedin", "kind": "affects" },
+    { "from": "finding:normalized-parent-gaps", "to": "component:normalized-model", "kind": "affects" },
+    { "from": "finding:trello-normalization-dead-ends", "to": "package:@sluice/app-trello", "kind": "affects" },
+    { "from": "finding:loom-cursor-limit-coercion", "to": "package:@sluice/app-loom", "kind": "affects" },
+    { "from": "finding:adapter-sdk-node-test-runtime", "to": "package:@sluice/adapter-sdk", "kind": "affects" }
+  ]
+}

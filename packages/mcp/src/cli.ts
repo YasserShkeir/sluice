@@ -9,11 +9,14 @@
  */
 import process from 'node:process';
 
+import { redactedErrorMessage, sweepStaleTempDirs } from '@sluice/core';
 import { startStdioServer } from './server.js';
 
+// A killed earlier run can leave a plaintext copy of an app's credential store
+// in $TMPDIR; remove it even if this session never reads that app again.
+sweepStaleTempDirs();
+
 startStdioServer().catch((err: unknown) => {
-  process.stderr.write(
-    `[sluice-mcp] fatal: ${err instanceof Error ? err.message : String(err)}\n`,
-  );
+  process.stderr.write(`[sluice-mcp] fatal: ${redactedErrorMessage(err)}\n`);
   process.exit(1);
 });

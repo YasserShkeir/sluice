@@ -20,6 +20,8 @@
     "@sluice/app-loom": "workspace:*",
     "@sluice/app-linkedin": "workspace:*",
     "@sluice/app-notion": "workspace:*",
+    "@sluice/app-olx": "workspace:*",
+    "@sluice/app-toters": "workspace:*",
     "@sluice/adapter-sdk": "workspace:*"
   },
   "devDependencies": {

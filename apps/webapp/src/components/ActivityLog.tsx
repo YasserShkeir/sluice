@@ -2,16 +2,11 @@
 /**
  * The activity surface — running and recently-finished operations, bottom-right.
  *
- * This is the counterpart to the single `notice` toast, and exists because that
- * toast cannot represent a long, multi-step operation: it holds one message for
- * 4.5s, so `sync` firing a line per failed action showed only the last and
- * nothing that finished. An operation here is keyed by requestId, so its frames
- * update ONE card (running → running → ok/error); a `running` card shows a
- * spinner and cannot be dismissed, an `error` card stays until dismissed, and an
- * `ok` card fades on its own — the outcomes a control panel actually needs to
- * distinguish.
+ * One card per requestId, updated in place (running → ok/error): `running` shows a
+ * spinner and cannot be dismissed, `error` stays until dismissed, `ok` fades on
+ * its own.
  */
-import { useEffect, useRef } from 'react';
+import { useEffect } from 'react';
 import { Loader2, X } from 'lucide-react';
 import type { OpProgress } from '@sluice/core';
 import { dismissOp } from '../ws.js';
@@ -36,13 +31,9 @@ export function ActivityLog({ operations }: { operations: OpProgress[] }) {
 function OpCard({ op }: { op: OpProgress }) {
   // Auto-dismiss a success after it has been seen; errors and running ops stay.
   // Keyed on state so a running→ok transition starts the timer exactly once.
-  const dismissed = useRef(false);
   useEffect(() => {
-    if (op.state !== 'ok' || dismissed.current) return;
-    const t = setTimeout(() => {
-      dismissed.current = true;
-      dismissOp(op.requestId);
-    }, OK_LINGER_MS);
+    if (op.state !== 'ok') return;
+    const t = setTimeout(() => dismissOp(op.requestId), OK_LINGER_MS);
     return () => clearTimeout(t);
   }, [op.state, op.requestId]);
 

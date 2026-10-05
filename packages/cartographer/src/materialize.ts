@@ -25,10 +25,11 @@
  * id-less rows are skipped on an id-keyed table rather than crashing.
  */
 import { createHash } from 'node:crypto';
+import { CORE_TABLE_NAMES, safeJsonObject } from '@sluice/core';
 import type { SqliteStore } from '@sluice/core';
 import { inferSchema } from './infer.js';
 import type { InferredColumn, InferredTable } from './infer.js';
-import { parseJsonObject, quoteIdent, sanitizeName } from './util.js';
+import { quoteIdent, sanitizeName } from './util.js';
 
 const ALL = 1_000_000;
 
@@ -107,16 +108,7 @@ interface Derived {
   records: Array<Record<string, unknown>>;
 }
 
-/**
- * Shared scan used by both deriveTables and materialize.
- *
- * `sinceTs` bounds the scan to captures newer than a watermark. This matters a
- * lot on the live path: the runner re-materializes every couple of seconds while
- * capture is running, and a full scan means loading every row — response bodies
- * included, up to 5 MB each — and re-upserting every record ever seen, on the
- * event loop, forever growing. Upserts are keyed and idempotent, so processing
- * only new captures leaves exactly the same table contents.
- */
+/** Shared scan used by deriveTables and materialize; `sinceTs` bounds it (see MaterializeOptions). */
 function collect(store: SqliteStore, sinceTs?: number): Derived[] {
   const captures = store.listCaptures({ limit: ALL, sinceTs });
   const collectors = new Map<string, Collector>();
@@ -124,13 +116,16 @@ function collect(store: SqliteStore, sinceTs?: number): Derived[] {
   for (const c of captures) {
     const adapterId = c.adapterId;
     if (!adapterId) continue; // unclassified traffic → no per-app table
-    const body = parseJsonObject(c.resBody);
+    const body = safeJsonObject(c.resBody);
     if (!body) continue;
     for (const key of Object.keys(body)) {
       const recs = arrayOfObjects(body[key]);
       if (!recs) continue;
       const base = baseNameFor(key);
       const name = `${sanitizeName(adapterId)}_${sanitizeName(base)}`;
+      // An adapter id plus a body key can spell a core table (`interaction` +
+      // `flowss` → interaction_flows) or an FTS one; never derive into those.
+      if (isReservedTable(name)) continue;
       let col = collectors.get(name);
       if (!col) {
         col = { adapterId, base, sourceKeys: new Set(), records: [] };
@@ -196,27 +191,29 @@ function toBindable(v: unknown): string | number | null {
 
 interface ColInfo {
   name: string;
-  pk: number;
 }
 
 function tableInfo(store: SqliteStore, table: string): ColInfo[] {
   return store.db.prepare(`PRAGMA table_info(${quoteIdent(table)})`).all() as ColInfo[];
 }
 
+/** Column names of a table, in declaration order. Allowlist `table` first (see listMaterializedTables). */
+export function tableColumns(store: SqliteStore, table: string): string[] {
+  return tableInfo(store, table).map((c) => c.name);
+}
+
 /**
  * How rows are keyed in an already-created table, or how a new one should be.
  *
- * Existing wins: an incremental batch must not invent `__pk` against an id-keyed
- * table (or drop `id` as the conflict target). Fresh tables follow the batch.
+ * Existing wins (`__pk` if it has one, else `id` when present): an incremental
+ * batch must not invent `__pk` against an id-keyed table (or drop `id` as the
+ * conflict target). Fresh tables follow the batch.
  */
 function keyMode(store: SqliteStore, spec: TableSpec): 'id' | '__pk' {
   const cols = tableInfo(store, spec.name);
   if (cols.length === 0) return spec.primaryKey === 'id' ? 'id' : '__pk';
   if (cols.some((c) => c.name === '__pk')) return '__pk';
-  if (cols.some((c) => c.name === 'id' && c.pk > 0)) return 'id';
-  // Odd legacy: has `id` but not marked pk, or neither — prefer id when present.
-  if (cols.some((c) => c.name === 'id')) return 'id';
-  return '__pk';
+  return cols.some((c) => c.name === 'id') ? 'id' : '__pk';
 }
 
 function createOrAlterTable(store: SqliteStore, spec: TableSpec): void {
@@ -255,15 +252,12 @@ function insertRecords(
   const mode = keyMode(store, spec);
   const allCols = mode === 'id' ? colNames : ['__pk', ...colNames];
   // Ensure every INSERT column exists (createOrAlter only adds spec.columns).
-  if (mode === '__pk') {
-    const have = new Set(tableInfo(store, spec.name).map((r) => r.name));
-    if (!have.has('__pk')) {
-      // Table existed without __pk and without an id PK — last-resort column so
-      // inserts can proceed. Not a PRIMARY KEY (SQLite can't ADD that); uniqueness
-      // is best-effort via REPLACE on the rowid-less path only when __pk was PK.
-      // Prefer drop+rebuild via sluice build-db for a clean schema.
-      store.db.exec(`ALTER TABLE ${quoteIdent(spec.name)} ADD COLUMN "__pk" TEXT`);
-    }
+  if (mode === '__pk' && !tableColumns(store, spec.name).includes('__pk')) {
+    // Table existed without __pk and without an id PK — last-resort column so
+    // inserts can proceed. Not a PRIMARY KEY (SQLite can't ADD that); uniqueness
+    // is best-effort via REPLACE on the rowid-less path only when __pk was PK.
+    // Prefer drop+rebuild via sluice build-db for a clean schema.
+    store.db.exec(`ALTER TABLE ${quoteIdent(spec.name)} ADD COLUMN "__pk" TEXT`);
   }
   const columnList = allCols.map(quoteIdent).join(', ');
   const placeholders = allCols.map(() => '?').join(', ');
@@ -282,6 +276,126 @@ function insertRecords(
 }
 
 /**
+ * Core tables materialize must never create, write or drop, whatever an adapter
+ * is named. Core owns the list, so a table it adds cannot drift out of it.
+ */
+const CORE_TABLES: ReadonlySet<string> = new Set(CORE_TABLE_NAMES);
+
+/** A table materialize must never create, write, or drop: a core table, an FTS5 table or shadow table, or SQLite's own. */
+function isReservedTable(name: string): boolean {
+  return CORE_TABLES.has(name) || name.endsWith('_fts') || name.includes('_fts_') || name.startsWith('sqlite_');
+}
+
+/** A materialized per-app table and the adapter that owns it. */
+export interface MaterializedTable {
+  name: string;
+  adapterId: string;
+}
+
+/**
+ * The materialized per-app tables for the given adapters, by name.
+ *
+ * The one listing of what materialize created: a table belongs to the adapter
+ * whose `<sanitizeName(id)>_` prefix it carries (the longest one, when ids nest),
+ * and a reserved table never belongs to anyone. Callers that interpolate a table
+ * name into SQL should allowlist against this.
+ */
+export function listMaterializedTables(store: SqliteStore, adapterIds: readonly string[]): MaterializedTable[] {
+  const prefixes = adapterIds.map((id) => ({ id, prefix: `${sanitizeName(id)}_` }));
+  const names = (
+    store.db
+      .prepare(`SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name`)
+      .all() as Array<{ name: string }>
+  ).map((r) => r.name);
+  const out: MaterializedTable[] = [];
+  for (const name of names) {
+    if (isReservedTable(name)) continue;
+    let best: { id: string; prefix: string } | undefined;
+    for (const p of prefixes) {
+      if (name.startsWith(p.prefix) && (!best || p.prefix.length > best.prefix.length)) best = p;
+    }
+    if (best) out.push({ name, adapterId: best.id });
+  }
+  return out;
+}
+
+/**
+ * Drop exactly the tables {@link listMaterializedTables} lists for the given
+ * adapters, returning their names — the drop half of {@link rebuildMaterialized},
+ * so it can only remove tables materialize itself created.
+ */
+export function dropMaterialized(store: SqliteStore, adapterIds: readonly string[]): string[] {
+  const names = listMaterializedTables(store, adapterIds).map((t) => t.name);
+  const tx = store.db.transaction(() => {
+    for (const name of names) store.db.exec(`DROP TABLE IF EXISTS ${quoteIdent(name)}`);
+  });
+  tx();
+  return names;
+}
+
+/**
+ * `meta` key holding the timestamp the derived tables are built through.
+ *
+ * Shared by the CLI's boot pass and the server's debounced live pass, because a
+ * watermark only works if every writer agrees where it is.
+ */
+export const MATERIALIZE_WATERMARK_KEY = 'materialize.through_ts';
+
+/**
+ * How far the watermark is rewound when it is written.
+ *
+ * A capture inserted while a pass was scanning would otherwise fall in the gap
+ * between "the pass started" and "the watermark says done". Re-processing a few
+ * seconds of captures is idempotent and cheap; missing one is permanent.
+ */
+const WATERMARK_REWIND_MS = 5_000;
+
+export interface IncrementalResult extends MaterializeResult {
+  /** True when no usable watermark existed, so this pass scanned the whole store. */
+  fullRebuild: boolean;
+  /** Wall-clock cost of the pass, for callers that report slow first builds. */
+  elapsedMs: number;
+}
+
+/**
+ * Materialize only what arrived since the last pass, then move the watermark, so a
+ * boot on a large store does not block the event loop re-deriving every row before
+ * the dashboard binds. The first call on an existing store pays the one full scan
+ * that establishes the watermark.
+ */
+export function materializeIncremental(store: SqliteStore): IncrementalResult {
+  const sinceTs = store.getMetaNumber(MATERIALIZE_WATERMARK_KEY);
+  const startedAt = Date.now();
+  const { tables } = materialize(store, { sinceTs });
+  store.setMetaNumber(MATERIALIZE_WATERMARK_KEY, startedAt - WATERMARK_REWIND_MS);
+  return { tables, fullRebuild: sinceTs === undefined, elapsedMs: Date.now() - startedAt };
+}
+
+/**
+ * Drop + fully rebuild the derived tables for the given adapters, returning the
+ * tables the rebuild produced.
+ *
+ * The integrity rule: `materialize` is INSERT-OR-REPLACE only, so it never
+ * removes rows for captures that were just deleted. After ANY capture delete,
+ * the derived tables must be dropped and rebuilt from scratch — an incremental
+ * re-materialize would leave the deleted captures' rows behind, and a surviving
+ * watermark would let the next incremental pass skip the captures that remain.
+ *
+ * Known limits: tables of an adapter this process has not loaded (an external
+ * adapter missing from the registry) are not dropped. A full materialize is
+ * synchronous — tens of seconds on a large store — which is the price of
+ * retention actually removing derived message text.
+ */
+export function rebuildMaterialized(store: SqliteStore, adapterIds: readonly string[]): MaterializeResult['tables'] {
+  dropMaterialized(store, adapterIds);
+  store.deleteMeta(MATERIALIZE_WATERMARK_KEY); // if the rebuild below throws, the next incremental pass must be full
+  const startedAt = Date.now(); // before collect() reads: a capture stored mid-rebuild must stay above the watermark
+  const { tables } = materialize(store);
+  store.setMetaNumber(MATERIALIZE_WATERMARK_KEY, startedAt - WATERMARK_REWIND_MS);
+  return tables;
+}
+
+/**
  * CREATE (if needed) and upsert every derived table into the store's db.
  * Idempotent: re-running with the same captures yields the same rows.
  *
@@ -289,54 +403,6 @@ function insertRecords(
  * rebuild path does this so its cost tracks new traffic rather than total store
  * size. Omit it for a full rebuild (`sluice build-db`).
  */
-/**
- * Core tables `dropMaterialized` must NEVER drop, whatever an adapter is named.
- * Belt to the prefix suspenders below: even an adapter id that collided with a
- * core name could not take one of these out.
- */
-const CORE_TABLES = new Set([
-  'captures',
-  'workspaces',
-  'actors',
-  'containers',
-  'items',
-  'edges',
-  'cursors',
-  'sessions',
-]);
-
-/**
- * Drop the materialized per-app tables for the given adapters, returning the
- * names dropped.
- *
- * Materialize is INSERT-OR-REPLACE only — it never deletes — so after any
- * capture-delete the derived tables still describe captures that are gone. The
- * fix is drop + full rebuild, and this is the drop half. It matches on the
- * `<adapterId>_` prefix these tables are minted with, and refuses to touch a
- * core table, so it can only ever remove tables materialize itself created.
- */
-export function dropMaterialized(store: SqliteStore, adapterIds: string[]): string[] {
-  const prefixes = adapterIds.map((id) => `${sanitizeName(id)}_`);
-  const all = (
-    store.db
-      .prepare(`SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'`)
-      .all() as Array<{ name: string }>
-  ).map((r) => r.name);
-  const dropped: string[] = [];
-  const tx = store.db.transaction(() => {
-    for (const name of all) {
-      if (CORE_TABLES.has(name)) continue;
-      if (name.endsWith('_fts') || name.includes('_fts_')) continue; // FTS shadow tables
-      if (prefixes.some((p) => name.startsWith(p))) {
-        store.db.exec(`DROP TABLE IF EXISTS ${quoteIdent(name)}`);
-        dropped.push(name);
-      }
-    }
-  });
-  tx();
-  return dropped;
-}
-
 export function materialize(store: SqliteStore, opts: MaterializeOptions = {}): MaterializeResult {
   const derived = collect(store, opts.sinceTs);
   const tables: { name: string; rows: number }[] = [];

@@ -5,10 +5,11 @@
  * Everything here is pure path math — nothing reads a secret, and nothing is
  * app-specific. Per-service desktop locations live in their app packages.
  */
-import { existsSync, mkdirSync, readFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { errorMessage, restrictToOwner } from '@sluice/core';
 
 /** App version reported to the webapp in the WS `hello` frame. */
 export const APP_VERSION = '0.1.0';
@@ -30,11 +31,25 @@ export function sluiceHome(): string {
   return join(homedir(), '.sluice');
 }
 
-/** Create `~/.sluice` if missing; returns the path. */
+/**
+ * Create `~/.sluice` if missing, owner-only (0700); returns the path.
+ *
+ * It holds the capture store — full response bodies, mail and messages — plus
+ * the runner's state file and whatever log a background launch redirects into
+ * it. Every macOS account is in group `staff`, so the default 0755 let any other
+ * account on the Mac read all of it. An existing directory is tightened too.
+ */
 export function ensureSluiceHome(): string {
   const dir = sluiceHome();
-  mkdirSync(dir, { recursive: true });
+  mkdirSync(dir, { recursive: true, mode: 0o700 });
+  restrictToOwner(dir);
   return dir;
+}
+
+/** Write a small owner-only (0600) file, tightening one that already exists. */
+export function writePrivateFile(path: string, content: string): void {
+  writeFileSync(path, content, { mode: 0o600 }); // the mode applies only on create…
+  restrictToOwner(path); // …so an existing file is tightened here
 }
 
 /** Default SQLite path: `~/.sluice/sluice.db`. */
@@ -118,16 +133,8 @@ export function resolveInterceptScope(input: {
   cliAllHosts?: boolean;
 }): { interceptHosts: string[]; interceptAllHosts: boolean } {
   const interceptHosts = [...(input.config.interceptHosts ?? []), ...(input.cliHosts ?? [])];
-  if (input.cliAllHosts === true || input.config.interceptAllHosts === true) {
-    return { interceptHosts, interceptAllHosts: true };
-  }
-  if (input.config.interceptAllHosts === false) {
-    return { interceptHosts, interceptAllHosts: false };
-  }
-  if (interceptHosts.length > 0) {
-    return { interceptHosts, interceptAllHosts: false };
-  }
-  return { interceptHosts, interceptAllHosts: true };
+  const forced = input.cliAllHosts === true || input.config.interceptAllHosts === true;
+  return { interceptHosts, interceptAllHosts: forced || (input.config.interceptAllHosts !== false && interceptHosts.length === 0) };
 }
 
 /** Identity helper so a config author gets type-checking and completion. */
@@ -170,7 +177,7 @@ export function loadConfig(explicitPath?: string): { config: SluiceConfig; path?
     } catch (e) {
       // A malformed config is a hard error: silently falling back to defaults
       // would run with settings the user believes they overrode.
-      throw new Error(`Invalid config at ${path}: ${e instanceof Error ? e.message : String(e)}`);
+      throw new Error(`Invalid config at ${path}: ${errorMessage(e)}`);
     }
   }
   if (explicitPath) throw new Error(`Config file not found: ${explicitPath}`);

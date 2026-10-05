@@ -2,23 +2,21 @@
 /**
  * The conformance harness every adapter must pass.
  *
- * These invariants were already being tested — just not by everyone, and not the
- * same way twice. "parse never throws" was pinned in app-fast and app-trello but
- * not app-slack; "matchRequest rejects a lookalike host" was pinned in all three
- * with a different bogus host each time. An invariant asserted in two packages
- * out of three is not an invariant, it is a coincidence.
- *
  * Running these is a build-time obligation, not a suggestion: `@sluice/apps`
  * runs the whole suite over every registered app, so a new adapter cannot be
  * added to the registry without satisfying them.
  *
- * Uses node:test directly so it drops into the existing
- * `node --import tsx --test src/*.test.ts` runner with no new dependency.
+ * node:test is loaded lazily via createRequire on the first runConformance call, not
+ * at import, so the barrel re-export never puts a test-only module into runtime
+ * imports or the shipped bundles (a bundler does not follow createRequire).
  */
 import assert from 'node:assert/strict';
-import test from 'node:test';
+import { createRequire } from 'node:module';
+import type { test as NodeTest } from 'node:test';
 import type { App, Capture, CursorSeed, Session } from '@sluice/core';
 import { makeCapture } from './fixtures.js';
+
+const load = createRequire(import.meta.url);
 
 /**
  * Paths that a hook must survive.
@@ -27,8 +25,7 @@ import { makeCapture } from './fixtures.js';
  * with a plain object literal — `ROUTES[method]` — gets `Object.prototype` back
  * for `__proto__` and a function for `toString`, both truthy, and then reads a
  * field off them. That is a TypeError out of a hook contractually forbidden from
- * throwing, and it shipped: an earlier version of this list held only
- * `/api/test`, so nothing varied the path and nothing caught it.
+ * throwing.
  */
 const HOSTILE_PATHS = [
   '/',
@@ -88,6 +85,32 @@ function ownPaths(app: App): string[] {
   return [...out];
 }
 
+/**
+ * Every hostile body × (own hosts + one unrelated host) × (HOSTILE_PATHS + the
+ * adapter's own endpoints).
+ */
+function* hostileCaptures(
+  app: App,
+  withReqBody: boolean,
+): Generator<{ label: string; host: string; path: string; capture: Capture }> {
+  const hosts = [...app.hosts, 'unrelated.test'];
+  const paths = [...HOSTILE_PATHS, ...ownPaths(app)];
+  for (const [label, body] of HOSTILE_BODIES) {
+    for (const host of hosts) {
+      for (const path of paths) {
+        const capture = makeCapture({
+          host,
+          path,
+          url: `https://${host}${path}`,
+          resBody: body,
+          ...(withReqBody ? { reqBody: body } : {}),
+        });
+        yield { label, host, path, capture };
+      }
+    }
+  }
+}
+
 export interface ConformanceOptions {
   /**
    * A session for this adapter, to exercise buildReplayRequest. Omit and the
@@ -106,11 +129,8 @@ export interface ConformanceOptions {
 /**
  * Every rule a CursorSeed must obey, checked wherever seeds are produced.
  *
- * Hoisted out of the hostile-body loop because that loop alone made the checks
- * VACUOUS: hostile bodies produce no seeds for any real adapter, so the assertions
- * ran zero times and an adapter returning seeds addressed to another adapter, at
- * a non-existent action, with an empty cursor, passed cleanly. Verified — that
- * exact adapter passed before this was split out.
+ * Also run over real fixtures: hostile bodies produce no seeds for real adapters,
+ * so checks that run only there are vacuous.
  */
 function assertSeeds(app: App, seeds: readonly CursorSeed[], where: string): void {
   const actionIds = new Set(app.listReplayActions().map((a) => a.id));
@@ -132,6 +152,7 @@ function assertSeeds(app: App, seeds: readonly CursorSeed[], where: string): voi
  * a `*.test.ts` file.
  */
 export function runConformance(app: App, opts: ConformanceOptions = {}): void {
+  const test = load('node:test') as typeof NodeTest;
   const name = app.id;
 
   test(`[${name}] declares a non-empty id, displayName and hosts`, () => {
@@ -172,8 +193,7 @@ export function runConformance(app: App, opts: ConformanceOptions = {}): void {
     // Note what is NOT tested: a PREFIX like 'notslack.com'. Adapters must match
     // their own subdomains — a Slack workspace is served from acme.slack.com —
     // so 'notedgeapi.slack.com' is an ordinary workspace host that no correct
-    // matcher can reject. An earlier version of this probe asserted otherwise and
-    // pushed two adapters into narrowing their real host lists to satisfy it.
+    // matcher can reject.
     for (const host of app.hosts) {
       const dashed = host.replace(/\./g, '-');
       for (const impostor of [
@@ -199,13 +219,8 @@ export function runConformance(app: App, opts: ConformanceOptions = {}): void {
   test(`[${name}] parse never throws`, () => {
     // parse() runs in the ingest funnel for EVERY capture, so a throw does not
     // lose one row — it takes down capture for every app at once.
-    for (const [label, body] of HOSTILE_BODIES) {
-      for (const host of [...app.hosts, 'unrelated.test']) {
-        for (const path of [...HOSTILE_PATHS, ...ownPaths(app)]) {
-          const capture = makeCapture({ host, path, url: `https://${host}${path}`, resBody: body, reqBody: body });
-          assert.doesNotThrow(() => app.parse(capture), `parse threw on ${label} at ${path} from ${host}`);
-        }
-      }
+    for (const { label, host, path, capture } of hostileCaptures(app, true)) {
+      assert.doesNotThrow(() => app.parse(capture), `parse threw on ${label} at ${path} from ${host}`);
     }
   });
 
@@ -223,32 +238,22 @@ export function runConformance(app: App, opts: ConformanceOptions = {}): void {
   test(`[${name}] classify never throws and names an operation`, { skip: !app.classify }, () => {
     const classify = app.classify;
     if (!classify) return;
-    for (const [label, body] of HOSTILE_BODIES) {
-      for (const host of [...app.hosts, 'unrelated.test']) {
-        for (const path of [...HOSTILE_PATHS, ...ownPaths(app)]) {
-          const capture = makeCapture({ host, path, url: `https://${host}${path}`, resBody: body });
-          assert.doesNotThrow(() => classify(capture), `classify threw on ${label} at ${path}`);
-          const got = classify(capture);
-          assert.ok(got !== null && typeof got === 'object', 'classify must return an object');
-          assert.ok(typeof got.class === 'string' && got.class.length > 0);
-        }
-      }
+    for (const { label, path, capture } of hostileCaptures(app, false)) {
+      assert.doesNotThrow(() => classify(capture), `classify threw on ${label} at ${path}`);
+      const got = classify(capture);
+      assert.ok(got !== null && typeof got === 'object', 'classify must return an object');
+      assert.ok(typeof got.class === 'string' && got.class.length > 0);
     }
   });
 
   test(`[${name}] nextCursors never throws and returns an array`, { skip: !app.nextCursors }, () => {
     const nextCursors = app.nextCursors;
     if (!nextCursors) return;
-    for (const [label, body] of HOSTILE_BODIES) {
-      for (const path of [...HOSTILE_PATHS, ...ownPaths(app)]) {
-        for (const host of [...app.hosts, 'unrelated.test']) {
-        const capture = makeCapture({ host, path, url: `https://${host}${path}`, resBody: body });
-        assert.doesNotThrow(() => nextCursors(capture), `nextCursors threw on ${label} at ${path}`);
-        const seeds = nextCursors(capture);
-        assert.ok(Array.isArray(seeds), 'nextCursors must return an array — [] is a fine answer');
-        assertSeeds(app, seeds, `${label} at ${path}`);
-        }
-      }
+    for (const { label, path, capture } of hostileCaptures(app, false)) {
+      assert.doesNotThrow(() => nextCursors(capture), `nextCursors threw on ${label} at ${path}`);
+      const seeds = nextCursors(capture);
+      assert.ok(Array.isArray(seeds), 'nextCursors must return an array — [] is a fine answer');
+      assertSeeds(app, seeds, `${label} at ${path}`);
     }
     // And over the real fixtures, which are the only inputs that actually
     // PRODUCE seeds — see assertSeeds for why that distinction mattered.

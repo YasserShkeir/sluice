@@ -17,16 +17,18 @@
  * and the whole flow restarts once (simpler and safer than mid-flow resume when
  * bindings may already have consumed the stale session).
  *
- * Pacing: prefer each step's `offsetFromPrimaryMsP50` (median ms from the
- * primary's start) so siblings keep the same deltas as the observed burst even
- * when an earlier soft companion is skipped. Fall back to chained `delayMsP50`
- * for steps without a primary anchor (or templates learned before offsets).
- * Hard-capped per wait; overall schedule still respects the flow timeout.
+ * Pacing: see {@link nextPaceWaitMs}.
+ *
+ * `FlowReplayResult.error` and `steps[].detail` come back redacted: every free
+ * text (a build or run error, an unreproducible reason) passes `redactText` in
+ * `stepFailed`, so no host has to remember to.
  */
 
-import { isAuthFailure, newId } from '@sluice/core';
+import { setTimeout as sleep } from 'node:timers/promises';
+import { errorMessage, isAuthFailure, newId, redactText, safeJsonParse } from '@sluice/core';
 import type {
   Capture,
+  FlowRunStepMsg,
   FlowTemplate,
   FlowTemplateStep,
   InteractionFlow,
@@ -41,6 +43,9 @@ export const FLOW_DELAY_CAP_MS = 2_000;
 /** Default overall wall-clock budget for one flow run. */
 export const DEFAULT_FLOW_TIMEOUT_MS = 120_000;
 
+/** The error (and step detail) of an auth failure — also what triggers the restart. */
+const AUTH_FAILURE = 'auth failure';
+
 export type FlowStepStatus =
   | 'ok'
   | 'skipped'
@@ -49,17 +54,9 @@ export type FlowStepStatus =
   | 'error'
   | 'auth_fail';
 
-export interface FlowStepResult {
-  seq: number;
+export interface FlowStepResult extends FlowRunStepMsg {
   role: FlowTemplateStep['role'];
-  operation?: string;
-  method: string;
-  path: string;
   status: FlowStepStatus;
-  captureId?: string;
-  httpStatus?: number | null;
-  detail?: string;
-  durationMs?: number;
 }
 
 export interface FlowReplayResult {
@@ -123,7 +120,6 @@ export interface RunFlowReplayOptions {
 export async function runFlowReplay(opts: RunFlowReplayOptions): Promise<FlowReplayResult> {
   const started = Date.now();
   const timeoutMs = opts.timeoutMs ?? DEFAULT_FLOW_TIMEOUT_MS;
-  const allowRestart = opts.allowRefreshRestart !== false;
 
   let session = opts.session;
   let refreshed = false;
@@ -135,25 +131,34 @@ export async function runFlowReplay(opts: RunFlowReplayOptions): Promise<FlowRep
     const captureIds: string[] = [];
     let primaryCaptureId: string | undefined;
     const ordered = opts.template.steps.slice().sort((a, b) => a.seq - b.seq);
-    let flowStartedAt = Date.now();
+    const flowStartedAt = Date.now();
     let flowEndedAt = flowStartedAt;
     /** Wall clock when the primary step began — anchor for sibling offsets. */
     let primaryStartedAt: number | undefined;
     const delayCap = opts.delayCapMs ?? FLOW_DELAY_CAP_MS;
     const pace = opts.pace !== false;
 
-    for (let i = 0; i < ordered.length; i++) {
-      if (Date.now() - started > timeoutMs) {
-        return {
-          ok: false,
-          refreshed,
-          steps,
-          error: `flow timed out after ${timeoutMs}ms`,
-          flow: maybeFlow(opts, primaryCaptureId, captureIds, flowStartedAt, flowEndedAt, steps),
-        };
-      }
+    // Reads primaryCaptureId / flowEndedAt / refreshed at call time.
+    const fail = (error: string): FlowReplayResult => ({
+      ok: false,
+      refreshed,
+      steps,
+      error,
+      flow: maybeFlow(opts, primaryCaptureId, captureIds, flowStartedAt, flowEndedAt, steps),
+    });
+    /** Record a failed step (redacted); a required one fails the flow, a soft one continues. */
+    const stepFailed = (
+      step: FlowTemplateStep,
+      status: FlowStepStatus,
+      detail: string,
+      error = detail,
+    ): FlowReplayResult | undefined => {
+      steps.push(stepResult(step, status, redactText(detail)));
+      return step.required ? fail(redactText(error)) : undefined;
+    };
 
-      const step = ordered[i]!;
+    for (const step of ordered) {
+      if (Date.now() - started > timeoutMs) return fail(`flow timed out after ${timeoutMs}ms`);
 
       // Sibling pacing: hold until the learned offset from primary (or chained
       // gap before the primary is known). Never sleep past the overall deadline.
@@ -167,25 +172,13 @@ export async function runFlowReplay(opts: RunFlowReplayOptions): Promise<FlowRep
       }
 
       if (step.unreproducible) {
-        const row: FlowStepResult = {
-          seq: step.seq,
-          role: step.role,
-          operation: step.operation,
-          method: step.method,
-          path: step.path,
-          status: 'skipped',
-          detail: step.unreproducibleReason ?? 'unreproducible',
-        };
-        steps.push(row);
-        if (step.required) {
-          return {
-            ok: false,
-            refreshed,
-            steps,
-            error: `required step ${step.seq} is unreproducible`,
-            flow: maybeFlow(opts, primaryCaptureId, captureIds, flowStartedAt, flowEndedAt, steps),
-          };
-        }
+        const r = stepFailed(
+          step,
+          'skipped',
+          step.unreproducibleReason ?? 'unreproducible',
+          `required step ${step.seq} is unreproducible`,
+        );
+        if (r) return r;
         continue;
       }
 
@@ -197,83 +190,28 @@ export async function runFlowReplay(opts: RunFlowReplayOptions): Promise<FlowRep
           priorCaptures,
         });
       } catch (e) {
-        if (isBuildDenied(e)) {
-          steps.push(stepResult(step, 'denied', errMsg(e)));
-          if (step.required) {
-            return {
-              ok: false,
-              refreshed,
-              steps,
-              error: errMsg(e),
-              flow: maybeFlow(opts, primaryCaptureId, captureIds, flowStartedAt, flowEndedAt, steps),
-            };
-          }
-          continue;
-        }
-        const msg = errMsg(e);
-        steps.push(stepResult(step, 'error', msg));
-        if (step.required) {
-          return {
-            ok: false,
-            refreshed,
-            steps,
-            error: msg,
-            flow: maybeFlow(opts, primaryCaptureId, captureIds, flowStartedAt, flowEndedAt, steps),
-          };
-        }
+        const r = stepFailed(step, isBuildDenied(e) ? 'denied' : 'error', errorMessage(e));
+        if (r) return r;
         continue;
       }
 
       if (req === null) {
-        steps.push(
-          stepResult(step, 'skipped', 'build returned null'),
-        );
-        if (step.required) {
-          return {
-            ok: false,
-            refreshed,
-            steps,
-            error: `required step ${step.seq} could not be built`,
-            flow: maybeFlow(opts, primaryCaptureId, captureIds, flowStartedAt, flowEndedAt, steps),
-          };
-        }
+        const r = stepFailed(step, 'skipped', 'build returned null', `required step ${step.seq} could not be built`);
+        if (r) return r;
         continue;
       }
 
       // Anchor sibling schedule at the moment we issue the primary — matches
       // capture `ts` (request start), not response completion.
-      if (step.role === 'primary' && primaryStartedAt === undefined) {
-        primaryStartedAt = Date.now();
-      }
+      if (step.role === 'primary') primaryStartedAt ??= Date.now();
 
       let capture: Capture;
       try {
         capture = await opts.io.run(req);
       } catch (e) {
-        if (e instanceof ReplayDeniedError) {
-          steps.push(stepResult(step, 'denied', e.message));
-          if (step.required) {
-            return {
-              ok: false,
-              refreshed,
-              steps,
-              error: e.message,
-              flow: maybeFlow(opts, primaryCaptureId, captureIds, flowStartedAt, flowEndedAt, steps),
-            };
-          }
-          continue;
-        }
-        const msg = errMsg(e);
-        steps.push(stepResult(step, 'error', msg));
-        if (step.required) {
-          return {
-            ok: false,
-            refreshed,
-            steps,
-            error: msg,
-            flow: maybeFlow(opts, primaryCaptureId, captureIds, flowStartedAt, flowEndedAt, steps),
-          };
-        }
+        // Narrower than isBuildDenied: only the runtime rails deny here.
+        const r = stepFailed(step, e instanceof ReplayDeniedError ? 'denied' : 'error', errorMessage(e));
+        if (r) return r;
         continue;
       }
 
@@ -283,55 +221,22 @@ export async function runFlowReplay(opts: RunFlowReplayOptions): Promise<FlowRep
       flowEndedAt = capture.ts + (capture.durationMs ?? 0);
       if (step.role === 'primary') primaryCaptureId = capture.id;
 
-      const bodyJson = tryParseJson(capture.resBody);
+      const bodyJson = safeJsonParse(capture.resBody);
       if (bodyJson !== undefined) priorResponses.set(step.seq, bodyJson);
 
       if (isAuthFailure(capture)) {
-        steps.push({
-          ...stepResult(step, 'auth_fail', 'auth failure'),
-          captureId: capture.id,
-          httpStatus: capture.status,
-          durationMs: capture.durationMs ?? undefined,
-        });
-        return {
-          ok: false,
-          refreshed,
-          steps,
-          error: 'auth failure',
-          flow: maybeFlow(opts, primaryCaptureId, captureIds, flowStartedAt, flowEndedAt, steps),
-        };
+        steps.push(captureStepResult(step, 'auth_fail', capture, AUTH_FAILURE));
+        return fail(AUTH_FAILURE);
       }
 
-      const failHttp = opts.failOnHttpError !== false;
-      const badHttp =
-        failHttp && capture.status !== null && capture.status >= 400;
-
-      if (badHttp) {
+      if (opts.failOnHttpError !== false && capture.status !== null && capture.status >= 400) {
         const status: FlowStepStatus = step.required ? 'error' : 'soft_fail';
-        steps.push({
-          ...stepResult(step, status, `HTTP ${capture.status}`),
-          captureId: capture.id,
-          httpStatus: capture.status,
-          durationMs: capture.durationMs ?? undefined,
-        });
-        if (step.required) {
-          return {
-            ok: false,
-            refreshed,
-            steps,
-            error: `required step ${step.seq} returned HTTP ${capture.status}`,
-            flow: maybeFlow(opts, primaryCaptureId, captureIds, flowStartedAt, flowEndedAt, steps),
-          };
-        }
+        steps.push(captureStepResult(step, status, capture, `HTTP ${capture.status}`));
+        if (step.required) return fail(`required step ${step.seq} returned HTTP ${capture.status}`);
         continue;
       }
 
-      steps.push({
-        ...stepResult(step, 'ok'),
-        captureId: capture.id,
-        httpStatus: capture.status,
-        durationMs: capture.durationMs ?? undefined,
-      });
+      steps.push(captureStepResult(step, 'ok', capture));
     }
 
     return {
@@ -343,55 +248,18 @@ export async function runFlowReplay(opts: RunFlowReplayOptions): Promise<FlowRep
     };
   };
 
-  let result = await attempt();
-
-  if (
-    !result.ok &&
-    result.error === 'auth failure' &&
-    allowRestart &&
-    !refreshed &&
-    opts.io.refresh
-  ) {
-    let fresh: Session | undefined;
-    try {
-      fresh = await opts.io.refresh();
-    } catch {
-      return result;
-    }
-    if (!fresh) return result;
-    session = fresh;
-    refreshed = true;
-    result = await attempt();
-    result.refreshed = true;
+  const result = await attempt();
+  if (result.error !== AUTH_FAILURE || opts.allowRefreshRestart === false || !opts.io.refresh) return result;
+  let fresh: Session | undefined;
+  try {
+    fresh = await opts.io.refresh();
+  } catch {
+    return result;
   }
-
-  return result;
-}
-
-/**
- * Resolve a JSON path produced by flow-learn (`a.b[0].c`) against a response
- * body. Returns string form of the leaf, or undefined.
- */
-export function resolveJsonPath(data: unknown, path: string): string | undefined {
-  if (!path || path === '$') {
-    return primitiveToString(data);
-  }
-  let cur: unknown = data;
-  // Tokenize: split on . but keep [n] indices.
-  const tokens = path.match(/[^.[\]]+|\[\d+\]/g) ?? [];
-  for (const raw of tokens) {
-    if (cur == null) return undefined;
-    if (raw.startsWith('[') && raw.endsWith(']')) {
-      const idx = Number(raw.slice(1, -1));
-      if (!Array.isArray(cur)) return undefined;
-      cur = cur[idx];
-    } else if (typeof cur === 'object') {
-      cur = (cur as Record<string, unknown>)[raw];
-    } else {
-      return undefined;
-    }
-  }
-  return primitiveToString(cur);
+  if (!fresh) return result;
+  session = fresh;
+  refreshed = true;
+  return attempt();
 }
 
 // ── helpers ──────────────────────────────────────────────────────────────────
@@ -427,44 +295,24 @@ function maybeFlow(
   };
 }
 
-function stepResult(
+function stepResult(step: FlowTemplateStep, status: FlowStepStatus, detail?: string): FlowStepResult {
+  const { seq, role, operation, method, path } = step;
+  return { seq, role, operation, method, path, status, detail };
+}
+
+/** A step row for an exchange that happened, carrying its capture's id, status and timing. */
+function captureStepResult(
   step: FlowTemplateStep,
   status: FlowStepStatus,
+  capture: Capture,
   detail?: string,
 ): FlowStepResult {
   return {
-    seq: step.seq,
-    role: step.role,
-    operation: step.operation,
-    method: step.method,
-    path: step.path,
-    status,
-    detail,
+    ...stepResult(step, status, detail),
+    captureId: capture.id,
+    httpStatus: capture.status,
+    durationMs: capture.durationMs ?? undefined,
   };
-}
-
-function tryParseJson(body: string | null): unknown {
-  if (!body) return undefined;
-  try {
-    return JSON.parse(body);
-  } catch {
-    return undefined;
-  }
-}
-
-function primitiveToString(v: unknown): string | undefined {
-  if (v === null || v === undefined) return undefined;
-  if (typeof v === 'string') return v;
-  if (typeof v === 'number' || typeof v === 'boolean') return String(v);
-  return undefined;
-}
-
-function errMsg(e: unknown): string {
-  return e instanceof Error ? e.message : String(e);
-}
-
-function sleep(ms: number): Promise<void> {
-  return new Promise((r) => setTimeout(r, ms));
 }
 
 /**
@@ -487,30 +335,13 @@ export function nextPaceWaitMs(
   },
 ): number {
   const now = ctx.now ?? Date.now();
-  const remaining = Math.max(0, ctx.flowDeadlineAt - now);
-  if (remaining <= 0) return 0;
-
-  const cap = Math.max(0, ctx.delayCapMs);
-
-  if (
-    ctx.primaryStartedAt !== undefined &&
-    typeof step.offsetFromPrimaryMsP50 === 'number' &&
-    Number.isFinite(step.offsetFromPrimaryMsP50)
-  ) {
-    // Negative offsets are pre-primary companions — they should already have
-    // run. A late negative target means "fire immediately".
-    const target = ctx.primaryStartedAt + step.offsetFromPrimaryMsP50;
-    const raw = Math.max(0, target - now);
-    return Math.min(raw, cap, remaining);
-  }
-
-  const chained = Math.max(0, step.delayMsP50 || 0);
-  if (chained <= 0) return 0;
-  return Math.min(chained, cap, remaining);
+  const offset = step.offsetFromPrimaryMsP50;
+  // Negative offsets are pre-primary companions; a late target fires immediately.
+  const wait = ctx.primaryStartedAt !== undefined && typeof offset === 'number' && Number.isFinite(offset) ? ctx.primaryStartedAt + offset - now : step.delayMsP50 || 0;
+  return Math.max(0, Math.min(wait, ctx.delayCapMs, ctx.flowDeadlineAt - now));
 }
 
 /** Build-time rails from cartographer throw FlowBuildError (name+code); treat as denied. */
 function isBuildDenied(e: unknown): e is Error {
-  if (e instanceof ReplayDeniedError) return true;
-  return e instanceof Error && e.name === 'FlowBuildError';
+  return e instanceof ReplayDeniedError || (e instanceof Error && e.name === 'FlowBuildError');
 }

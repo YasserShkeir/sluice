@@ -9,6 +9,7 @@
  * memoize cleanly against the frozen per-frame snapshot.
  */
 import type { Capture } from '@sluice/core';
+import { bodyLengths } from './format.js';
 
 /** "App" = the adapter that claimed the capture, or a stable 'unclassified' bucket. */
 export function appOf(c: Capture): string {
@@ -57,7 +58,7 @@ export function computeKpis(captures: Capture[], now = Date.now()): Kpis {
       if (c.status >= 400) errors += 1;
     }
     if (c.durationMs !== null) durations.push(c.durationMs);
-    if (c.resBody) bytes += c.resBody.length;
+    bytes += bodyLengths(c).res;
   }
 
   return {
@@ -115,14 +116,11 @@ export function requestSeries(captures: Capture[], bucketCount = 30, now = Date.
   }
 
   for (const c of captures) {
-    let i = Math.floor((c.ts - start) / width);
-    if (i < 0) i = 0;
-    if (i >= bucketCount) i = bucketCount - 1;
+    const i = Math.min(bucketCount - 1, Math.max(0, Math.floor((c.ts - start) / width)));
     buckets[i]!.count += 1;
   }
 
-  let max = 0;
-  for (const b of buckets) if (b.count > max) max = b.count;
+  const max = Math.max(0, ...buckets.map((b) => b.count));
   return { buckets, max, start, end };
 }
 
@@ -189,14 +187,8 @@ export interface ErrorRow {
 }
 
 /**
- * Per-capture "did this fail?" cache, keyed by capture id.
- *
- * Deciding this means JSON.parsing the response body, and the scan below walks
- * backwards until it finds `limit` errors — so on a healthy stream (fewer than
- * `limit` errors anywhere) it reached the entire ring buffer, parsing up to 8000
- * bodies of up to 5 MB each. And it re-ran on every animation frame, because the
- * snapshot hands out a fresh array identity per flush. Captures are immutable
- * once stored, so the verdict is safe to remember.
+ * Per-capture "did this fail?" cache. Deciding means JSON.parsing the body, and recentErrors can walk
+ * the whole ring every frame; captures are immutable once stored, so the verdict is safe to remember.
  */
 const errorVerdict = new Map<string, { failed: boolean; reason: string }>();
 /** Bound the cache so a long capture session can't grow it without limit. */
@@ -205,9 +197,9 @@ const VERDICT_CAP = 20_000;
 function verdictFor(c: Capture): { failed: boolean; reason: string } {
   const hit = errorVerdict.get(c.id);
   if (hit) return hit;
-  const httpErr = c.status !== null && c.status >= 400;
-  const failed = httpErr || isNotOk(c.resBody);
-  const v = { failed, reason: failed ? errorReason(c) : '' };
+  const body = asRecord(parseBody(c.resBody));
+  const failed = (c.status !== null && c.status >= 400) || body?.ok === false;
+  const v = { failed, reason: failed ? errorReason(c, body) : '' };
   if (errorVerdict.size >= VERDICT_CAP) errorVerdict.clear();
   errorVerdict.set(c.id, v);
   return v;
@@ -279,10 +271,7 @@ export interface AppIdentity {
 
 /** True when `host` is the claimed host or a subdomain of it. */
 function onClaimedHost(host: string, claimed: readonly string[]): boolean {
-  for (const h of claimed) {
-    if (host === h || host.endsWith(`.${h}`)) return true;
-  }
-  return false;
+  return claimed.some((h) => host === h || host.endsWith(`.${h}`));
 }
 
 /**
@@ -297,11 +286,7 @@ function onClaimedHost(host: string, claimed: readonly string[]): boolean {
  * itself claimed on a host the catalog does not list. So: either one.
  */
 export function capturesForApp(captures: Capture[], app: AppIdentity): Capture[] {
-  const out: Capture[] = [];
-  for (const c of captures) {
-    if (c.adapterId === app.id || onClaimedHost(c.host, app.hosts)) out.push(c);
-  }
-  return out;
+  return captures.filter((c) => c.adapterId === app.id || onClaimedHost(c.host, app.hosts));
 }
 
 export interface AppEndpointRow {
@@ -374,15 +359,8 @@ function parseBody(body: string | null): unknown {
   }
 }
 
-/** True when the response body is JSON with `ok: false` (Slack-style failure). */
-function isNotOk(body: string | null): boolean {
-  const o = asRecord(parseBody(body));
-  return o !== null && o.ok === false;
-}
-
 /** Best-effort short reason: `error` / `error.message` / `message` / `ok:false` / HTTP. */
-function errorReason(c: Capture): string {
-  const o = asRecord(parseBody(c.resBody));
+function errorReason(c: Capture, o: Record<string, unknown> | null): string {
   if (o) {
     if (typeof o.error === 'string' && o.error) return o.error;
     const err = asRecord(o.error);

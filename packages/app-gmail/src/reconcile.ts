@@ -23,7 +23,6 @@ import {
   ADAPTER_ID,
   accountSlotOfWorkspaceId,
   accountWorkspaceId,
-  addressOfWorkspaceId,
   gmailAccountAddress,
   gmailAccountSlot,
   gmailCarriesEntities,
@@ -268,19 +267,4 @@ export function gmailReconcile(store: ReconcileStore): ReconcileOutcome {
   if (straddling > 0) parts.push(`${straddling} left unattributed (recorded across an account switch)`);
   if (unbound > 0) parts.push(`${unbound} left unattributed (no message fetch names the mailbox)`);
   return { changed, note: parts.join('; ') };
-}
-
-/**
- * A one-line account summary for the CLI and the MCP status tool: which
- * mailboxes are known, and how much mail is still parked in a placeholder.
- */
-export function describeAccounts(store: ReconcileStore): string {
-  const all = store.listWorkspaces().filter((w) => w.adapterId === ADAPTER_ID);
-  const named = all.filter((w) => addressOfWorkspaceId(w.id) !== undefined);
-  const parked = all.filter((w) => isProvisionalWorkspaceId(w.id));
-  const parts = [`${named.length} mailbox${named.length === 1 ? '' : 'es'}`];
-  if (parked.length > 0) {
-    parts.push(`${parked.length} unidentified (${parked.map((w) => w.id).join(', ')})`);
-  }
-  return parts.join(', ');
 }

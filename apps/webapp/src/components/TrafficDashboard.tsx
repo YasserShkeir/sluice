@@ -3,37 +3,25 @@
  * All-traffic dashboard (Wireshark / Charles style): a toolbar over one dense,
  * monospace grid of every captured request.
  *
- * Three things changed from the paginated table this replaces, and each was a
- * ceiling rather than a preference.
- *
- * FILTERING is now a language (`../filter.js`) instead of six fixed dropdowns.
- * The dropdowns could express "app = slack" and nothing else — not "429s", not
- * "slower than a second and a half", not "everything except client.counts", and
- * not two values for one field. They survive as menus that APPEND a term to the
- * query rather than as a parallel source of truth, so there is exactly one place
- * that says what is being shown and it is the text you can read, copy and share.
- *
- * ROWS are virtualized rather than paged. Paging was a workaround for rendering
- * 8000 rows; with a virtualizer only the visible ~40 exist, so the page controls
- * (and the question "which page is that request on?") go away entirely. The list
- * is a `role="grid"` of divs, not a `<table>`: virtualizing table rows requires
- * absolute positioning, which is exactly what table layout will not tolerate.
- *
- * BODY SEARCH goes to the server. Everything else is on the row already, but
- * bodies are not — the WS backfill is a bounded window, so answering
- * `body:"not_in_channel"` from what the client holds silently answers "matches
- * among the last few thousand captures" while presenting itself as "matches".
+ * FILTERING is the `../filter.js` language; the menus only APPEND terms, so the
+ * text box is the single source of truth. ROWS are virtualized in a `role="grid"`
+ * of divs, not a `<table>`: virtualized rows need absolute positioning, which
+ * table layout rejects. `body:` terms go to the SERVER: the client holds only a
+ * bounded window, and answering them locally would silently answer a narrower
+ * question.
  */
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { useVirtualizer } from '@tanstack/react-virtual';
+import type { VirtualItem } from '@tanstack/react-virtual';
 import * as ContextMenu from '@radix-ui/react-context-menu';
 import type { Capture } from '@sluice/core';
 import type { ConnectionState } from '../ws.js';
-import { distinctValues, sendCaptureControl, sendSync } from '../ws.js';
+import { captureToggleAction, distinctValues, sendCaptureControl, sendSync } from '../ws.js';
 import { appOf } from '../analytics.js';
-import { fetchFlows, fetchCapturesByIds, searchCaptureBodies } from '../api.js';
+import { fetchCaptureBody, fetchCapturesByIds, fetchFlows, searchCaptureBodies } from '../api.js';
 import type { FlowSummary } from '../api.js';
-import { formatClock, formatDuration, humanizeBytes, toCurl } from '../format.js';
+import { toggled } from '../collections.js';
+import { captureSize, errorMessage, formatClock, formatDuration, toCurl } from '../format.js';
 import { Badge, statusTone } from '../ui/badge.js';
 import { Button } from '../ui/button.js';
 import { Input } from '../ui/input.js';
@@ -88,27 +76,16 @@ const GRID_COLS =
 interface Props {
   /** oldest → newest, straight from the store */
   captures: Capture[];
-  /**
-   * Only to disable Sync while the socket is down. The connection PILL moved to
-   * the shell nav — it describes the runner, not this table, and it had no
-   * business disappearing when you navigated away from here.
-   */
+  /** Only to disable Sync while the socket is down. */
   connection: ConnectionState;
   selectedId: string | null;
   onSelect: (c: Capture | null) => void;
-  /**
-   * Whether the RUNNER is writing captures. Rendered rather than guessed: the
-   * button used to toggle local state only, so the UI said "paused" while the
-   * engine went on writing every request to disk.
-   */
+  /** Whether the RUNNER is writing captures (server state, see ws.ts). */
   capturePaused: boolean;
   /** monotonic id of the last notice — bumps to clear the Sync button's "syncing…" */
   noticeId: number;
-  /**
-   * App id chosen in the launcher above, or '' for all. Applied by rewriting the
-   * query's `app:` term, so the launcher and the filter box remain one source of
-   * truth rather than two that can disagree.
-   */
+  /** Launcher app id, or '' for all. Applied by rewriting the query's `app:` term
+   *  so the launcher and the filter box stay one source of truth. */
   appFilter?: string;
 }
 
@@ -136,7 +113,7 @@ export function TrafficDashboard({
    *  body term in play, which is different from "searched and found nothing". */
   const [bodyHits, setBodyHits] = useState<ReadonlySet<string> | null>(null);
   const [searchError, setSearchError] = useState<string | null>(null);
-  /** F7.1 — collapse companions under observed/pinned interaction flows. */
+  /** Collapse companions under observed/pinned interaction flows. */
   const [groupByFlow, setGroupByFlow] = useState(false);
   const [flows, setFlows] = useState<FlowSummary[]>([]);
   const [flowsError, setFlowsError] = useState<string | null>(null);
@@ -146,11 +123,8 @@ export function TrafficDashboard({
   const indexRef = useRef<Map<string, number>>(new Map());
   const seqRef = useRef<Map<string, number>>(new Map());
   const seqCounter = useRef(0);
-  /**
-   * Captures pulled for Group-flows that are not in the live ingest ring.
-   * Kept off listRef so hydration does not invent seqs or churn version /
-   * re-fetch flows on every gap fill.
-   */
+  /** Captures pulled for Group-flows that are not in the live ring. Kept off listRef
+   *  so hydration invents no seqs and does not churn version / re-fetch flows. */
   const flowHydrateRef = useRef<Map<string, Capture>>(new Map());
   // Ids present at the last Clear — skipped so a Clear taken while recording doesn't
   // immediately re-ingest everything still in the store's live window.
@@ -215,11 +189,8 @@ export function TrafficDashboard({
     setVersion((v) => v + 1);
   }, [captures, recording, follow]);
 
-  // Wipe (and any full server clear) empties the ws capture ring. listRef is a
-  // separate live buffer — drop it too so the dashboard cannot keep deleted rows.
-  useEffect(() => {
-    if (captures.length > 0) return;
-    if (listRef.current.length === 0) return;
+  /** Drop every buffered row and the per-row state hanging off it. */
+  function resetBuffers(): void {
     listRef.current = [];
     indexRef.current = new Map();
     seqRef.current = new Map();
@@ -230,6 +201,14 @@ export function TrafficDashboard({
     setUnseen(0);
     setVersion((v) => v + 1);
     onSelect(null);
+  }
+
+  // Wipe (and any full server clear) empties the ws capture ring. listRef is a
+  // separate live buffer — drop it too so the dashboard cannot keep deleted rows.
+  useEffect(() => {
+    if (captures.length > 0) return;
+    if (listRef.current.length === 0) return;
+    resetBuffers();
   }, [captures, onSelect]);
 
   // ── Body search: the one predicate the client cannot answer from its window ───
@@ -257,7 +236,7 @@ export function TrafficDashboard({
           if (cancelled) return;
           // Surface it rather than falling back to a local scan: a local scan
           // would answer a narrower question and look like a complete answer.
-          setSearchError(e instanceof Error ? e.message : String(e));
+          setSearchError(errorMessage(e));
           setBodyHits(new Set());
         });
     }, 250);
@@ -283,7 +262,7 @@ export function TrafficDashboard({
         })
         .catch((e: unknown) => {
           if (cancelled) return;
-          setFlowsError(e instanceof Error ? e.message : String(e));
+          setFlowsError(errorMessage(e));
           setFlows([]);
         });
     };
@@ -301,14 +280,14 @@ export function TrafficDashboard({
   useEffect(() => {
     if (!groupByFlow || flows.length === 0) return;
     let cancelled = false;
-    const have = new Set<string>([
-      ...listRef.current.map((c) => c.id),
-      ...flowHydrateRef.current.keys(),
-    ]);
+    // indexRef's keys are exactly listRef's ids (kept together by ingest, trim,
+    // clear and wipe), so it answers "already held?" without a scan.
     const missing: string[] = [];
     for (const f of flows) {
       for (const s of f.steps ?? []) {
-        if (s.captureId && !have.has(s.captureId)) missing.push(s.captureId);
+        if (s.captureId && !indexRef.current.has(s.captureId) && !flowHydrateRef.current.has(s.captureId)) {
+          missing.push(s.captureId);
+        }
       }
     }
     const unique = [...new Set(missing)].slice(0, 500);
@@ -318,7 +297,7 @@ export function TrafficDashboard({
         if (cancelled || r.captures.length === 0) return;
         let changed = false;
         for (const c of r.captures) {
-          if (listRef.current.some((x) => x.id === c.id)) continue;
+          if (indexRef.current.has(c.id)) continue;
           if (flowHydrateRef.current.has(c.id)) continue;
           flowHydrateRef.current.set(c.id, c);
           changed = true;
@@ -441,38 +420,24 @@ export function TrafficDashboard({
   }, [syncing]);
 
   function clear(): void {
-    listRef.current = [];
-    indexRef.current = new Map();
-    seqRef.current = new Map();
-    seqCounter.current = 0;
-    flowHydrateRef.current.clear();
     ignoredRef.current = new Set(captures.map((c) => c.id));
-    setMarks(new Set());
-    setMulti(new Set());
-    setUnseen(0);
     setFollow(true);
-    setVersion((v) => v + 1);
-    onSelect(null);
+    resetBuffers();
   }
-
 
   function addTerm(term: string): void {
     setQueryText((t) => (t.includes(term) ? t : `${t ? `${t} ` : ''}${term}`));
   }
 
   function toggleMark(id: string): void {
-    setMarks((m) => {
-      const next = new Set(m);
-      if (!next.delete(id)) next.add(id);
-      return next;
-    });
+    setMarks((m) => toggled(m, id));
   }
 
   /**
    * Click semantics, matching every list a developer already uses: plain click
    * selects one, cmd/ctrl toggles, shift extends from the last anchor.
    */
-  function onRowClick(c: Capture, e: React.MouseEvent): void {
+  function onRowClick(c: Capture, e: React.MouseEvent | React.KeyboardEvent): void {
     if (e.shiftKey && lastAnchor.current) {
       const from = rows.findIndex((r) => r.id === lastAnchor.current);
       const to = rows.findIndex((r) => r.id === c.id);
@@ -488,9 +453,7 @@ export function TrafficDashboard({
       }
     }
     if (e.metaKey || e.ctrlKey) {
-      const next = new Set(multi);
-      if (!next.delete(c.id)) next.add(c.id);
-      setMulti(next);
+      setMulti(toggled(multi, c.id));
       lastAnchor.current = c.id;
       return;
     }
@@ -499,8 +462,15 @@ export function TrafficDashboard({
     onSelect(c);
   }
 
-  const copyCurl = useCallback((c: Capture) => {
-    void navigator.clipboard?.writeText(toCurl(c));
+  const copyCurl = useCallback(async (c: Capture) => {
+    // Rows are previews: a request body over 64 KiB is cut, and copying it would
+    // hand out a silently corrupted --data-raw. Fetch the stored one, or copy nothing.
+    const cut = (c.bodyLengths?.req ?? 0) > (c.reqBody?.length ?? 0);
+    const full = cut ? await fetchCaptureBody(c.id).catch(() => null) : null;
+    if (cut && !full) return;
+    await navigator.clipboard
+      ?.writeText(toCurl(full ? { ...c, reqHeaders: full.reqHeaders, reqBody: full.reqBody } : c))
+      .catch(() => {});
   }, []);
 
   const copySelection = useCallback(() => {
@@ -511,6 +481,31 @@ export function TrafficDashboard({
     void navigator.clipboard?.writeText(text);
   }, [rows, multi]);
 
+  /** Keyed by the virtual item's key (unique per flow: a capture can render under two expanded flows). */
+  const renderRow = (c: Capture, v: VirtualItem, nested?: boolean, membership?: CaptureFlowMembership) => (
+    <Row
+      key={v.key}
+      capture={c}
+      seq={seqRef.current.get(c.id) ?? 0}
+      rowIndex={v.index}
+      top={v.start}
+      selected={c.id === selectedId}
+      inSelection={multi.has(c.id)}
+      marked={marks.has(c.id)}
+      nested={nested}
+      membership={membership ?? primaryMembership(flowMembership.get(c.id))}
+      onClick={onRowClick}
+      onToggleMark={toggleMark}
+      onCopyCurl={copyCurl}
+      onCopySelection={copySelection}
+      onAddTerm={addTerm}
+      selectionSize={multi.size}
+    />
+  );
+
+  // What the button SHOWS is what it toggles (see captureToggleAction).
+  const active = recording && !capturePaused;
+
   return (
     <section className="dashboard">
       <header className="flex flex-wrap items-center gap-x-3.5 gap-y-2.5 border-b border-border bg-bg-1 px-3 py-1.5">
@@ -518,20 +513,18 @@ export function TrafficDashboard({
           <Button
             size="sm"
             className={
-              recording && !capturePaused
+              active
                 ? 'border-[#4a2020] bg-[#1d1416] text-[#f0a0a0] hover:border-err hover:bg-[#1d1416] hover:text-[#f0a0a0]'
                 : 'border-[#2c4a30] bg-[#131a15] text-ok hover:border-ok hover:bg-[#131a15] hover:text-ok'
             }
             onClick={() => {
-              const next = !recording;
-              setRecording(next);
-              // Tell the RUNNER too. Without this the proxy kept writing every
-              // request to disk while the button read "paused" — which is the
-              // opposite of what someone pressing pause is asking for, and on a
-              // capture tool that is a privacy bug rather than a cosmetic one.
-              sendCaptureControl(next ? 'resume' : 'pause');
+              const action = captureToggleAction(recording, capturePaused);
+              setRecording(action === 'resume');
+              // Tell the runner too: pausing only this view would leave the proxy
+              // writing every request to disk — a privacy bug on a capture tool.
+              sendCaptureControl(action);
             }}
-            aria-pressed={recording && !capturePaused}
+            aria-pressed={active}
             title={
               capturePaused
                 ? 'The runner is not writing captures — click to resume'
@@ -540,7 +533,7 @@ export function TrafficDashboard({
                   : 'Resume recording'
             }
           >
-            {recording && !capturePaused ? '❚❚ Pause' : '● Record'}
+            {active ? '❚❚ Pause' : '● Record'}
           </Button>
           <Button size="sm" onClick={clear} title="Clear captured traffic">
             Clear
@@ -617,16 +610,9 @@ export function TrafficDashboard({
         </div>
       ) : null}
 
-      {/* One `role="grid"` wrapping BOTH the header and the scrolling body.
-          The header sits outside the scroller so it cannot scroll away, but it
-          must still be inside the grid — a `role="row"` with no grid ancestor is
-          not a row at all, and a screen reader reads the column names as loose
-          text. Hence grid > rowgroup > row > gridcell throughout, with the
-          scroller as a plain layout div in between.
-
-          Divs rather than <table>: the virtualizer positions rows by absolute
-          offset, which table layout will not tolerate. biome.json turns off
-          useSemanticElements for this file for exactly that reason. */}
+      {/* One role=grid wraps the header AND the scroller: a role=row outside a grid
+          is not a row (grid > rowgroup > row > gridcell). Divs, not <table> (see the
+          header), which is why biome.json turns off useSemanticElements here. */}
       <div
         role="grid"
         aria-label="Captured traffic"
@@ -653,19 +639,17 @@ export function TrafficDashboard({
         <div className="traffic-scroll min-h-0 flex-1 overflow-auto" ref={scrollRef} onScroll={onScroll}>
           {total === 0 ? (
             <div className="empty">
-              {recording
+              {active
                 ? 'Recording… waiting for traffic. Start the proxy and generate requests.'
                 : 'Paused. No traffic captured — press ● Record to start.'}
             </div>
           ) : virtualCount === 0 ? (
             <div className="empty">
-              {groupByFlow && flows.length > 0 && filteredCaptures.length === 0
+              {!groupByFlow || (flows.length > 0 && filteredCaptures.length === 0)
                 ? 'No requests match the current filter.'
-                : groupByFlow && flows.length > 0
-                  ? 'Flows are loaded, but none of their captures are in this traffic window. Clear filters, press Sync, or capture a fresh burst and re-run learn-flows.'
-                  : groupByFlow && flows.length === 0
-                    ? 'No interaction flows in the store yet. Run: sluice learn-flows'
-                    : 'No requests match the current filter.'}
+                : flows.length === 0
+                  ? 'No interaction flows in the store yet. Run: sluice learn-flows'
+                  : 'Flows are loaded, but none of their captures are in this traffic window. Clear filters, press Sync, or capture a fresh burst and re-run learn-flows.'}
             </div>
           ) : (
             <div role="rowgroup" className="relative w-full" style={{ height: virtualizer.getTotalSize() }}>
@@ -676,19 +660,13 @@ export function TrafficDashboard({
                   if (r.kind === 'flow') {
                     return (
                       <FlowGroupRow
-                        key={`flow:${r.flow.id}`}
+                        key={v.key}
                         flow={r.flow}
                         members={r.members}
                         expanded={r.expanded}
                         top={v.start}
                         rowIndex={v.index}
-                        onToggle={() => {
-                          setExpandedFlows((prev) => {
-                            const next = new Set(prev);
-                            if (!next.delete(r.flow.id)) next.add(r.flow.id);
-                            return next;
-                          });
-                        }}
+                        onToggle={() => setExpandedFlows((prev) => toggled(prev, r.flow.id))}
                         onSelectPrimary={() => {
                           const primary =
                             r.members.find((c) => c.id === r.flow.primaryCaptureId) ?? r.members[0];
@@ -700,7 +678,7 @@ export function TrafficDashboard({
                   if (r.kind === 'ungrouped-header') {
                     return (
                       <div
-                        key="ungrouped"
+                        key={v.key}
                         role="row"
                         tabIndex={-1}
                         aria-rowindex={v.index + 2}
@@ -713,51 +691,11 @@ export function TrafficDashboard({
                       </div>
                     );
                   }
-                  const c = r.capture;
-                  return (
-                    <Row
-                      key={`cap:${c.id}:${r.nested ? 'n' : 't'}`}
-                      capture={c}
-                      seq={seqRef.current.get(c.id) ?? 0}
-                      rowIndex={v.index}
-                      top={v.start}
-                      selected={c.id === selectedId}
-                      inSelection={multi.has(c.id)}
-                      marked={marks.has(c.id)}
-                      nested={r.nested}
-                      membership={r.membership ?? primaryMembership(flowMembership.get(c.id))}
-                      onClick={onRowClick}
-                      onToggleMark={toggleMark}
-                      onCopyCurl={copyCurl}
-                      onCopySelection={copySelection}
-                      onFilterOp={(op) => addTerm(`op:${op}`)}
-                      onExcludeOp={(op) => addTerm(`-op:${op}`)}
-                      selectionSize={multi.size}
-                    />
-                  );
+                  return renderRow(r.capture, v, r.nested, r.membership);
                 }
                 const c = rows[v.index];
                 if (!c) return null;
-                return (
-                  <Row
-                    key={c.id}
-                    capture={c}
-                    seq={seqRef.current.get(c.id) ?? 0}
-                    rowIndex={v.index}
-                    top={v.start}
-                    selected={c.id === selectedId}
-                    inSelection={multi.has(c.id)}
-                    marked={marks.has(c.id)}
-                    membership={primaryMembership(flowMembership.get(c.id))}
-                    onClick={onRowClick}
-                    onToggleMark={toggleMark}
-                    onCopyCurl={copyCurl}
-                    onCopySelection={copySelection}
-                    onFilterOp={(op) => addTerm(`op:${op}`)}
-                    onExcludeOp={(op) => addTerm(`-op:${op}`)}
-                    selectionSize={multi.size}
-                  />
-                );
+                return renderRow(c, v);
               })}
             </div>
           )}
@@ -777,13 +715,7 @@ export function TrafficDashboard({
   );
 }
 
-/**
- * The query minus its `body:` terms.
- *
- * Those were answered by the server against the full store; re-testing them here
- * against the client's bounded window would reject rows the server correctly
- * matched, whose bodies this process may never have received.
- */
+/** The query minus its server-answered `body:` terms (see serverSideTerms). */
 function localQuery(q: FilterQuery): FilterQuery {
   const server = serverSideTerms(q);
   if (server.length === 0) return q;
@@ -792,24 +724,13 @@ function localQuery(q: FilterQuery): FilterQuery {
 
 /** Skip setFlows when id+endedAt fingerprint is unchanged (avoids hydrate thrash). */
 function flowsListUnchanged(a: FlowSummary[], b: FlowSummary[]): boolean {
-  if (a.length !== b.length) return false;
-  for (let i = 0; i < a.length; i++) {
-    const x = a[i]!;
-    const y = b[i]!;
-    if (x.id !== y.id || x.endedAt !== y.endedAt) return false;
-  }
-  return true;
+  return a.length === b.length && a.every((x, i) => x.id === b[i]!.id && x.endedAt === b[i]!.endedAt);
 }
 
 /** Live ring first, then side-map hydrates not already present. */
 function mergeLiveAndHydrated(live: Capture[], hydrated: Map<string, Capture>): Capture[] {
-  if (hydrated.size === 0) return live;
   const have = new Set(live.map((c) => c.id));
-  const extra: Capture[] = [];
-  for (const c of hydrated.values()) {
-    if (!have.has(c.id)) extra.push(c);
-  }
-  return extra.length === 0 ? live : live.concat(extra);
+  return live.concat([...hydrated.values()].filter((c) => !have.has(c.id)));
 }
 
 function FlowGroupRow({
@@ -846,18 +767,10 @@ function FlowGroupRow({
         }
       }}
     >
-      <div role="gridcell" aria-colindex={1} className="truncate px-1 text-fg-mute" tabIndex={-1}>
-        {expanded ? '▼' : '▶'}
-      </div>
-      <div role="gridcell" aria-colindex={2} className="truncate px-1 text-fg-dim" title={flow.id} tabIndex={-1}>
-        flow
-      </div>
-      <div role="gridcell" aria-colindex={3} className="truncate px-1" tabIndex={-1}>
-        {flow.adapterId}
-      </div>
-      <div role="gridcell" aria-colindex={4} className="truncate px-1 text-fg-dim" tabIndex={-1}>
-        {flow.source}
-      </div>
+      <Cell col={1} className="text-fg-mute">{expanded ? '▼' : '▶'}</Cell>
+      <Cell col={2} className="text-fg-dim" title={flow.id}>flow</Cell>
+      <Cell col={3}>{flow.adapterId}</Cell>
+      <Cell col={4} className="text-fg-dim">{flow.source}</Cell>
       <div
         role="gridcell"
         aria-colindex={5}
@@ -882,12 +795,8 @@ function FlowGroupRow({
           {members.length}/{flow.stepCount} steps · {flow.endedAt - flow.startedAt}ms span
         </span>
       </div>
-      <div role="gridcell" aria-colindex={10} className="truncate px-1 text-fg-mute" tabIndex={-1}>
-        —
-      </div>
-      <div role="gridcell" aria-colindex={11} className="truncate px-1 text-fg-mute" tabIndex={-1}>
-        —
-      </div>
+      <Cell col={10} className="text-fg-mute">—</Cell>
+      <Cell col={11} className="text-fg-mute">—</Cell>
     </div>
   );
 }
@@ -903,12 +812,11 @@ interface RowProps {
   selectionSize: number;
   nested?: boolean;
   membership?: CaptureFlowMembership;
-  onClick: (c: Capture, e: React.MouseEvent) => void;
+  onClick: (c: Capture, e: React.MouseEvent | React.KeyboardEvent) => void;
   onToggleMark: (id: string) => void;
   onCopyCurl: (c: Capture) => void;
   onCopySelection: () => void;
-  onFilterOp: (op: string) => void;
-  onExcludeOp: (op: string) => void;
+  onAddTerm: (term: string) => void;
 }
 
 function Row({
@@ -926,8 +834,7 @@ function Row({
   onToggleMark,
   onCopyCurl,
   onCopySelection,
-  onFilterOp,
-  onExcludeOp,
+  onAddTerm,
 }: RowProps) {
   const app = appOf(c);
   const op = c.classification ?? '';
@@ -955,7 +862,7 @@ function Row({
           onKeyDown={(e) => {
             if (e.key === 'Enter' || e.key === ' ') {
               e.preventDefault();
-              onClick(c, e as unknown as React.MouseEvent);
+              onClick(c, e);
             }
             if (e.key === 'm' || e.key === 'M') onToggleMark(c.id);
           }}
@@ -996,7 +903,7 @@ function Row({
           <Cell col={9}>
             <Badge tone={statusTone(c.status)}>{c.status ?? '—'}</Badge>
           </Cell>
-          <Cell col={10} className="tabnum text-fg-dim">{humanizeBytes(c.resBody ?? c.reqBody)}</Cell>
+          <Cell col={10} className="tabnum text-fg-dim">{captureSize(c)}</Cell>
           <Cell col={11} className="tabnum text-fg-dim">{formatDuration(c.durationMs)}</Cell>
         </div>
       </ContextMenu.Trigger>
@@ -1015,13 +922,10 @@ function Row({
           <MenuItem onSelect={() => onToggleMark(c.id)}>{marked ? 'Unmark' : 'Mark'} row</MenuItem>
           {op ? (
             <>
-              <MenuItem onSelect={() => onFilterOp(op)}>Filter to {op}</MenuItem>
-              <MenuItem onSelect={() => onExcludeOp(op)}>Exclude {op}</MenuItem>
+              <MenuItem onSelect={() => onAddTerm(`op:${op}`)}>Filter to {op}</MenuItem>
+              <MenuItem onSelect={() => onAddTerm(`-op:${op}`)}>Exclude {op}</MenuItem>
             </>
           ) : null}
-          <MenuItem onSelect={() => onFilterOp(`*`)} disabled>
-            Send to Replay — needs the replay UI (§U4)
-          </MenuItem>
         </ContextMenu.Content>
       </ContextMenu.Portal>
     </ContextMenu.Root>
@@ -1055,20 +959,11 @@ function Cell({
   );
 }
 
-function MenuItem({
-  children,
-  onSelect,
-  disabled,
-}: {
-  children: React.ReactNode;
-  onSelect?: () => void;
-  disabled?: boolean;
-}) {
+function MenuItem({ children, onSelect }: { children: React.ReactNode; onSelect: () => void }) {
   return (
     <ContextMenu.Item
-      disabled={disabled}
       onSelect={onSelect}
-      className="cursor-default rounded-sm px-2 py-1 outline-none data-[disabled]:text-fg-mute data-[highlighted]:bg-accent-dim"
+      className="cursor-default rounded-sm px-2 py-1 outline-none data-[highlighted]:bg-accent-dim"
     >
       {children}
     </ContextMenu.Item>
@@ -1083,14 +978,7 @@ interface AddFilterProps {
   onPick: (term: string) => void;
 }
 
-/**
- * A menu that APPENDS a term to the query rather than holding filter state.
- *
- * One-way on purpose. The dropdowns this replaces were a second source of truth
- * that had to be kept in step with the text box; writing into the query instead
- * means there is one thing to read, and it is the thing you can copy and send to
- * someone else.
- */
+/** A menu that APPENDS a term to the query; it holds no filter state of its own. */
 function AddFilter({ label, prefix, options, labels, onPick }: AddFilterProps) {
   if (options.length === 0) return null;
   return (

@@ -15,18 +15,10 @@
  * and must never be persisted or streamed; only a RedactedSession may cross
  * those boundaries.
  */
-import { isAuthFailure, newId } from '@sluice/core';
-import type {
-  App,
-  AppMcpTool,
-  AppRedaction,
-  AppToolContext,
-  CredentialProvider,
-  Session,
-  WorkspaceInfo,
-} from '@sluice/core';
-import { obj, str } from '@sluice/adapter-sdk';
-import { ADAPTER_ID, API_ORIGIN, CHROME_UA, notionAdapter } from './notion-adapter.js';
+import { errorMessage, newId } from '@sluice/core';
+import type { App, AppMcpTool, AppRedaction, AppToolContext, CredentialProvider } from '@sluice/core';
+import { localSessionCredentials, obj, replayAttempt, safeJson, str } from '@sluice/adapter-sdk';
+import { ADAPTER_ID, API_ORIGIN, notionAdapter, notionHeaders } from './notion-adapter.js';
 import { locateNotionProfile, readNotionCookieHeader } from './chrome-cookies.js';
 import { recordMaps, recordTitle, tableRecords } from './record-map.js';
 
@@ -43,92 +35,60 @@ import { recordMaps, recordTitle, tableRecords } from './record-map.js';
  * A VALUE pattern is the durable fix: it catches the token regardless of which
  * field name it is hiding under.
  */
+const TOKEN_V2 = /v0\d(?:%3A|:)user_token_or_cookies(?:%3A|:)[A-Za-z0-9_%\-+/=.]{16,}/;
+
+/** True when `text` is exactly one Notion-shaped `token_v2` value. */
+const isTokenV2 = (text: string): boolean => TOKEN_V2.exec(text)?.[0] === text;
+
 const notionRedaction: AppRedaction = {
-  patterns: [/v0\d(?:%3A|:)user_token_or_cookies(?:%3A|:)[A-Za-z0-9_%\-+/=.]{16,}/g],
-  // `headers` is deliberately empty. `x-notion-active-user-header` was masked
-  // here at first, on the reasoning that anything account-shaped should be —
-  // and that was wrong twice over. It carries a user UUID, not a credential
-  // (the credential is `token_v2`, caught by the pattern above and by the
-  // generic Cookie rule), and the same UUID appears unmasked all over every
-  // recordMap as `created_by_id`. So masking it protected nothing and destroyed
-  // the one field that records WHICH signed-in account a capture was made as —
-  // which is exactly what a downstream consumer needs to attribute the read to
-  // a principal. Without it, a downstream loader could not name who authorized a pull.
+  patterns: [new RegExp(TOKEN_V2.source, 'g')],
+  // `headers` is deliberately empty: x-notion-active-user-header is a user UUID, not a
+  // credential (token_v2 is, masked by the pattern above and the generic Cookie rule).
+  // It is unmasked in every recordMap as created_by_id, and it records which account a capture was made as.
 };
 
 // ── Credential provider (macOS Chrome local store) ─────────────────────────────
 
 /**
- * Is this "no Notion session here" (fine, return nothing) or "we could not read
- * it" (a real failure the user needs to see)? A blanket catch makes a locked
- * cookie DB, a denied Keychain prompt and a decrypt failure all indistinguishable
- * from being signed out — so the user is told to sign in when they already are.
+ * The passive probe (see `LocalSessionSpec.locate`) looks for a Notion SESSION
+ * cookie — `token_v2`, not merely any notion.com row. The workspace NAMES live
+ * behind the session, so it reports the account; `notion_workspaces` names them.
  */
-function isNoSessionError(err: unknown): boolean {
-  const msg = err instanceof Error ? err.message : String(err);
-  return /no chrome profile|not signed in|no .*cookie|not found|does not exist|ENOENT/i.test(msg);
-}
-
 const notionCredentials: CredentialProvider = {
-  /**
-   * Passive readiness probe: does a Chrome profile hold a Notion SESSION cookie?
-   * It counts rows without decrypting, so it never triggers a Keychain prompt.
-   * `sluice doctor` needs this — an app with no probe cannot be verified, and a
-   * broken Notion cookie would otherwise stay invisible until a tool failed.
-   */
-  listWorkspaces: async (): Promise<WorkspaceInfo[]> => {
-    if (process.platform !== 'darwin') return [];
-    try {
-      const found = locateNotionProfile();
-      if (!found) return [];
-      // The workspace NAMES live behind the session, and reading them would mean
-      // decrypting — which this probe must not do. So it reports the account,
-      // not the spaces, and `notion_workspaces` is the tool that names them.
-      return [{ id: 'notion', name: 'Notion', domain: 'notion.com', url: `${API_ORIGIN}/` }];
-    } catch {
-      return [];
-    }
-  },
-
-  extractSessions: async (): Promise<Session[]> => {
-    if (process.platform !== 'darwin') return [];
-    try {
+  ...localSessionCredentials({
+    adapterId: ADAPTER_ID,
+    label: 'Notion',
+    kind: 'notion-session',
+    workspace: { id: 'notion', name: 'Notion', domain: 'notion.com', url: `${API_ORIGIN}/` },
+    locate: () => locateNotionProfile(),
+    read: () => {
       const { cookieHeader, activeUserId } = readNotionCookieHeader();
-      const session: Session = {
-        id: newId('sess'),
-        adapterId: ADAPTER_ID,
-        label: 'Notion',
-        credentials: {
-          kind: 'notion-session',
-          values: { cookieHeader, ...(activeUserId ? { activeUserId } : {}) },
-          injection: {
-            headers: {
-              Cookie: 'cookieHeader',
-              'x-notion-active-user-header': 'activeUserId',
-            },
-          },
+      return {
+        values: { cookieHeader, ...(activeUserId ? { activeUserId } : {}) },
+        injection: {
+          headers: { Cookie: 'cookieHeader', 'x-notion-active-user-header': 'activeUserId' },
         },
-        discoveredAt: Date.now(),
-        source: 'local-store',
       };
-      return [session];
-    } catch (err) {
-      if (isNoSessionError(err)) return [];
-      throw new Error(
-        `Notion credential extraction failed: ${err instanceof Error ? err.message : String(err)}`,
-      );
-    }
-  },
+    },
+  }),
 
   /**
    * Paste-in fallback for a machine this cannot read Chrome on (not macOS, or a
    * browser that is not Chrome). `token_v2` alone is enough to authenticate;
    * the active user id is optional and only matters with several logins.
+   *
+   * Notion's own names win; `token` / `cookie` are the runner's generic pair.
+   * Either a bare `token_v2` value or a Cookie header carrying one is accepted,
+   * and only a Notion-SHAPED token: a pasted Slack or Toters credential must
+   * never become a cookie sent to notion.com.
    */
   sessionFromInput: (input) => {
-    const token = input.token_v2 ?? input.tokenV2 ?? input.cookieHeader;
-    if (!token) return undefined;
-    const cookieHeader = token.includes('=') ? token : `token_v2=${token}`;
+    const raw = (input.token_v2 ?? input.tokenV2 ?? input.cookieHeader ?? input.token ?? input.cookie)?.trim();
+    if (!raw) return undefined;
+    const bare = isTokenV2(raw);
+    const value = bare ? raw : /(?:^|;\s*)token_v2=([^;]+)/.exec(raw)?.[1]?.trim();
+    if (!value || !isTokenV2(value)) return undefined;
+    const cookieHeader = bare ? `token_v2=${raw}` : raw;
     return {
       id: newId('sess'),
       adapterId: ADAPTER_ID,
@@ -151,28 +111,9 @@ const notionCredentials: CredentialProvider = {
 
 // ── MCP tools ──────────────────────────────────────────────────────────────────
 
-const NOTION_TIMEOUT_MS = 30_000;
-
-function notionHeaders(cookieHeader: string, activeUserId?: string): Record<string, string> {
-  return {
-    Cookie: cookieHeader,
-    'User-Agent': CHROME_UA,
-    Accept: '*/*',
-    'Content-Type': 'application/json',
-    Origin: API_ORIGIN,
-    Referer: `${API_ORIGIN}/`,
-    'notion-audit-log-platform': 'web',
-    ...(activeUserId ? { 'x-notion-active-user-header': activeUserId } : {}),
-  };
-}
-
 /**
- * POST a Notion API endpoint with the browser session cookie.
- *
- * When the MCP server supplies a context the call goes through the shared replay
- * pipeline: it picks up the real client's learned request fingerprint, passes
- * the replay safety rails, and lands in the capture store like any other Sluice
- * request. Without one (direct library use) it falls back to `fetch`.
+ * POST a Notion API endpoint with the browser session cookie, through
+ * `replayAttempt`.
  *
  * Notion answers some failures with HTTP 200 and `isNotionError: true`, so the
  * status is not on its own enough to tell success from failure.
@@ -187,34 +128,11 @@ async function notionPost(
   const headers = notionHeaders(creds.cookieHeader, creds.activeUserId);
   const payload = JSON.stringify(body);
 
-  let status: number | null;
-  let text: string | null;
-  if (ctx) {
-    const capture = await ctx.replay({ method: 'POST', url, headers, body: payload });
-    status = capture.status;
-    text = capture.resBody;
-    if (isAuthFailure(capture)) {
-      throw new Error('The Notion session is expired — sign in again in Chrome.');
-    }
-  } else {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), NOTION_TIMEOUT_MS);
-    try {
-      const res = await fetch(url, { method: 'POST', headers, body: payload, signal: controller.signal });
-      status = res.status;
-      text = await res.text();
-    } finally {
-      clearTimeout(timer);
-    }
-  }
-
-  if (status === null || status >= 400) throw new Error(`HTTP ${status ?? 'error'} from ${operation}`);
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(text ?? 'null');
-  } catch {
-    throw new Error(`Notion returned a non-JSON body from ${operation}`);
-  }
+  const attempt = await replayAttempt({ method: 'POST', url, headers, body: payload }, ctx);
+  if (attempt.authFailed) throw new Error('The Notion session is expired — sign in again in Chrome.');
+  if (attempt.status === null || attempt.status >= 400) throw new Error(`HTTP ${attempt.status ?? 'error'} from ${operation}`);
+  const parsed = safeJson(attempt.body ?? 'null');
+  if (parsed === undefined) throw new Error(`Notion returned a non-JSON body from ${operation}`);
   const o = obj(parsed);
   if (!o) throw new Error(`Notion returned an unexpected body from ${operation}`);
   if (o.isNotionError === true) {
@@ -223,22 +141,21 @@ async function notionPost(
   return o;
 }
 
-function withCredentials<T>(run: (creds: { cookieHeader: string; activeUserId?: string }) => Promise<T>) {
-  return async (): Promise<T | { error: string }> => {
-    try {
-      const { cookieHeader, activeUserId } = readNotionCookieHeader();
-      return await run({ cookieHeader, activeUserId });
-    } catch (err) {
-      return { error: err instanceof Error ? err.message : String(err) };
-    }
-  };
+async function withCredentials<T>(
+  run: (creds: { cookieHeader: string; activeUserId?: string }) => Promise<T>,
+): Promise<T | { error: string }> {
+  try {
+    return await run(readNotionCookieHeader());
+  } catch (err) {
+    return { error: errorMessage(err) };
+  }
 }
 
 /**
  * A Notion page id out of whatever the caller had to hand.
  *
  * Notion URLs end in a 32-character hex id with no dashes, usually glued to a
- * slugified title (`…/Launch-checklist-7bf74c6fdcff4013a680bf4fd4e5a048`),
+ * slugified title (`…/Launch-checklist-0000000000004000800000000000a001`),
  * and the API only accepts the dashed uuid form. Accepting the URL is not a
  * convenience: pasting one is how anybody actually refers to a Notion page.
  */
@@ -246,10 +163,8 @@ export function toPageId(input: string): string | undefined {
   const trimmed = input.trim();
   const dashed = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i.exec(trimmed);
   if (dashed) return dashed[0].toLowerCase();
-  // Match the 32-hex run IN PLACE, bounded on both sides. Stripping dashes from
-  // the whole string first — the obvious implementation — splices the slug into
-  // the id: `…some-title-7bf74c6f…` became `e7bf74c6-fdcf-…`, a valid-looking
-  // uuid for a page that does not exist.
+  // Match the 32-hex run in place, bounded both sides: stripping dashes from the whole
+  // string first splices the slug's tail into the id.
   const bare = /(?<![0-9a-f])[0-9a-f]{32}(?![0-9a-f])/i.exec(trimmed);
   if (!bare) return undefined;
   const h = bare[0].toLowerCase();
@@ -274,7 +189,7 @@ async function listWorkspacesTool(ctx?: AppToolContext): Promise<unknown> {
       }
     }
     return { spaces, teamspaces: teams };
-  })();
+  });
 }
 
 async function readPageTool(args: Record<string, unknown>, ctx?: AppToolContext): Promise<unknown> {
@@ -310,7 +225,7 @@ async function readPageTool(args: Record<string, unknown>, ctx?: AppToolContext)
       return { pageId, title: '', blocks: [], note: 'No blocks returned — the page is empty, deleted, or not shared with this account.' };
     }
     return { pageId, title, blockCount: blocks.length, blocks, commentCount: comments.length };
-  })();
+  });
 }
 
 const notionMcpTools: AppMcpTool[] = [
@@ -346,11 +261,8 @@ export {
   parseNotionCapture,
   classifyNotionCapture,
   notionNextCursors,
+  notionHeaders,
   reconcileNotion,
-  ADAPTER_ID,
-  API_ORIGIN,
-  CHROME_UA,
 } from './notion-adapter.js';
-export { readNotionCookieHeader, locateNotionProfile } from './chrome-cookies.js';
-export type { NotionCookieHeader } from './chrome-cookies.js';
-export { recordMaps, recordValue, recordTitle, recordTs, plainText, tableRecords } from './record-map.js';
+export { readNotionCookieHeader } from './chrome-cookies.js';
+export { plainText, recordValue } from './record-map.js';

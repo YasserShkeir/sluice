@@ -7,7 +7,7 @@
 </head>
 <body>
 <h1>Replay</h1>
-<p class="subtitle">Reading your session without being able to act as you</p>
+<p class="subtitle">Reading your session, with rails that refuse what looks like a write</p>
 <div class="rule"></div>
 
 <div class="body">
@@ -23,13 +23,14 @@
   </div>
 
   <div class="panel">
-    <header><h2>Replay safety rails<small>three independent limits; a request must clear all three</small></h2><span class="meta">interceptor/src/replay-policy.ts · core/src/replay-deny.ts</span></header>
+    <header><h2>Replay safety rails<small>four independent limits; a request must clear all four</small></h2><span class="meta">interceptor/src/replay-policy.ts · core/src/replay-deny.ts</span></header>
     <div class="row">
       <div class="card red"><h3>1 · Method</h3><p>GET, HEAD and POST only. PUT / PATCH / DELETE are refused outright — they can only mutate.<br><span class="mono">→ method_not_allowed</span></p></div>
       <div class="card red"><h3>2 · Operation</h3><p>Matched against the path, query <b>and</b> body, because a service can POST for an ordinary read — <span class="mono">chat.post* · admin.* · files.upload|delete · conversations.create|invite · reactions · oauth|auth.token · GraphQL mutation</span>.<br><span class="mono">→ operation_not_allowed</span></p></div>
-      <div class="card red"><h3>3 · Budget</h3><p>A process-global token bucket — 60 requests per 60s — plus single-flight serialization, shared by the CLI, the dashboard, sync and every MCP tool.<br><span class="mono">→ rate_budget_exhausted</span></p></div>
+      <div class="card red"><h3>3 · Host</h3><p>The URL must be one of the owning app's declared hosts or a subdomain of one.<br><span class="mono">→ host_not_allowed</span></p></div>
+      <div class="card red"><h3>4 · Budget</h3><p>A process-global token bucket — 60 requests per 60s — plus single-flight serialization, shared by the CLI, the dashboard, sync and every MCP tool.<br><span class="mono">→ rate_budget_exhausted</span></p></div>
     </div>
-    <p class="note tight">Sluice can read your session; it cannot act as you. That property is enforced here rather than in the UI, and the same three gates apply to every step of a multi-step flow.</p>
+    <p class="note tight">Best-effort heuristics, not a proof of non-mutation: enforced here rather than in the UI, and on every step of a multi-step flow.</p>
   </div>
 
   <div class="panel">
@@ -52,7 +53,7 @@
     <div class="row">
       <div class="card blue"><h3>Learned offline</h3><p><span class="mono">learn-flows</span> clusters observed bursts into templates. MCP only reads and replays them, and templates never train on replay traffic.</p></div>
       <div class="card blue"><h3>Paced, not chained</h3><p>Each step waits the median offset measured <i>from the primary</i>, capped at 2s; skipping a soft companion cannot desync the rest. Whole flow: 120s.</p></div>
-      <div class="card red"><h3>One extra rail</h3><p>Each step is also checked against the owning adapter's host list, and an unresolvable path id fails the build rather than guessing.</p></div>
+      <div class="card red"><h3>Extra build-time rails</h3><p>Each step is checked at build time: https only, the owning adapter's hosts, a POST must match one of the adapter's read actions (fail-closed), and an unresolvable path id fails the build rather than guessing.</p></div>
     </div>
   </div>
 

@@ -8,15 +8,6 @@
  * as the capture and no more, which is what `gmail_sync_status` exists to say out
  * loud.
  *
- * They lived in `packages/mcp/src/server.ts` until `AppToolContext` grew a
- * read-only store. `AppToolContext` used to carry nothing but `replay` — one live
- * network request — so a store-backed app tool could not be written at all, and
- * four Gmail tools were compiled into the MCP server's own spine instead. That
- * cost two things worth naming: `@sluice/apps` is meant to be the only module
- * that knows a concrete adapter id, and the app catalog computes its MCP flag
- * from `mcpTools()` — so the dashboard reported Gmail as contributing none while
- * `sluice-mcp` served four.
- *
  * Every tool is total against an empty store: a Sluice-backed MCP is queried
  * before anything has been captured, because on a fresh install that is the FIRST
  * thing that happens. Returning nothing is an answer; throwing is a bug report
@@ -29,8 +20,8 @@
  * `gmail_sync_status` is the tool that says which accounts exist at all;
  * `gmail_get_thread` needs no such parameter and says why above itself.
  */
-import { num, str } from '@sluice/adapter-sdk';
-import type { AppMcpTool, AppToolContext, Item, ReadOnlyStore, Workspace } from '@sluice/core';
+import { isoTime, pageArgs, previewText, requireStore, str } from '@sluice/adapter-sdk';
+import type { AppMcpTool, Item, ReadOnlyStore, Workspace } from '@sluice/core';
 import { z } from 'zod';
 import type { AddressRef } from './gmail-adapter.js';
 import {
@@ -45,7 +36,6 @@ import {
 
 // ── Shared shapes ────────────────────────────────────────────────────────────────
 
-const DEFAULT_PAGE = 50;
 const MAX_PAGE = 500;
 
 /**
@@ -57,9 +47,6 @@ const MAX_PAGE = 500;
  */
 const MAX_THREAD_MESSAGES = 500;
 
-/** How much body text a list entry carries before it stops being a preview. */
-const SNIPPET_CHARS = 240;
-
 /**
  * The most rows one paged read will pull out of the store.
  *
@@ -70,27 +57,6 @@ const SNIPPET_CHARS = 240;
  * request into a full table read.
  */
 const MAX_ROW_SCAN = 20_000;
-
-interface Page {
-  limit: number;
-  offset: number;
-}
-
-/**
- * The page an agent asked for.
- *
- * `offset` is what was missing: an agent facing thousands of threads used to get
- * the first N and had no way to walk on — the tool simply had no word for "the
- * next fifty".
- */
-function page(args: Record<string, unknown>): Page {
-  const limit = num(args.limit);
-  const offset = num(args.offset);
-  return {
-    limit: limit !== undefined && limit > 0 ? Math.min(Math.floor(limit), MAX_PAGE) : DEFAULT_PAGE,
-    offset: offset !== undefined && offset > 0 ? Math.floor(offset) : 0,
-  };
-}
 
 const PAGE_SCHEMA = {
   limit: z.number().int().positive().max(MAX_PAGE).optional(),
@@ -104,23 +70,6 @@ const PAGE_SCHEMA = {
  * one-account mailbox, which is most of them, never has to say anything.
  */
 const ACCOUNT_SCHEMA = { account: z.string().optional() };
-
-/**
- * The store, or a refusal that names what is missing.
- *
- * `AppToolContext.store` is optional so that adding it broke no existing app or
- * host, which means a tool that needs it has to check. Throwing is right here:
- * the MCP server turns a thrown error into a tool error with a message, and "I
- * was not given a store" is something the operator can fix, unlike an empty list.
- */
-function requireStore(ctx?: AppToolContext): ReadOnlyStore {
-  if (ctx?.store === undefined) {
-    throw new Error(
-      'This tool reads the Sluice capture store, and the host did not provide one. Run it through `sluice-mcp`.',
-    );
-  }
-  return ctx.store;
-}
 
 // ── Accounts ─────────────────────────────────────────────────────────────────────
 
@@ -212,23 +161,6 @@ function labelContainers(
 }
 
 /**
- * The epoch alongside an ISO string, because deciding "is this stale?" from a
- * millisecond integer is arithmetic a model should not have to do — and
- * `new Date(NaN).toISOString()` THROWS, so the guard is not decoration.
- */
-function isoOf(ts: number | null | undefined): string | null {
-  if (ts === null || ts === undefined) return null;
-  const at = new Date(ts);
-  return Number.isNaN(at.getTime()) ? null : at.toISOString();
-}
-
-/** A one-line preview: whitespace collapsed, then clipped. */
-function preview(text: string): string {
-  const flat = text.replace(/\s+/g, ' ').trim();
-  return flat.length > SNIPPET_CHARS ? `${flat.slice(0, SNIPPET_CHARS)}…` : flat;
-}
-
-/**
  * The body of a stored message item.
  *
  * `raw` is the message record and is the truth; `text` is the flattened
@@ -283,7 +215,7 @@ function foldThreadRow(into: Map<string, ThreadSummary>, item: Item): void {
   if (existing !== undefined) {
     if (item.ts > existing.ts) {
       existing.ts = item.ts;
-      existing.date = isoOf(item.ts);
+      existing.date = isoTime(item.ts);
     }
     return;
   }
@@ -292,10 +224,10 @@ function foldThreadRow(into: Map<string, ThreadSummary>, item: Item): void {
     threadId: item.id,
     workspaceId: item.workspaceId,
     ts: item.ts,
-    date: isoOf(item.ts),
+    date: isoTime(item.ts),
     subject: view.subject,
     from: view.from ?? null,
-    snippet: preview(item.text),
+    snippet: previewText(item.text),
     messageCount: view.messageCount,
     messagesHeld: 0,
     labelId: item.containerId,
@@ -321,7 +253,7 @@ function foldMessage(into: Map<string, ThreadSummary>, item: Item): void {
   if (existing !== undefined) {
     if (item.ts > existing.ts) {
       existing.ts = item.ts;
-      existing.date = isoOf(item.ts);
+      existing.date = isoTime(item.ts);
     }
     return;
   }
@@ -330,10 +262,10 @@ function foldMessage(into: Map<string, ThreadSummary>, item: Item): void {
     threadId,
     workspaceId: item.workspaceId,
     ts: item.ts,
-    date: isoOf(item.ts),
+    date: isoTime(item.ts),
     subject: parts.subject,
     from: parts.from,
-    snippet: preview(parts.body),
+    snippet: previewText(parts.body),
     messageCount: 0,
     messagesHeld: 0,
   });
@@ -348,10 +280,9 @@ function foldMessage(into: Map<string, ThreadSummary>, item: Item): void {
  * contributes a row per message it holds and a row per label view that listed it,
  * so the newest 5 rows may name only 3 threads — the two that were missed then
  * reappear when a later page reads further, and page 2 repeats a thread from page
- * 1. Measured on the Gmail recording before this loop existed: `limit 5` and
- * `limit 5, offset 5` shared one thread. Account-scoped search has the same shape
- * with a different survivor: the store's FTS query cannot filter by workspace, so
- * the other account's hits are read and dropped.
+ * 1. Account-scoped search has the same shape with a different survivor: the
+ * store's FTS query cannot filter by workspace, so the other account's hits are
+ * read and dropped.
  *
  * Reading `wanted` survivors out of each stream is what makes the merge exact for
  * the whole page: a row in the true top-N has its highest-timestamped sighting at
@@ -387,7 +318,7 @@ const listLabels: AppMcpTool = {
   run: async (args, ctx) => {
     const store = requireStore(ctx);
     const workspaceId = resolveAccount(store, str(args.account));
-    const { limit, offset } = page(args);
+    const { limit, offset } = pageArgs(args, { maxLimit: MAX_PAGE });
     const addresses = new Map(gmailAccounts(store).map((w) => [w.id, w.domain ?? null]));
     const labels = store
       .listContainers(workspaceId)
@@ -413,7 +344,7 @@ const listLabels: AppMcpTool = {
         // about a mailbox from a fiftieth of it is the whole hazard here.
         total: container.itemCount ?? null,
         unread: container.unreadCount ?? null,
-        held: store.listItems(container.id, { limit: MAX_ROW_SCAN }).length,
+        held: store.countItems({ containerId: container.id }),
       })),
     };
   },
@@ -428,7 +359,7 @@ const listThreads: AppMcpTool = {
     const store = requireStore(ctx);
     const workspaceId = resolveAccount(store, str(args.account));
     const labelId = str(args.labelId);
-    const { limit, offset } = page(args);
+    const { limit, offset } = pageArgs(args, { maxLimit: MAX_PAGE });
     // Both sources are read down to the end of the requested page rather than to
     // its start, since neither is sorted with respect to the other. One past it,
     // so "is there another page" is answerable without a second query.
@@ -533,7 +464,7 @@ const getThread: AppMcpTool = {
       return {
         id: item.id,
         ts: item.ts,
-        date: isoOf(item.ts),
+        date: isoTime(item.ts),
         subject: parts.subject,
         from: parts.from,
         to: view.to,
@@ -570,10 +501,10 @@ const getThread: AppMcpTool = {
       // this tool — but with two mailboxes in one store a reader still has to be
       // told whose mail it is holding.
       workspaceId: held[0]?.workspaceId ?? listed?.workspaceId ?? null,
-      snippet: listed === undefined ? null : preview(listed.text),
+      snippet: listed === undefined ? null : previewText(listed.text),
       note:
         messages.length === 0
-          ? 'Sluice has not captured this thread\'s messages. Open the thread in Gmail with capture running, or replay the "gmail.threads.list" action, then call this again.'
+          ? 'Sluice has not captured this thread\'s messages. Open the thread in Gmail with capture running, then call this again.'
           : undefined,
       messages,
     };
@@ -590,7 +521,7 @@ const search: AppMcpTool = {
     const workspaceId = resolveAccount(store, str(args.account));
     const query = str(args.query);
     if (query === undefined) throw new Error('gmail_search needs a query.');
-    const { limit, offset } = page(args);
+    const { limit, offset } = pageArgs(args, { maxLimit: MAX_PAGE });
 
     // The FTS index, not a LIKE scan, and the adapter scope goes INTO the query so
     // the limit is spent on mail rather than on whatever else was captured.
@@ -629,10 +560,10 @@ const search: AppMcpTool = {
         kind: isMessage ? 'message' : 'thread',
         threadId: item.threadId ?? item.id,
         ts: item.ts,
-        date: isoOf(item.ts),
+        date: isoTime(item.ts),
         subject: parts?.subject ?? view?.subject ?? '',
         from: parts?.from ?? view?.from ?? null,
-        snippet: preview(parts?.body ?? item.text),
+        snippet: previewText(parts?.body ?? item.text),
       };
     });
 
@@ -648,6 +579,33 @@ const search: AppMcpTool = {
   },
 };
 
+/** Label, thread and message counts for one workspace, or for all when it is omitted. */
+function coverage(store: ReadOnlyStore, workspaceId?: string) {
+  const kinds = store
+    .listContainers(workspaceId)
+    .filter((c) => c.adapterId === ADAPTER_ID)
+    .map((c) => containerKind(c.id));
+  // Threads and messages are both Items and are told apart by `threadId`: the
+  // batch view emits one item per thread and sets none, the thread fetcher emits
+  // one per message and sets the thread it is in. Counting them together reports
+  // a mailbox with more conversations than it has.
+  const messages = store.countItems({ adapterId: ADAPTER_ID, workspaceId, threaded: true });
+  return {
+    labels: kinds.filter((k) => k === 'label').length,
+    threads: store.countItems({ adapterId: ADAPTER_ID, workspaceId, threaded: false }),
+    // Threads whose messages were fetched. Not a subset of `threads`: a thread
+    // opened from a view Sluice never captured has messages and no batch-view
+    // row, which is why the two numbers are reported rather than one. The
+    // "label not recovered" bucket is neither, and is counted as neither.
+    fetchedThreads: kinds.filter((k) => k === 'thread').length,
+    messages,
+    // A message item exists only because the thread fetcher parsed one, and that
+    // is the only place a body comes from — so this tells a snippet-only store
+    // (batch views alone) from a fully-parsed one without reading any mail.
+    bodiesPresent: messages > 0,
+  };
+}
+
 /**
  * How much of ONE account is in the store.
  *
@@ -658,15 +616,6 @@ const search: AppMcpTool = {
  * accounts exist — there is no other tool that lists them.
  */
 function accountCoverage(store: ReadOnlyStore, workspace: Workspace) {
-  const containers = store
-    .listContainers(workspace.id)
-    .filter((c) => c.adapterId === ADAPTER_ID)
-    .map((c) => containerKind(c.id));
-  const messages = store.countItems({
-    adapterId: ADAPTER_ID,
-    workspaceId: workspace.id,
-    threaded: true,
-  });
   return {
     id: workspace.id,
     name: workspace.name,
@@ -679,15 +628,7 @@ function accountCoverage(store: ReadOnlyStore, workspace: Workspace) {
     // that survives means the capture straddled an account switch, or that the
     // session never opened a message.
     identified: !isProvisionalWorkspaceId(workspace.id),
-    labels: containers.filter((k) => k === 'label').length,
-    threads: store.countItems({
-      adapterId: ADAPTER_ID,
-      workspaceId: workspace.id,
-      threaded: false,
-    }),
-    fetchedThreads: containers.filter((k) => k === 'thread').length,
-    messages,
-    bodiesPresent: messages > 0,
+    ...coverage(store, workspace.id),
   };
 }
 
@@ -698,16 +639,6 @@ const syncStatus: AppMcpTool = {
   inputSchema: {},
   run: async (_args, ctx) => {
     const store = requireStore(ctx);
-    const kinds = store
-      .listContainers()
-      .filter((c) => c.adapterId === ADAPTER_ID)
-      .map((c) => containerKind(c.id));
-    // Threads and messages are both Items and are told apart by `threadId`: the
-    // batch view emits one item per thread and sets none, the thread fetcher emits
-    // one per message and sets the thread it is in. Counting them together reports
-    // a mailbox with more conversations than it has.
-    const threads = store.countItems({ adapterId: ADAPTER_ID, threaded: false });
-    const messages = store.countItems({ adapterId: ADAPTER_ID, threaded: true });
     const newestCaptureTs = store.newestCaptureTs({ adapterId: ADAPTER_ID });
     return {
       adapterId: ADAPTER_ID,
@@ -715,25 +646,14 @@ const syncStatus: AppMcpTool = {
       // The totals stay alongside the per-account rows: "how much mail is in this
       // store" is still a question, and it is the one a single-account user is
       // actually asking.
-      labels: kinds.filter((k) => k === 'label').length,
-      threads,
-      // Threads whose messages were fetched. Not a subset of `threads`: a thread
-      // opened from a view Sluice never captured has messages and no batch-view
-      // row, which is why the two numbers are reported rather than one. The
-      // "label not recovered" bucket is neither, and is counted as neither.
-      fetchedThreads: kinds.filter((k) => k === 'thread').length,
-      messages,
-      // A message item exists only because the thread fetcher parsed one, and that
-      // is the only place a body comes from — so this tells a snippet-only store
-      // (batch views alone) from a fully-parsed one without reading any mail.
-      bodiesPresent: messages > 0,
+      ...coverage(store),
       // Captures are NOT split per account. A capture is raw traffic and carries
       // no workspace — attribution happens in the parser — so the only way to
       // divide these would be to re-read every path, which is a different fact
       // (how many calls) than the per-account ones (how much mail).
       captures: store.countCaptures({ adapterId: ADAPTER_ID }),
       newestCaptureTs,
-      newestCaptureAt: isoOf(newestCaptureTs),
+      newestCaptureAt: isoTime(newestCaptureTs),
     };
   },
 };

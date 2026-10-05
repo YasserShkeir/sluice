@@ -1,10 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 /**
  * The capture factory every test needs.
- *
- * Four packages each grew a byte-similar private copy of this — app-slack,
- * app-trello, app-fast and core — which meant a new required field on `Capture`
- * had to be added in four places, and the four drifted in what they defaulted.
  */
 import type { Capture } from '@sluice/core';
 

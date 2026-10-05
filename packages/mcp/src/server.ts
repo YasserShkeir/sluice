@@ -22,11 +22,36 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { z } from 'zod';
 import type { ZodRawShape } from 'zod';
 
-import { decodeBody, readOnlyStore, redactText, SqliteStore } from '@sluice/core';
-import type { App, AppToolContext, Capture, ReplayAction, Session } from '@sluice/core';
+import {
+  anonymousSession,
+  decodeBody,
+  redactedErrorMessage as errText,
+  flowStepSummary,
+  flowSummary,
+  paramSourcesSummary,
+  persistCapture,
+  readOnlyStore,
+  safeJsonObject,
+  SqliteStore,
+  templateStepSummary,
+  templateSummary,
+  workspaceOfParams,
+} from '@sluice/core';
+import type {
+  App,
+  AppToolContext,
+  Capture,
+  FlowTemplate,
+  ReplayAction,
+  Session,
+  UpsertCounts,
+} from '@sluice/core';
 import { enabledApps, installExternalAdapters } from '@sluice/apps';
-import { buildFlowStepRequest, faithfulReplayRequest } from '@sluice/cartographer';
-import { mapAuthFlow, replayWithRefresh, runFlowReplay, runReplay, resolveJsonPath } from '@sluice/interceptor';
+// The same bound the dashboard's replay.run / flow.run frames use.
+import { replayParamsSchema } from '@sluice/protocol';
+import { FLOW_TEMPLATE_VERSION, faithfulReplayRequest, flowStepBuilder } from '@sluice/cartographer';
+import { mapAuthFlow, replayWithRefresh, runFlowReplay, runReplay } from '@sluice/interceptor';
+import type { FlowReplayResult } from '@sluice/interceptor';
 
 // ── MCP result helpers ──────────────────────────────────────────────────────────
 
@@ -47,74 +72,43 @@ const errorResult = (message: string): TextResult => ({
   isError: true,
 });
 
-const errText = (e: unknown): string =>
-  redactText(e instanceof Error ? e.message : String(e));
-
-/**
- * The workspace a replay's arguments already imply, or undefined.
- *
- * Reads the action's own param declarations rather than guessing at names: a
- * param of kind `containerId` holds a container id, and a container row carries
- * its workspace. That is the whole inference, and it is exact when it fires —
- * no heuristics on key names, which would break the moment an adapter called
- * something `board` instead of `channel`.
- */
-export function workspaceOfParams(
-  store: SqliteStore,
-  action: ReplayAction,
-  params: Record<string, string> | undefined,
-): string | undefined {
-  if (!params) return undefined;
-  for (const p of action.params) {
-    if (p.kind !== 'containerId') continue;
-    const value = params[p.name];
-    if (value === undefined || value.length === 0) continue;
-    const owner = store.listContainers().find((c) => c.id === value)?.workspaceId;
-    if (owner !== undefined) return owner;
-  }
-  return undefined;
+/** Which session to act as: an agent's explicit `workspaceId`, else one `inferred` from the request's params. */
+interface SessionWant {
+  workspaceId?: string;
+  inferred?: string;
 }
 
 /**
- * Pick exactly one session: explicit/inferred workspace, or the sole session.
- * Multi-session without a workspace is an error — never silent sessions[0].
+ * Pick exactly one session — never a silent sessions[0]. An explicit
+ * `workspaceId` must match a signed-in session. An `inferred` one picks its
+ * owner when one is signed in; a workspace nobody owns (a synthetic or
+ * unreconciled id) says nothing about which account to use, so it falls
+ * through to the sole session, as the runner's picker does. Several sessions
+ * with nothing to choose by is an error.
  */
-export function pickSession(
+function pickSession(
   sessions: Session[],
-  workspaceId: string | undefined,
-  appLabel = 'app',
+  want: SessionWant,
+  appLabel: string,
 ): { ok: true; session: Session } | { ok: false; error: string } {
-  const inferred = workspaceId;
-  const picked = inferred
-    ? sessions.find((s) => s.workspaceId === inferred)
-    : sessions.length === 1
-      ? sessions[0]
-      : undefined;
-  if (picked) return { ok: true, session: picked };
+  const id = want.workspaceId || want.inferred;
+  const owner = id === undefined ? undefined : sessions.find((s) => s.workspaceId === id);
+  if (owner) return { ok: true, session: owner };
   const have = sessions.map((s) => `${s.workspaceId ?? '(unknown)'} (${s.label})`).join(', ');
-  if (inferred) {
+  if (want.workspaceId) {
     return {
       ok: false,
-      error: `No signed-in workspace matched "${inferred}". Have: ${have || '(none)'}.`,
+      error: `No signed-in workspace matched "${want.workspaceId}". Have: ${have || '(none)'}.`,
     };
   }
+  const [only] = sessions;
+  if (sessions.length === 1 && only) return { ok: true, session: only };
   if (sessions.length === 0) return { ok: false, error: 'No signed-in workspace found.' };
   return {
     ok: false,
     error: `${sessions.length} ${appLabel} workspaces are signed in. Pass workspaceId. Have: ${have}.`,
   };
 }
-
-// ── Raw SQLite access (structural, to stay off better-sqlite3's type surface) ────
-
-interface RawStatement {
-  all(params?: Record<string, unknown>): unknown[];
-  get(params?: Record<string, unknown>): unknown;
-}
-interface RawDb {
-  prepare(sql: string): RawStatement;
-}
-const rawDb = (store: SqliteStore): RawDb => store.db as unknown as RawDb;
 
 // ── Store location ──────────────────────────────────────────────────────────────
 
@@ -129,135 +123,252 @@ export function openStore(): SqliteStore {
 }
 
 /**
- * The stand-in session for apps with no credential provider (fast.com). Its
- * `values` are empty by construction, so it can never carry a secret and can
- * never justify a Keychain prompt.
+ * The session a replay for `app` runs under. Apps WITH a credential provider
+ * cold-start-extract a live in-memory session (SECRET: it goes to the request
+ * builder and nowhere else); credential-free apps (e.g. fast.com) get the
+ * anonymous empty session, which the builder is free to ignore.
+ *
+ * Exported for tests; not part of the package surface.
  */
-const SYNTHETIC_SESSION: Session = {
-  id: '',
-  adapterId: '',
-  label: '',
-  credentials: { kind: 'none', values: {}, injection: {} },
-  discoveredAt: 0,
-  source: 'manual',
-};
+export async function acquireSession(
+  app: App,
+  want: SessionWant,
+): Promise<{ ok: true; session: Session } | { ok: false; error: string }> {
+  if (!app.credentials) return { ok: true, session: anonymousSession(app.id) };
+  let sessions: Session[];
+  try {
+    sessions = await app.credentials.extractSessions();
+  } catch (e) {
+    return { ok: false, error: `Could not acquire a session: ${errText(e)}` };
+  }
+  return pickSession(sessions, want, app.displayName);
+}
 
-/** Secret-free template summary for MCP describe/list. */
-function summarizeTemplate(t: {
-  id: string;
-  adapterId: string;
-  primaryKey: string;
-  label?: string;
-  sampleCount: number;
-  version: number;
-  learnedAt: number;
-  steps: Array<{
-    seq: number;
-    role: string;
-    method: string;
-    path: string;
-    operation?: string;
-    required: boolean;
-    support: number;
-    delayMsP50: number;
-    offsetFromPrimaryMsP50?: number;
-    offsetSpreadMs?: number;
-    unreproducible?: boolean;
-    unreproducibleReason?: string;
-    params?: Record<string, { kind: string; name?: string; fromStep?: number; jsonPath?: string; reason?: string }>;
-  }>;
-  flowParams: Array<{ name: string; required: boolean }>;
-}): Record<string, unknown> {
-  const steps = t.steps.map((s) => ({
-    seq: s.seq,
-    role: s.role,
-    method: s.method,
-    path: s.path,
-    operation: s.operation,
-    required: s.required,
-    support: s.support,
-    delayMsP50: s.delayMsP50,
-    /** Median ms from primary start (may be negative for pre-primary auth/bootstrap). */
-    offsetFromPrimaryMsP50: s.offsetFromPrimaryMsP50,
-    offsetSpreadMs: s.offsetSpreadMs,
-    unreproducible: s.unreproducible || undefined,
-    unreproducibleReason: s.unreproducibleReason,
-    params: s.params
-      ? Object.fromEntries(
-          Object.entries(s.params).map(([k, src]) => [
-            k,
-            {
-              kind: src.kind,
-              name: src.name,
-              fromStep: src.fromStep,
-              jsonPath: src.jsonPath,
-              reason: src.reason,
-            },
-          ]),
-        )
-      : undefined,
-  }));
-  const apiSteps = steps.filter(
-    (s) =>
-      s.role === 'primary' ||
-      (s.operation &&
-        !/^assets?\b/i.test(s.operation) &&
-        !/\.(js|css|png|svg)(\?|$)/i.test(s.path)),
-  );
-  const negOffsets = steps.filter(
-    (s) => typeof s.offsetFromPrimaryMsP50 === 'number' && s.offsetFromPrimaryMsP50 < 0,
-  ).length;
-  return {
-    id: t.id,
-    adapterId: t.adapterId,
-    primaryKey: t.primaryKey,
-    label: t.label,
-    sampleCount: t.sampleCount,
-    version: t.version,
-    learnedAt: t.learnedAt,
-    flowParams: t.flowParams,
-    stepCount: steps.length,
-    /** Steps that look like API (not SPA bundles) — prefer these when explaining a flow. */
-    apiStepCount: apiSteps.length,
-    /** Pre-primary companions (auth/bootstrap). Replay fires them immediately if still pending. */
-    negativeOffsetSteps: negOffsets || undefined,
-    qualityNotes: templateQualityNotes(t.primaryKey, steps.length, apiSteps.length, t.sampleCount, negOffsets),
-    steps,
+/**
+ * The auth-failure refresh hook: re-extract and pick the SAME workspace as the
+ * session first picked (pass its `workspaceId`), strictly — a 401 after that
+ * workspace signed out must not retry as another account. Credential-free apps
+ * have nothing to refresh and must never be sent to a Keychain prompt they have
+ * no use for.
+ */
+function sessionRefresher(
+  app: App,
+  workspaceId: string | undefined,
+): (() => Promise<Session | undefined>) | undefined {
+  const credentials = app.credentials;
+  if (!credentials) return undefined;
+  return async () => {
+    const choice = pickSession(await credentials.extractSessions(), { workspaceId }, app.displayName);
+    return choice.ok ? choice.session : undefined;
   };
 }
 
-function templateQualityNotes(
-  primaryKey: string,
-  stepCount: number,
-  apiStepCount: number,
-  sampleCount: number,
-  negOffsets: number,
-): string[] {
+/**
+ * One of `app`'s replay actions, end to end: acquire the session (for the given
+ * workspace, else the one the params name), build and fingerprint the request,
+ * send it under the app's host rail, record every attempt, and on an auth
+ * failure re-extract the SAME workspace and retry once. The single path the
+ * `replay` tool and `ctx.replayAction` share. A session failure is returned; a
+ * build or send failure throws.
+ *
+ * Exported for tests; not part of the package surface.
+ */
+export async function replayActionFor(
+  store: SqliteStore,
+  app: App,
+  action: ReplayAction,
+  params: Record<string, string>,
+  workspaceId: string | undefined,
+): Promise<{ ok: true; capture: Capture; counts: UpsertCounts; refreshed: boolean } | { ok: false; error: string }> {
+  // An explicit workspace is strict; one read off the params is a hint.
+  const inferred = workspaceId === undefined ? workspaceOfParams(store, action, params) : undefined;
+  // In-memory SECRET session; passed only to the request builder below.
+  const choice = await acquireSession(app, { workspaceId, inferred });
+  if (!choice.ok) return choice;
+
+  // On an auth failure re-extract the local credential and retry once;
+  // nothing is cached — re-extraction IS the mechanism.
+  let refreshed = false;
+  let counts: UpsertCounts = { workspaces: 0, actors: 0, containers: 0, items: 0, edges: 0 };
+  let stored: Capture | undefined;
+  const capture = await replayWithRefresh(choice.session, {
+    // Rebuilt per attempt: the first request carries the STALE credential in
+    // its headers, so reusing it would send the dead cookie back.
+    build: (s) => faithfulReplayRequest(store, app.buildReplayRequest(action, params, s)),
+    run: (req) => runReplay(req, { allowedHosts: app.hosts }),
+    // Both attempts land in the store — the failed one is the evidence that
+    // makes "the session expired at 14:03" answerable later. The LAST attempt's
+    // counts are the answer; summing both would double-count.
+    record: (c) => {
+      ({ capture: stored, counts } = persistCapture(store, c, app));
+    },
+    refresh: sessionRefresher(app, choice.session.workspaceId),
+    onRetry: () => {
+      refreshed = true;
+    },
+  });
+  return { ok: true, capture: stored ?? capture, counts, refreshed };
+}
+
+/**
+ * Run one learned template under `session` through the flow rails (build-time
+ * host + read-action rails, then the runtime rails), record every step capture
+ * against `app` and keep the parent flow; `runFlowReplay` redacts error/step
+ * details. The single path `sluice_replay_flow` and `ctx.replayFlow` share.
+ */
+async function replayTemplate(
+  store: SqliteStore,
+  app: App,
+  tmpl: FlowTemplate,
+  params: Record<string, string>,
+  session: Session,
+): Promise<FlowReplayResult> {
+  const result = await runFlowReplay({
+    template: tmpl,
+    params,
+    session,
+    io: {
+      build: flowStepBuilder(tmpl, app),
+      run: (req) => runReplay(req, { allowedHosts: app.hosts }),
+      record: (c) => {
+        persistCapture(store, c, app);
+      },
+      refresh: sessionRefresher(app, session.workspaceId),
+    },
+  });
+  if (result.flow) {
+    try {
+      store.upsertFlow(result.flow);
+    } catch {
+      /* parent flow persist is best-effort */
+    }
+  }
+  return result;
+}
+
+/**
+ * A step that looks like an API call rather than an SPA bundle or static file.
+ * The primary always counts. One rule for list and describe, so the two views
+ * can never report different numbers for the same template.
+ */
+function isApiStep(s: { role: string; operation?: string; path: string }): boolean {
+  if (s.role === 'primary') return true;
+  return (
+    Boolean(s.operation) &&
+    !/^assets?\b/i.test(s.operation ?? '') &&
+    !/\.(js|css|png|svg)(\?|$)/i.test(s.path) &&
+    !/^\/assets\//i.test(s.path)
+  );
+}
+
+/** How much of a template is worth an agent's attention, and why not. */
+function templateQuality(t: FlowTemplate): {
+  apiStepCount: number;
+  negativeOffsetSteps: number;
+  qualityNotes: string[];
+} {
+  const apiStepCount = t.steps.filter(isApiStep).length;
+  const negativeOffsetSteps = t.steps.filter((s) => (s.offsetFromPrimaryMsP50 ?? 0) < 0).length;
   const notes: string[] = [];
-  if (/^assets?\b/i.test(primaryKey) || primaryKey === 'asset') {
+  if (t.version < FLOW_TEMPLATE_VERSION) {
+    notes.push(
+      "learned by an older Sluice — steps without a learned host, or non-GET steps outside the app's read actions, are refused; re-run `sluice learn-flows`",
+    );
+  }
+  if (/^assets?\b/i.test(t.primaryKey)) {
     notes.push('primary looks like a static asset — prefer another template for agent replay');
   }
-  if (sampleCount < 2) {
+  if (t.sampleCount < 2) {
     notes.push('single-sample template — timing and companions are less reliable until more bursts are learned');
   }
-  if (stepCount > 0 && apiStepCount / stepCount < 0.4) {
+  if (t.steps.length > 0 && apiStepCount / t.steps.length < 0.4) {
     notes.push('many non-API companions (SPA bundles); soft steps may skip at replay');
   }
-  if (negOffsets > 0) {
+  if (negativeOffsetSteps > 0) {
     notes.push(
       'some offsetFromPrimaryMsP50 values are negative (companions observed before the learned primary); pacing clamps those to immediate',
     );
   }
-  if (primaryKey.includes('graphql') || primaryKey.includes('gateway/api/gasv3')) {
+  if (t.primaryKey.includes('graphql') || t.primaryKey.includes('gateway/api/gasv3')) {
     notes.push(
       'gateway/GraphQL primaries often sit inside large page-load bursts — confirm flowParams and required steps before replay',
     );
   }
-  return notes;
+  return { apiStepCount, negativeOffsetSteps, qualityNotes: notes };
 }
 
-// FLOW_AGENT_GUIDANCE is inlined into tool descriptions so every MCP client
-// sees the same operational contract without reading a separate doc.
+/** Secret-free template summary for MCP describe: never a literal value or a request fingerprint. */
+function summarizeTemplate(t: FlowTemplate): Record<string, unknown> {
+  const q = templateQuality(t);
+  return {
+    ...templateSummary(t),
+    /** Steps that look like API (not SPA bundles) — prefer these when explaining a flow. */
+    apiStepCount: q.apiStepCount,
+    /** Pre-primary companions (auth/bootstrap). Replay fires them immediately if still pending. */
+    negativeOffsetSteps: q.negativeOffsetSteps || undefined,
+    qualityNotes: q.qualityNotes,
+    steps: t.steps.map((s) => ({ ...templateStepSummary(s), params: paramSourcesSummary(s.params) })),
+  };
+}
+
+/**
+ * The same pipeline `replay` uses, handed to an app's own MCP tools so their
+ * traffic is fingerprint-matched, rate-limited, sent under the app's host rail,
+ * and recorded — rather than escaping through a bare `fetch` nothing can see.
+ *
+ * Exported for tests; not part of the package surface.
+ */
+export function appToolContext(store: SqliteStore, app: App): AppToolContext {
+  return {
+    // Read-only by VALUE, not merely by type: `SqliteStore` satisfies
+    // `ReadOnlyStore` structurally, so passing it straight through would hand
+    // an app tool `insertCapture`, `pruneCaptures` and the raw `db` handle
+    // alongside the reads it actually needs.
+    store: readOnlyStore(store),
+    replay: async (base) => {
+      // One attempt, no host-side refresh: the tool's request carries its own
+      // credentials, so there is no Session to re-extract (apps that build their
+      // own auth refresh themselves). A tool that needs the app's session and
+      // its 401 retry uses replayAction below.
+      const capture = await runReplay(faithfulReplayRequest(store, base), { allowedHosts: app.hosts });
+      return persistCapture(store, capture, app).capture;
+    },
+    replayAction: async (actionId, actionParams, actionOpts) => {
+      // Only this app's own declared actions: its session never builds
+      // another app's request.
+      const action = app.listReplayActions().find((a) => a.id === actionId);
+      if (!action) throw new Error(`Unknown replay action "${actionId}" for ${app.id}`);
+      const out = await replayActionFor(store, app, action, actionParams ?? {}, actionOpts?.workspaceId);
+      if (!out.ok) throw new Error(out.error);
+      return out.capture;
+    },
+    replayFlow: async (templateId, flowParams, flowOpts) => {
+      const tmpl = store.getFlowTemplate(templateId)
+        ?? store.getFlowTemplateByPrimary(app.id, templateId);
+      // Sessions are adapter-scoped: this app's session never runs another
+      // app's template, even one whose steps its host rail would refuse.
+      if (!tmpl || tmpl.adapterId !== app.id) {
+        throw new Error(`Unknown flow template "${templateId}" for ${app.id}`);
+      }
+      const choice = await acquireSession(app, { workspaceId: flowOpts?.workspaceId });
+      if (!choice.ok) throw new Error(choice.error);
+      const result = await replayTemplate(store, app, tmpl, flowParams ?? {}, choice.session);
+      return {
+        ok: result.ok,
+        error: result.error,
+        flowId: result.flow?.id,
+        steps: result.steps.map((s) => ({
+          seq: s.seq,
+          status: s.status,
+          operation: s.operation,
+          captureId: s.captureId,
+          httpStatus: s.httpStatus,
+        })),
+      };
+    },
+  };
+}
+
 const FLOW_LIST_DESCRIPTION =
   "List observed/pinned interaction flows and learned multi-step templates from THIS machine's captures only. " +
   'Returns ids, primary ops, step counts, sampleCount, qualityNotes — never secrets, cookies, tokens, or bodies. ' +
@@ -273,11 +384,13 @@ const FLOW_DESCRIBE_DESCRIPTION =
   'offsetSpreadMs, param binding kinds (flowParam|bind|session|literal|unreproducible), qualityNotes. ' +
   'Never returns secrets, live tokens, or full bodies — binding kinds and names only. ' +
   'Agent guidance: required=false companions may soft-fail or skip; unreproducible steps are not guessed; ' +
-  'F4.4 build rails refuse write-shaped ops and hosts outside the adapter allowlist. Pass id, or adapterId+primaryKey.';
+  "F4.4 build rails refuse write-shaped ops, non-GET steps that match none of the app's replay actions, and hosts outside the adapter allowlist. " +
+  'Pass id, or adapterId+primaryKey.';
 
 const FLOW_REPLAY_DESCRIPTION =
-  'Run a learned multi-step flow template READ-ONLY through the same rails as single replay ' +
-  '(method allowlist GET|HEAD|POST, operation denylist, per-step budget, adapter hosts allowlist at build). ' +
+  'Run a learned multi-step flow template for reads through the same rails as single replay ' +
+  "(method allowlist GET|HEAD|POST, non-GET steps only when they match one of the app's replay actions, best-effort write-operation denylist, " +
+  'per-step budget, adapter hosts allowlist at build and at send). The rails are heuristics, not a proof that nothing is mutated. ' +
   "Built only from this machine's observed/pinned captures — never invents fingerprints or credentials. " +
   'Pacing prefers offsetFromPrimaryMsP50 (primary-anchored; cap 2s) so siblings keep observed deltas when a soft step skips; falls back to delayMsP50. ' +
   'Auth failure → optional session refresh → full flow restart once. ' +
@@ -294,7 +407,6 @@ const FLOW_REPLAY_DESCRIPTION =
 export function buildServer(store: SqliteStore): McpServer {
   const server = new McpServer({ name: 'sluice', version: '0.0.0' });
 
-  // list_workspaces() -> every known workspace across adapters.
   server.registerTool(
     'list_workspaces',
     {
@@ -305,7 +417,6 @@ export function buildServer(store: SqliteStore): McpServer {
     async () => jsonResult(store.listWorkspaces()),
   );
 
-  // list_channels({ workspaceId? }) -> containers, optionally scoped to a workspace.
   server.registerTool(
     'list_channels',
     {
@@ -317,7 +428,6 @@ export function buildServer(store: SqliteStore): McpServer {
     async ({ workspaceId }) => jsonResult(store.listContainers(workspaceId)),
   );
 
-  // get_messages({ containerId, limit? }) -> items in a container, newest first.
   server.registerTool(
     'get_messages',
     {
@@ -332,7 +442,6 @@ export function buildServer(store: SqliteStore): McpServer {
     async ({ containerId, limit }) => jsonResult(store.listItems(containerId, { limit })),
   );
 
-  // list_endpoints() -> distinct method+host+path with call counts.
   server.registerTool(
     'list_endpoints',
     {
@@ -342,7 +451,7 @@ export function buildServer(store: SqliteStore): McpServer {
       inputSchema: {},
     },
     async () => {
-      const rows = rawDb(store)
+      const rows = store.db
         .prepare(
           `SELECT method, host, path, COUNT(*) AS count
              FROM captures
@@ -354,7 +463,6 @@ export function buildServer(store: SqliteStore): McpServer {
     },
   );
 
-  // search_captures({ query, limit? }) -> capture metadata matching url/path/host.
   server.registerTool(
     'search_captures',
     {
@@ -367,7 +475,7 @@ export function buildServer(store: SqliteStore): McpServer {
       },
     },
     async ({ query, limit }) => {
-      const rows = rawDb(store)
+      const rows = store.db
         .prepare(
           `SELECT id, ts, method, host, path, status, adapter_id AS adapterId
              FROM captures
@@ -375,20 +483,11 @@ export function buildServer(store: SqliteStore): McpServer {
             ORDER BY ts DESC
             LIMIT @limit`,
         )
-        .all({ q: `%${query}%`, limit: limit ?? 50 }) as Array<{
-        id: string;
-        ts: number;
-        method: string;
-        host: string;
-        path: string;
-        status: number | null;
-        adapterId: string | null;
-      }>;
+        .all({ q: `%${query}%`, limit: limit ?? 50 });
       return jsonResult(rows);
     },
   );
 
-  // describe_endpoint({ method, path }) -> inline response-shape summary.
   server.registerTool(
     'describe_endpoint',
     {
@@ -398,7 +497,7 @@ export function buildServer(store: SqliteStore): McpServer {
       inputSchema: { method: z.string(), path: z.string() },
     },
     async ({ method, path }) => {
-      const rows = rawDb(store)
+      const rows = store.db
         .prepare(
           `SELECT status, res_body AS resBody, res_body_encoding AS resBodyEncoding
              FROM captures
@@ -408,11 +507,8 @@ export function buildServer(store: SqliteStore): McpServer {
         )
         .all({ method, path, limit: 100 }) as Array<{
         status: number | null;
-        // Raw column value — a Buffer when resBodyEncoding says gzip. This query
-        // reads the table directly, so it does not get rowToCapture's decoding
-        // and must decode for itself. Getting this wrong fails SILENTLY: the
-        // JSON.parse below is inside a try, so the tool would just report zero
-        // samples and no keys, forever.
+        // Raw column (no rowToCapture decoding): a Buffer when gzip-encoded, so
+        // decodeBody it — a miss fails silently as zero keys.
         resBody: string | Buffer | null;
         resBodyEncoding: string | null;
       }>;
@@ -422,16 +518,11 @@ export function buildServer(store: SqliteStore): McpServer {
       let jsonSampleCount = 0;
       for (const r of rows) {
         if (r.status !== null) statusCodes.add(r.status);
-        const body = decodeBody(r.resBody, r.resBodyEncoding);
-        if (!body) continue;
-        try {
-          const parsed: unknown = JSON.parse(body);
-          if (parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed)) {
-            for (const k of Object.keys(parsed)) responseKeys.add(k);
-            jsonSampleCount++;
-          }
-        } catch {
-          // Non-JSON body (HTML error page, empty, truncated) — skip it.
+        // A non-object body (HTML error page, empty, truncated) is skipped.
+        const o = safeJsonObject(decodeBody(r.resBody, r.resBodyEncoding));
+        if (o) {
+          for (const k of Object.keys(o)) responseKeys.add(k);
+          jsonSampleCount++;
         }
       }
 
@@ -446,7 +537,6 @@ export function buildServer(store: SqliteStore): McpServer {
     },
   );
 
-  // replay({ actionId, params?, workspaceId?, adapterId? }) -> THE ONE NETWORK-TOUCHING TOOL.
   server.registerTool(
     'replay',
     {
@@ -455,96 +545,30 @@ export function buildServer(store: SqliteStore): McpServer {
         'The ONLY tool that performs a network call. Cold-start-extracts your local session for the owning app (may trigger a macOS Keychain prompt), re-issues the chosen replay action, stores the redacted result, and returns a summary (status + parsed entity counts). No secrets are returned, logged, or persisted. actionId must be one of the replay-action ids an installed app exposes; pass action params via `params`, and optionally pin the app with `adapterId`.',
       inputSchema: {
         actionId: z.string(),
-        params: z.record(z.string()).optional(),
+        params: replayParamsSchema.optional(),
         workspaceId: z.string().optional(),
         adapterId: z.string().optional(),
       },
     },
     async ({ actionId, params, workspaceId, adapterId }) => {
-      // Resolve the owning app + action: prefer the pinned (or first) app, then
-      // fall back to scanning every installed app for the action id.
-      const installed = enabledApps();
-      const preferred = adapterId ? installed.find((a) => a.id === adapterId) : installed[0];
-      if (adapterId && !preferred) {
+      // The owning app + action: the first enabled app declaring the id, or
+      // only the pinned app — a pin never resolves to another app's action.
+      const pool = enabledApps().filter((a) => !adapterId || a.id === adapterId);
+      if (adapterId && pool.length === 0) {
         return errorResult(
           `Adapter "${adapterId}" is not enabled. Enable it in ~/.sluice/config.json or omit adapterId.`,
         );
       }
-      let match: { app: App; action: ReplayAction } | undefined;
-      const tryApp = (app: App): void => {
-        if (match) return;
-        const action = app.listReplayActions().find((a) => a.id === actionId);
-        if (action) match = { app, action };
-      };
-      if (preferred) tryApp(preferred);
-      for (const app of installed) tryApp(app);
+      const actions = pool.flatMap((app) => app.listReplayActions().map((action) => ({ app, action })));
+      const match = actions.find((m) => m.action.id === actionId);
       if (!match) {
-        const ids = installed.flatMap((a) => a.listReplayActions().map((x) => x.id));
-        return errorResult(`Unknown actionId "${actionId}". Available: ${ids.join(', ')}`);
-      }
-
-      const app = match.app;
-      const action = match.action;
-      // Workspace for first pick AND 401-refresh — one value for both paths.
-      const inferred =
-        workspaceId ?? workspaceOfParams(store, action, params);
-
-      // Resolve a Session. Apps WITH a credential provider cold-start-extract a
-      // live in-memory session; credential-free apps (e.g. fast.com) replay with
-      // a synthetic empty session that the builder is free to ignore.
-      let session: Session;
-      if (app.credentials) {
-        let sessions: Session[];
-        try {
-          // In-memory SECRET sessions; passed only to the request builder below.
-          sessions = await app.credentials.extractSessions();
-        } catch (e) {
-          return errorResult(`Could not acquire a session: ${errText(e)}`);
-        }
-
-        const choice = pickSession(sessions, inferred, app.displayName);
-        if (!choice.ok) return errorResult(choice.error);
-        session = choice.session;
-      } else {
-        session = { ...SYNTHETIC_SESSION, adapterId: app.id };
+        return errorResult(`Unknown actionId "${actionId}". Available: ${actions.map((m) => m.action.id).join(', ')}`);
       }
 
       try {
-        // Replay, and on an auth failure re-extract the local credential and try
-        // once more. This is the whole of D1: a long-running agent workflow used
-        // to die on cookie expiry with "open the app and sign in", even though
-        // the credential it needed was sitting in the OS keychain the entire
-        // time. Nothing is cached — re-extraction IS the mechanism.
-        let refreshed = false;
-        let counts = { workspaces: 0, actors: 0, containers: 0, items: 0, edges: 0 };
-        const capture = await replayWithRefresh(session, {
-          // Rebuilt per attempt: the first request carries the STALE credential
-          // in its headers, so reusing it would send the dead cookie back.
-          build: (s) => faithfulReplayRequest(store, app.buildReplayRequest(action, params ?? {}, s)),
-          run: (req) => runReplay(req),
-          // Both attempts land in the store. The failed one is the evidence that
-          // makes "the session expired at 14:03" answerable later.
-          record: (c) => {
-            c.adapterId = app.id;
-            store.insertCapture(c);
-            // The LAST attempt's counts are the answer; a failed first attempt
-            // parses to nothing anyway, and summing both would double-count.
-            counts = store.applyParseResult(app.parse(c), c.ts || Date.now());
-          },
-          // Credential-free apps have nothing to refresh and must never be sent
-          // to a Keychain prompt they have no use for.
-          refresh: app.credentials
-            ? async () => {
-                const again = (await app.credentials?.extractSessions()) ?? [];
-                // Same inferred workspace as the first pick — never sessions[0] on multi.
-                const choice = pickSession(again, inferred, app.displayName);
-                return choice.ok ? choice.session : undefined;
-              }
-            : undefined,
-          onRetry: () => {
-            refreshed = true;
-          },
-        });
+        const out = await replayActionFor(store, match.app, match.action, params ?? {}, workspaceId);
+        if (!out.ok) return errorResult(out.error);
+        const { capture, counts, refreshed } = out;
         return jsonResult({
           note: 'This tool made a live network request.',
           // Surfaced so an agent can tell "it worked" from "it worked on the
@@ -565,7 +589,6 @@ export function buildServer(store: SqliteStore): McpServer {
     },
   );
 
-
   // ── Interaction flows (multi-step, observation-learned) ────────────────────
 
   server.registerTool(
@@ -583,19 +606,7 @@ export function buildServer(store: SqliteStore): McpServer {
     },
     async ({ adapterId, source, q, limit, templates }) => {
       const lim = limit ?? 50;
-      const flows = store.listFlows({ adapterId, source, q, limit: lim }).map((f) => ({
-        id: f.id,
-        adapterId: f.adapterId,
-        label: f.label,
-        source: f.source,
-        primaryCaptureId: f.primaryCaptureId,
-        primaryOp:
-          f.steps.find((s) => s.captureId === f.primaryCaptureId)?.operation ??
-          f.steps.find((s) => s.role === 'primary')?.operation,
-        stepCount: f.steps.length,
-        startedAt: f.startedAt,
-        endedAt: f.endedAt,
-      }));
+      const flows = store.listFlows({ adapterId, source, q, limit: lim }).map((f) => flowSummary(f));
       const out: Record<string, unknown> = {
         flows,
         guidance: {
@@ -608,33 +619,8 @@ export function buildServer(store: SqliteStore): McpServer {
       };
       if (templates !== false) {
         out.templates = store.listFlowTemplates({ adapterId, q, limit: lim }).map((t) => {
-          const apiStepCount = t.steps.filter(
-            (s) =>
-              s.role === 'primary' ||
-              (s.operation && !/^assets?\b/i.test(s.operation) && !/^\/assets\//i.test(s.path)),
-          ).length;
-          const neg = t.steps.filter(
-            (s) => typeof s.offsetFromPrimaryMsP50 === 'number' && s.offsetFromPrimaryMsP50 < 0,
-          ).length;
-          return {
-            id: t.id,
-            adapterId: t.adapterId,
-            primaryKey: t.primaryKey,
-            label: t.label,
-            sampleCount: t.sampleCount,
-            stepCount: t.steps.length,
-            apiStepCount,
-            flowParams: t.flowParams,
-            learnedAt: t.learnedAt,
-            version: t.version,
-            qualityNotes: templateQualityNotes(
-              t.primaryKey,
-              t.steps.length,
-              apiStepCount,
-              t.sampleCount,
-              neg,
-            ),
-          };
+          const { apiStepCount, qualityNotes } = templateQuality(t);
+          return { ...templateSummary(t), apiStepCount, qualityNotes };
         });
       }
       return jsonResult(out);
@@ -656,23 +642,7 @@ export function buildServer(store: SqliteStore): McpServer {
       if (id) {
         const flow = store.getFlow(id);
         if (flow) {
-          return jsonResult({
-            kind: 'flow',
-            id: flow.id,
-            adapterId: flow.adapterId,
-            label: flow.label,
-            source: flow.source,
-            primaryCaptureId: flow.primaryCaptureId,
-            startedAt: flow.startedAt,
-            endedAt: flow.endedAt,
-            steps: flow.steps.map((s) => ({
-              seq: s.seq,
-              role: s.role,
-              operation: s.operation,
-              required: s.required,
-              captureId: s.captureId,
-            })),
-          });
+          return jsonResult({ kind: 'flow', ...flowSummary(flow), steps: flow.steps.map(flowStepSummary) });
         }
         const tmpl = store.getFlowTemplate(id);
         if (tmpl) return jsonResult({ kind: 'template', ...summarizeTemplate(tmpl) });
@@ -698,7 +668,7 @@ export function buildServer(store: SqliteStore): McpServer {
         templateId: z.string().optional(),
         adapterId: z.string().optional(),
         primaryKey: z.string().optional(),
-        params: z.record(z.string()).optional(),
+        params: replayParamsSchema.optional(),
         workspaceId: z.string().optional(),
       },
     },
@@ -720,58 +690,12 @@ export function buildServer(store: SqliteStore): McpServer {
         );
       }
 
-      let session: Session;
-      if (app.credentials) {
-        let sessions: Session[];
-        try {
-          sessions = await app.credentials.extractSessions();
-        } catch (e) {
-          return errorResult(`Could not acquire a session: ${errText(e)}`);
-        }
-        const choice = pickSession(sessions, workspaceId, app.displayName);
-        if (!choice.ok) return errorResult(choice.error);
-        session = choice.session;
-      } else {
-        session = { ...SYNTHETIC_SESSION, adapterId: app.id };
-      }
+      const choice = await acquireSession(app, { workspaceId });
+      if (!choice.ok) return errorResult(choice.error);
 
       try {
-        const result = await runFlowReplay({
-          template: tmpl,
-          params: params ?? {},
-          session,
-          io: {
-            build: (step, s, ctx) =>
-              buildFlowStepRequest(tmpl!, step, s, {
-                params: ctx.params,
-                priorResponses: ctx.priorResponses,
-                resolvePath: resolveJsonPath,
-                allowedHosts: app.hosts,
-              }),
-            run: (req) => runReplay(req),
-            record: (c) => {
-              c.adapterId = app.id;
-              store.insertCapture(c);
-              store.applyParseResult(app.parse(c), c.ts || Date.now());
-            },
-            refresh: app.credentials
-              ? async () => {
-                  const again = (await app.credentials?.extractSessions()) ?? [];
-                  const choice = pickSession(again, workspaceId, app.displayName);
-                  return choice.ok ? choice.session : undefined;
-                }
-              : undefined,
-          },
-        });
-
-        if (result.flow) {
-          try {
-            store.upsertFlow(result.flow);
-          } catch {
-            /* parent flow persist is best-effort */
-          }
-        }
-
+        // Already redacted by runFlowReplay: error and step details can quote the request.
+        const result = await replayTemplate(store, app, tmpl, params ?? {}, choice.session);
         return jsonResult({
           note: 'This tool made live network request(s) for each reproducible step.',
           ok: result.ok,
@@ -780,18 +704,7 @@ export function buildServer(store: SqliteStore): McpServer {
           flowId: result.flow?.id,
           templateId: tmpl.id,
           primaryKey: tmpl.primaryKey,
-          steps: result.steps.map((s) => ({
-            seq: s.seq,
-            role: s.role,
-            operation: s.operation,
-            method: s.method,
-            path: s.path,
-            status: s.status,
-            captureId: s.captureId,
-            httpStatus: s.httpStatus,
-            detail: s.detail,
-            durationMs: s.durationMs,
-          })),
+          steps: result.steps,
         });
       } catch (e) {
         return errorResult(`Flow replay failed: ${errText(e)}`);
@@ -799,7 +712,6 @@ export function buildServer(store: SqliteStore): McpServer {
     },
   );
 
-  // auth_flow() -> how the service issues/refreshes the credential you hold.
   server.registerTool(
     'auth_flow',
     {
@@ -811,113 +723,16 @@ export function buildServer(store: SqliteStore): McpServer {
     async ({ app }) => jsonResult(mapAuthFlow(store.listCaptures({ limit: 5_000, adapterId: app }), app ?? null)),
   );
 
-  // App-contributed MCP tools (e.g. fast.com's speed test, Gmail's mailbox
-  // reads). Each installed app
-  // may expose zero or more; register them under their own names. A tool's `run`
-  // may touch the network, so wrap it: a thrown error becomes a tool error rather
-  // than crashing the handler, and its message is redacted before leaving.
-  //
-  // Only the apps this machine has ENABLED. A client that installed Sluice for
-  // Gmail was being shown Slack's and Trello's tools too — tools it cannot use,
-  // occupying the tool budget of every request it makes.
+  // App-contributed MCP tools, only for apps this machine has ENABLED (others
+  // only eat the client's tool budget). run may touch the network, so a thrown
+  // error becomes a redacted tool error rather than crashing the handler.
   for (const app of enabledApps()) {
-    /**
-     * The same pipeline `sluice_replay` uses, handed to the app's own tools so
-     * their traffic is fingerprint-matched, rate-limited, and recorded — rather
-     * than escaping through a bare `fetch` that nothing can see.
-     */
-    const record = (capture: Capture): void => {
-      capture.adapterId = app.id; // attribute so the cartographer + stats include it
-      store.insertCapture(capture);
-      store.applyParseResult(app.parse(capture), capture.ts || Date.now());
-    };
-    const ctx: AppToolContext = {
-      // Read-only by VALUE, not merely by type: `SqliteStore` satisfies
-      // `ReadOnlyStore` structurally, so passing it straight through would hand
-      // an app tool `insertCapture`, `pruneCaptures` and the raw `db` handle
-      // alongside the reads it actually needs.
-      store: readOnlyStore(store),
-      replay: async (base) => {
-        // An app tool gets the same 401 → re-extract → retry-once treatment as
-        // sluice_replay. It cannot rebuild the request from a Session (the tool
-        // handed us a finished ReplayRequest), so the refresh here is "ask the
-        // app for a fresh session and let it re-inject" — apps whose tools build
-        // their own auth, like Trello's cookie header, refresh internally
-        // instead. Both paths retry exactly once.
-        const capture = await replayWithRefresh(SYNTHETIC_SESSION, {
-          build: () => faithfulReplayRequest(store, base),
-          run: (req) => runReplay(req),
-          record,
-        });
-        return capture;
-      },
-      replayFlow: async (templateId, flowParams, flowOpts) => {
-        const tmpl = store.getFlowTemplate(templateId)
-          ?? store.getFlowTemplateByPrimary(app.id, templateId);
-        if (!tmpl) throw new Error(`Unknown flow template "${templateId}"`);
-        let session: Session = { ...SYNTHETIC_SESSION, adapterId: app.id };
-        const flowWs = flowOpts?.workspaceId;
-        if (app.credentials) {
-          const sessions = await app.credentials.extractSessions();
-          const choice = pickSession(sessions, flowWs, app.displayName);
-          if (!choice.ok) throw new Error(choice.error);
-          session = choice.session;
-        }
-        const result = await runFlowReplay({
-          template: tmpl,
-          params: flowParams ?? {},
-          session,
-          io: {
-            build: (step, s, ctxB) =>
-              buildFlowStepRequest(tmpl, step, s, {
-                params: ctxB.params,
-                priorResponses: ctxB.priorResponses,
-                resolvePath: resolveJsonPath,
-                allowedHosts: app.hosts,
-              }),
-            run: (req) => runReplay(req),
-            record: (c, _step) => {
-              record(c);
-            },
-            refresh: app.credentials
-              ? async () => {
-                  const again = (await app.credentials?.extractSessions()) ?? [];
-                  const choice = pickSession(again, flowWs, app.displayName);
-                  return choice.ok ? choice.session : undefined;
-                }
-              : undefined,
-          },
-        });
-        if (result.flow) {
-          try {
-            store.upsertFlow(result.flow);
-          } catch {
-            /* best-effort */
-          }
-        }
-        return {
-          ok: result.ok,
-          error: result.error,
-          flowId: result.flow?.id,
-          steps: result.steps.map((s) => ({
-            seq: s.seq,
-            status: s.status,
-            operation: s.operation,
-            captureId: s.captureId,
-            httpStatus: s.httpStatus,
-          })),
-        };
-      },
-    };
+    const ctx = appToolContext(store, app);
 
     for (const t of app.mcpTools?.() ?? []) {
-      // Pass the tool's declared parameters through. This used to be hardcoded
-      // to `{}`, which told every client the tool took no arguments — so `run`
-      // could never receive any, no matter what it was typed to accept.
-      const inputSchema = (t.inputSchema ?? {}) as ZodRawShape;
       server.registerTool(
         t.name,
-        { title: t.name, description: t.description, inputSchema },
+        { title: t.name, description: t.description, inputSchema: (t.inputSchema ?? {}) as ZodRawShape },
         async (args) => {
           try {
             return jsonResult(await t.run((args ?? {}) as Record<string, unknown>, ctx));
@@ -946,11 +761,8 @@ export async function startStdioServer(): Promise<void> {
   for (const r of (await installExternalAdapters()).rejected) {
     process.stderr.write(`[sluice-mcp] external adapter ${r.specifier} rejected: ${r.reason}\n`);
   }
-  // Before the first tool call, not after: a store written by a capture session
-  // that ended without reconciling holds mail under a placeholder workspace, and
-  // a placeholder is not a name any caller can pass as `account`. That mail
-  // would read as an empty mailbox rather than as an unattributed one, which is
-  // the failure mode worth spending a few milliseconds of startup on.
+  // Before the first tool call: a capture session that ended without
+  // reconciling leaves data under a placeholder workspace no caller can name.
   for (const app of enabledApps()) {
     if (app.reconcile === undefined) continue;
     try {

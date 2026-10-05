@@ -209,6 +209,27 @@ test('a listener that throws does not take the supervisor down', async () => {
   assert.ok(engine.starts >= 1, 'the restart still happened');
 });
 
+test('a listener that throws on running does not cause a restart loop', async () => {
+  const engine = fakeEngine();
+  const { sleep, whenExhausted } = drive(10);
+  let probes = 0;
+  const sup = superviseEngine({
+    engine,
+    // Dead once, healthy after the restart.
+    healthy: async () => ++probes > 1,
+    sleep,
+    probeMs: 1,
+    onStatus: (s) => {
+      if (s.state === 'running') throw new Error('broadcast failed');
+    },
+  });
+  whenExhausted(() => sup.stop());
+  await new Promise((r) => setTimeout(r, 10));
+  assert.equal(engine.starts, 1, 'one restart, not one per listener throw');
+  assert.equal(sup.failures(), 0);
+  assert.equal(sup.status().state, 'running');
+});
+
 test('backoff doubles and starts at a second', () => {
   assert.deepEqual([1, 2, 3, 4, 5].map(backoffMs), [1000, 2000, 4000, 8000, 16000]);
   // Defensive: attempt 0 must not produce half a second through 2**-1.

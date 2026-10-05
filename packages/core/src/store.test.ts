@@ -7,8 +7,12 @@
  * store is exercised for real.
  */
 import assert from 'node:assert/strict';
+import { chmodSync, mkdtempSync, rmSync, statSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import test from 'node:test';
-import { readOnlyStore, SqliteStore } from './store.js';
+import { CORE_TABLE_NAMES } from './schema.js';
+import { readOnlyStore, restrictToOwner, SqliteStore } from './store.js';
 import type { Capture } from './types.js';
 
 function capture(over: Partial<Capture> = {}): Capture {
@@ -494,14 +498,26 @@ test('completing and failing a work item are distinguishable', () => {
   store.close();
 });
 
-test('a killed drainer does not strand its claims forever', () => {
+test('a lease releases only old claims, and releaseCursors only the given running ones', () => {
   const store = new SqliteStore(':memory:');
-  store.enqueueCursors([{ adapterId: 'slack', actionId: 'a', cursor: '1' }]);
-  store.claimCursors(1);
-  assert.equal(store.claimCursors(1).length, 0, 'precondition: nothing left to claim');
+  store.enqueueCursors([
+    { adapterId: 'slack', actionId: 'a', cursor: '1' },
+    { adapterId: 'slack', actionId: 'a', cursor: '2' },
+    { adapterId: 'slack', actionId: 'a', cursor: '3' },
+  ]);
+  const [dead, live, mine] = store.claimCursors(3);
+  // A drainer that died an hour ago; `live` and `mine` were claimed just now.
+  store.db.prepare(`UPDATE cursors SET updated_ts = @ts WHERE id = @id`).run({ ts: Date.now() - 3_600_000, id: dead!.id });
 
-  assert.equal(store.releaseStaleCursors(), 1);
-  assert.equal(store.claimCursors(1).length, 1);
+  assert.equal(store.releaseStaleCursors(10 * 60_000), 1, 'only the claim past its lease');
+  assert.equal(store.listCursors({ state: 'running' }).length, 2, "a live drainer's claims survive");
+
+  store.completeCursor(live!.id);
+  assert.equal(store.releaseCursors([mine!.id, live!.id, 'no-such-id']), 1, 'settled and unknown ids are left alone');
+  assert.deepEqual(
+    store.listCursors({ state: 'pending' }).map((w) => w.id).sort(),
+    [dead!.id, mine!.id].sort(),
+  );
   store.close();
 });
 
@@ -1092,5 +1108,145 @@ test('deleteFlows and deleteFlowTemplates scope by adapter', () => {
   assert.equal(store.deleteFlowTemplates({ adapterId: 'slack' }), 1);
   assert.equal(store.listFlowTemplates({ adapterId: 'slack' }).length, 0);
   assert.equal(store.listFlowTemplates({ adapterId: 'trello' }).length, 1);
+  store.close();
+});
+
+// ── meta (runner bookkeeping) ─────────────────────────────────────────────────
+
+test('meta numbers upsert, delete, and a corrupted one reads as absent', () => {
+  const store = new SqliteStore(':memory:');
+  assert.equal(store.getMetaNumber('ts'), undefined);
+  store.setMetaNumber('ts', 1);
+  store.setMetaNumber('ts', 1_700_000_000_000); // upsert, not a second row
+  assert.equal(store.getMetaNumber('ts'), 1_700_000_000_000);
+  assert.equal((store.db.prepare('SELECT COUNT(*) n FROM meta').get() as { n: number }).n, 1);
+
+  // The watermark's failure mode matters: unreadable must mean "never ran" (one
+  // extra full rebuild), never NaN silently poisoning a `ts >= ?` comparison.
+  store.db.prepare(`UPDATE meta SET value = 'not-a-number' WHERE key = 'ts'`).run();
+  assert.equal(store.getMetaNumber('ts'), undefined);
+  store.deleteMeta('ts');
+  assert.equal((store.db.prepare('SELECT COUNT(*) n FROM meta').get() as { n: number }).n, 0);
+  store.close();
+});
+
+test('a database created before the meta table gains it on open', () => {
+  // Same regression as the columns test above, one level up: `meta` arrived
+  // after the first stores existed, so migrate() has to reach them too.
+  const store = new SqliteStore(':memory:');
+  store.db.exec('DROP TABLE meta');
+  assert.equal(
+    (
+      store.db
+        .prepare(`SELECT COUNT(*) n FROM sqlite_master WHERE type='table' AND name='meta'`)
+        .get() as { n: number }
+    ).n,
+    0,
+    'precondition: the old database has no meta table',
+  );
+
+  store.migrate();
+
+  store.setMetaNumber('k', 1);
+  assert.equal(store.getMetaNumber('k'), 1);
+  store.close();
+});
+
+// ── File modes, core table names, shared delete paths ─────────────────────────
+
+test(
+  'an on-disk store keeps its directory and database files owner-only',
+  { skip: process.platform === 'win32' },
+  () => {
+    // The DB holds whole response bodies. SQLite's default 0644 under a 0755
+    // directory let every other account on the machine read it.
+    const dir = mkdtempSync(join(tmpdir(), 'sluice-store-mode-'));
+    try {
+      const home = join(dir, 'home');
+      const dbPath = join(home, 'sluice.db');
+      const store = new SqliteStore(dbPath);
+      assert.equal(statSync(dbPath).mode & 0o777, 0o600, 'created owner-only, before any write');
+      store.insertCapture(capture({ id: 'c1', resBody: '{"ok":true}' })); // a write, so the WAL exists
+      assert.equal(statSync(home).mode & 0o777, 0o700, 'a parent the store creates is owner-only');
+      for (const p of [dbPath, `${dbPath}-wal`, `${dbPath}-shm`]) {
+        assert.equal(statSync(p).mode & 0o077, 0, `${p} must not be group/other accessible`);
+      }
+
+      // Files an earlier version left world-readable are tightened on the next open.
+      chmodSync(dbPath, 0o644);
+      chmodSync(`${dbPath}-wal`, 0o644);
+      const again = new SqliteStore(dbPath);
+      for (const p of [dbPath, `${dbPath}-wal`]) assert.equal(statSync(p).mode & 0o777, 0o600, p);
+      chmodSync(home, 0o755);
+      restrictToOwner(home); // the shared helper narrows directories too, never widening
+      assert.equal(statSync(home).mode & 0o777, 0o700);
+      again.close();
+      store.close();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  },
+);
+
+test('CORE_TABLE_NAMES is exactly the set of tables the schema creates', () => {
+  // Read from the live schema, not by parsing SCHEMA_SQL: its comments mention
+  // `CREATE TABLE IF NOT EXISTS` in prose. FTS5 shadow tables are the index's
+  // own storage, never a name anything else should claim.
+  const store = new SqliteStore(':memory:');
+  const live = (
+    store.db
+      .prepare(`SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'`)
+      .all() as Array<{ name: string }>
+  )
+    .map((r) => r.name)
+    .filter((n) => !n.includes('_fts_'));
+  assert.deepEqual(live.sort(), [...CORE_TABLE_NAMES].sort());
+  store.close();
+});
+
+test('wipe empties every core table except meta', () => {
+  const store = new SqliteStore(':memory:');
+  store.insertCapture(capture({ id: 'c1', resBody: '{"ok":true}' }));
+  store.upsertItem({
+    id: 'm1', containerId: 'C1', workspaceId: 'W1', adapterId: 'slack', kind: 'message', ts: 1, text: 'hi',
+  });
+  store.setMetaNumber('k', 1);
+  store.wipe();
+  for (const t of CORE_TABLE_NAMES) {
+    const n = (store.db.prepare(`SELECT COUNT(*) AS n FROM ${t}`).get() as { n: number }).n;
+    assert.equal(n, t === 'meta' ? 1 : 0, t);
+  }
+  store.close();
+});
+
+test('pruning by maxRows drops the same rows from the index as from the table, ties included', () => {
+  // Every row shares one ts, so the ORDER BY alone does not fix which rows sit
+  // past the OFFSET. The index and the table must still lose the same ones.
+  const store = new SqliteStore(':memory:');
+  for (let i = 0; i < 20; i++) {
+    store.insertCapture(capture({ id: `c${i}`, ts: 1_000, resBody: `{"marker":${i}}` }));
+  }
+  assert.equal(store.pruneCaptures({ maxRows: 7 }), 13);
+  assert.equal(store.countCaptures(), 7);
+  assert.equal((store.db.prepare(`SELECT COUNT(*) AS n FROM captures_fts`).get() as { n: number }).n, 7);
+  assert.equal(store.searchCaptures('marker').length, 7, 'every survivor is still searchable');
+  store.close();
+});
+
+test('an empty-string filter keeps each query its historical meaning', () => {
+  const store = new SqliteStore(':memory:');
+  store.insertCapture(capture({ id: 'a', adapterId: 'slack' }));
+  store.insertCapture(capture({ id: 'b', adapterId: 'trello' }));
+  // Captures, flows, templates, cursors: '' has always meant "no filter".
+  assert.equal(store.listCaptures({ adapterId: '' }).length, 2);
+  assert.equal(store.countCaptures({ adapterId: '', host: '' }), 2);
+
+  // Items and edges: only undefined is "no filter"; '' is a value that matches nothing.
+  store.upsertItem({
+    id: 'm1', containerId: 'C1', workspaceId: 'W1', adapterId: 'slack', kind: 'message', ts: 1, text: 'hi',
+  });
+  assert.equal(store.queryItems({}).length, 1);
+  assert.equal(store.queryItems({ adapterId: '' }).length, 0);
+  assert.equal(store.queryItems({ adapterId: 'slack', workspaceId: 'W1' }).length, 1);
   store.close();
 });

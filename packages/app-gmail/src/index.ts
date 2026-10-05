@@ -2,20 +2,15 @@
 /**
  * @sluice/app-gmail — the self-contained Gmail app.
  *
- * The primary export is `gmailApp: App`. There is no `credentials` provider yet:
- * Gmail is authorized by Google's browser cookie set (SID/HSID/SSID/APISID/SAPISID),
- * so a provider here would be a second copy of app-trello's macOS Chrome cookie
- * reader pointed at a different host. `buildReplayRequest` already consumes a
- * Session built from those cookies, so the seam is open — nothing fills it.
+ * The primary export is `gmailApp: App`. It has no `credentials` provider yet (Gmail is
+ * authorized by Google's SID/HSID/SSID/APISID/SAPISID cookies, which `buildReplayRequest`
+ * already consumes), so `listReplayActions()` offers nothing; see GMAIL_THREADS_LIST.
  *
  * Registered in `@sluice/apps`, which is what turns the redaction contribution
  * below into global policy and puts `mail.google.com` on the proxy's
  * TLS-intercept list.
  *
- * The five `gmail_*` MCP tools live here too, in `mcp-tools.ts`. They answer from
- * the capture store rather than the network, which was impossible until
- * `AppToolContext` grew a read-only store view — until then they were compiled
- * into `packages/mcp`'s own spine.
+ * The five `gmail_*` MCP tools (mcp-tools.ts) answer from the capture store.
  */
 import type { App, AppRedaction } from '@sluice/core';
 import { gmailAdapter } from './gmail-adapter.js';
@@ -38,39 +33,6 @@ const gmailRedaction: AppRedaction = {
 export const gmailApp: App = {
   ...gmailAdapter,
   redaction: gmailRedaction,
-  mcpTools() {
-    return gmailMcpTools;
-  },
-  reconcile(store) {
-    return gmailReconcile(store);
-  },
+  mcpTools: () => gmailMcpTools,
+  reconcile: gmailReconcile,
 };
-
-// ── Named re-exports ───────────────────────────────────────────────────────────────
-export {
-  gmailAdapter,
-  parseGmailCapture,
-  classifyGmailCapture,
-  gmailNextCursors,
-  decodeGmailBody,
-  gmailMessageView,
-  gmailThreadView,
-  ADAPTER_ID,
-  CHROME_UA,
-  accountWorkspaceId,
-  accountSlotOfWorkspaceId,
-  addressOfWorkspaceId,
-  isProvisionalWorkspaceId,
-  provisionalWorkspaceId,
-  labelContainerId,
-  unknownContainerId,
-  labelRef,
-  containerKind,
-  gmailAccountSlot,
-  gmailAccountAddress,
-  gmailCarriesEntities,
-} from './gmail-adapter.js';
-export type { AddressRef, GmailMessageView, GmailThreadView, LabelRef } from './gmail-adapter.js';
-export { gmailMcpTools } from './mcp-tools.js';
-export { reconcileGmailAccounts, gmailReconcile, slotLedger, describeAccounts } from './reconcile.js';
-export type { ReconcileReport, SlotBinding, UnresolvedReason } from './reconcile.js';

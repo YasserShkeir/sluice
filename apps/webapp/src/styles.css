@@ -21,6 +21,9 @@
 
 @theme {
   --color-bg: #0f1115;
+  /* Aliases components use: bg-0 is the darkest surface (a tint behind body
+     panes), danger is err. */
+  --color-bg-0: var(--color-bg);
   --color-bg-1: #14171d;
   --color-bg-2: #191d25;
   --color-bg-3: #202631;
@@ -37,6 +40,7 @@
   --color-warn: #f0a020;
   --color-warn-2: #f76707;
   --color-err: #f03e3e;
+  --color-danger: var(--color-err);
   --color-none: #6b7280;
 
   --font-mono: ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, 'Liberation Mono', monospace;

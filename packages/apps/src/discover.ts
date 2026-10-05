@@ -36,16 +36,14 @@
  *
  * ## What is checked before an adapter is trusted with anything
  *
- * The conformance harness, at load. It is a CORRECTNESS check and not a security
- * boundary, and must not be sold as one — it proves an adapter does not throw on
- * hostile input and does not claim lookalike hosts. Trust still comes from naming
- * the adapter yourself, and from the hosts it adds being printed rather than
- * assumed.
+ * The conformance harness (checkConformance), at load — a correctness check, NOT a security
+ * boundary; trust comes from naming the adapter yourself (see adapter-sdk check.ts).
  */
 import { existsSync, readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
+import { errorMessage as msg, safeJsonObject } from '@sluice/core';
 import type { App } from '@sluice/core';
 
 /** Where an external adapter may be named. Deliberately one path. */
@@ -104,49 +102,43 @@ export function looksLikeApp(v: unknown): v is App {
   );
 }
 
+/** Unreadable or malformed config yields undefined, so Sluice still starts with its built-ins. */
+function readHomeConfig(configPath: string): Record<string, unknown> | undefined {
+  try {
+    return safeJsonObject(readFileSync(configPath, 'utf8'));
+  } catch {
+    return undefined;
+  }
+}
+
 /** The `externalAdapters` list from the HOME config, or [] when there is none. */
 export function readExternalSpecifiers(configPath = externalConfigPath()): {
   specifiers: string[];
   configPath?: string;
 } {
   if (!existsSync(configPath)) return { specifiers: [] };
-  try {
-    const parsed = JSON.parse(readFileSync(configPath, 'utf8')) as unknown;
-    if (typeof parsed !== 'object' || parsed === null) return { specifiers: [], configPath };
-    const raw = (parsed as { externalAdapters?: unknown }).externalAdapters;
-    if (!Array.isArray(raw)) return { specifiers: [], configPath };
-    return {
-      specifiers: raw.filter((s): s is string => typeof s === 'string' && s.trim().length > 0),
-      configPath,
-    };
-  } catch {
-    // A malformed config must not stop Sluice starting with its built-in apps.
-    return { specifiers: [], configPath };
-  }
+  const raw = readHomeConfig(configPath)?.externalAdapters;
+  return {
+    specifiers: Array.isArray(raw)
+      ? raw.filter((s): s is string => typeof s === 'string' && s.trim().length > 0)
+      : [],
+    configPath,
+  };
 }
 
 /**
  * The `adapters` allow-list from the home config, or undefined for "all".
  *
- * Read from the same file `externalAdapters` comes from, and read by BOTH the
- * CLI and the MCP server — which is the point. The list existed and only the CLI
- * honoured it, so `sluice start` would capture Slack alone while `sluice-mcp`
- * went on advertising every app's tools. One switch that half the product obeys
- * is worse than no switch: it reads as if it worked.
+ * Read by both the CLI and the MCP server, so one switch governs both.
  *
  * Undefined and empty both mean "all installed apps". An allow-list that
  * silently meant "none" would be a footgun in a file people hand-edit.
  */
 export function readEnabledAdapterIds(configPath = externalConfigPath()): string[] | undefined {
   if (!existsSync(configPath)) return undefined;
-  try {
-    const parsed = JSON.parse(readFileSync(configPath, 'utf8')) as { adapters?: unknown };
-    if (!Array.isArray(parsed.adapters)) return undefined;
-    const ids = parsed.adapters.filter((v): v is string => typeof v === 'string' && v.length > 0);
-    return ids.length > 0 ? ids : undefined;
-  } catch {
-    return undefined;
-  }
+  const raw = readHomeConfig(configPath)?.adapters;
+  const ids = Array.isArray(raw) ? raw.filter((v): v is string => typeof v === 'string' && v.length > 0) : [];
+  return ids.length > 0 ? ids : undefined;
 }
 
 export interface DiscoverOptions {
@@ -248,8 +240,6 @@ function pickApp(mod: unknown): App | undefined {
   }
   return undefined;
 }
-
-const msg = (e: unknown): string => (e instanceof Error ? e.message : String(e));
 
 /**
  * One line per external adapter, for the CLI to print at startup.
