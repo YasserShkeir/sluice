@@ -433,7 +433,7 @@ const listThreads: AppMcpTool = {
  * There is no `account` parameter here, unlike every other tool, and that is a
  * property of the id rather than an omission.
  *
- * A thread id is minted per mailbox — `thread-f:2942556809216331240` — and is
+ * A thread id is minted per mailbox — `thread-f:1700000000000000001` — and is
  * what BOTH parsers use as the container a message lives in, unscoped, because
  * two accounts never mint the same one. So `listItems(threadId)` already selects
  * exactly one account's conversation: an account filter could only ever be a
